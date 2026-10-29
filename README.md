@@ -24,15 +24,16 @@ the x86 instruction named CRC32.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
+| [`wav`](docs/wav.md) | Complete WAVE/RF64 decoding and PCM16 RIFF writing, with explicit storage and `std.Io` | `wav-example` |
 | [`riff`](docs/riff.md) | Borrowed container/chunk traversal, nested lists and checked writing | `riff-example` |
 | [`pcm`](docs/pcm.md) | Little-endian integer/float sample conversion and PCM16 writing | `pcm-example` |
 | [`g711`](docs/g711.md) | A-law and mu-law decoding to exact PCM16 or normalized floats | `g711-example` |
 | [`adpcm`](docs/adpcm.md) | Microsoft and IMA/DVI WAVE block decoding, including validated frame prefixes | `adpcm-example` |
 
-RIFF handles container framing; payload interpretation belongs to its caller. The audio libraries
-convert sample representations. Callers supply the required layout or block geometry and own
-container, sample-rate and playback policy. A valid RIFF envelope alone does not establish a valid
-media file, and the ADPCM library accepts complete blocks rather than parsing a WAVE file.
+WAVE connects container metadata to sample decoding. RIFF handles generic framing; a valid
+envelope alone does not establish a valid media file. The raw PCM, G.711 and ADPCM libraries take
+sample layouts or complete blocks independently of containers. Callers own playback, resampling
+and speaker placement.
 
 ## Try it
 
@@ -52,7 +53,7 @@ Run one with `zig build <example-step>`; the checksum, hash and RIFF examples al
 after `--`.
 
 The examples exercise complete public API calls: format-specific checksum bytes, seeded hashes,
-nested chunks, sample quantization and compressed-block decoding with PCM16 output. Each checks
+nested chunks, sample quantization, compressed-block decoding and complete WAVE audio. Each checks
 its results as it runs. The [source files](examples/) are small standalone starting points.
 
 ## Use it in a project
@@ -86,9 +87,10 @@ test "complete and streaming checksums" {
 
 The libraries accept exact, unaligned input bytes and perform no hidden allocation. Hash and
 checksum states copy what they need, so an input chunk can be released after `update` returns.
-RIFF views borrow their input; keep that storage alive while using the views. Audio conversion
-writes caller-provided output. RIFF and PCM writing use the caller's `std.Io.Writer`; callers
-choose its storage, handle backend failures and flush it.
+RIFF views borrow their input; keep that storage alive while using the views. Raw audio conversion
+writes caller-provided output. WAVE also offers explicit allocating owners and parallel conversion
+through `std.Io`; every submitted job finishes before return. RIFF, PCM and WAVE writing use the
+caller's `std.Io.Writer`; callers choose its storage, handle backend failures and flush it.
 
 The guides specify numeric encoding, admitted regions and partial-output behavior for each API.
 They also explain the mechanisms behind the contracts: vector sums, polynomial folding,

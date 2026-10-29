@@ -65,6 +65,12 @@ pub fn build(b: *std.Build) void {
             .executable = "adpcm-decode",
             .description = "Decode Microsoft and IMA blocks and validate prefix output",
         },
+        .{
+            .step = "wav-example",
+            .source = "examples/wav.zig",
+            .executable = "wave-audio",
+            .description = "Write, inspect and decode WAVE with owned and caller storage",
+        },
     };
     for (examples) |example| {
         const module = b.createModule(

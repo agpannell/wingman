@@ -296,3 +296,63 @@ test "ADPCM prefix still rejects omitted invalid IMA blocks" {
         adpcm.decodePrefixInto(&source, &output, 0, format),
     );
 }
+
+test "WAVE owned and caller samples retain rate and independent storage" {
+    const wav = @import("wingman").wav;
+    var bytes: [48]u8 = undefined;
+    const encoded = try wav.encodePcm16Into(
+        .{ .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 0.5 } },
+        &bytes,
+    );
+    try std.testing.expectEqual(
+        48,
+        try wav.encodePcm16Requirements(.{ .sample_rate = 8000, .channels = .mono, .samples = &.{
+            -1, 0.5,
+        } }),
+    );
+    const required = try wav.decodeRequirements(encoded, &.{});
+    try std.testing.expectEqual(2, required.frames);
+    var samples: [3]f32 = @splat(42);
+    const view = try wav.decodeInto(encoded, &samples, &.{});
+    try std.testing.expectEqual(8000, view.sample_rate);
+    try std.testing.expectEqual(wav.Channels.mono, view.channels);
+    try std.testing.expectEqualSlices(f32, &.{ -1, 0.5 }, view.samples);
+    try std.testing.expectEqual(42, samples[2]);
+    var owned = try wav.decodeAlloc(std.testing.allocator, encoded);
+    defer owned.deinit(std.testing.allocator);
+    @memset(&bytes, 0xa5);
+    try std.testing.expectEqualSlices(f32, &.{ -1, 0.5 }, owned.view().samples);
+}
+
+test "WAVE chunk inspection and inline std.Io conversion use the public namespace" {
+    const wav = @import("wingman").wav;
+    var bytes: [56]u8 = undefined;
+    const encoded = try wav.encodePcm16Into(
+        .{ .sample_rate = 48000, .channels = .stereo, .samples = &.{ -1, 1, -0.5, 0.5, 0, 0.25 } },
+        &bytes,
+    );
+    const container = try wav.parse(encoded);
+    var chunks = try container.iterator(&.{});
+    const format_chunk = (try chunks.next()).?;
+    try std.testing.expectEqualStrings("fmt ", format_chunk.id);
+    const format = try wav.parseFormat(format_chunk.data);
+    const data = (try chunks.next()).?;
+    try std.testing.expectEqual(3, try wav.frameCount(format, data.data.len));
+    try std.testing.expectEqual(null, try chunks.next());
+    var samples: [6]f32 = undefined;
+    var workers: [2]wav.Worker = undefined;
+    const view = try wav.decodeParallelInto(
+        std.Io.failing,
+        encoded,
+        &samples,
+        &.{},
+        &workers,
+        .{ .minimum_bytes = 0, .minimum_job_bytes = 1 },
+    );
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -1, 32767.0 / 32768.0, -0.5, 0.5, 0, 0.25 },
+        view.samples,
+    );
+    for (workers) |worker| try std.testing.expectEqual(0, worker.source.len);
+}
