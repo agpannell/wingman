@@ -6,15 +6,20 @@
 //!
 //! XXH32 and XXH64 provide seeded hashes for lookup keys and content checksums. Their Hasher states
 //! copy pending bytes and provide non-consuming snapshots; no input or allocator is retained.
+//!
+//! RIFF reads borrowed container/chunk views and writes checked framing through std.Io.Writer.
+//! Payload decoding and format-specific policy remain with the caller.
 
 pub const adler32 = @import("adler32.zig");
 pub const crc32 = @import("crc32.zig");
 pub const xxhash32 = @import("xxhash32.zig");
 pub const xxhash64 = @import("xxhash64.zig");
+pub const riff = @import("riff.zig");
 
 test {
     _ = adler32;
     _ = crc32;
     _ = xxhash32;
     _ = xxhash64;
+    _ = riff;
 }

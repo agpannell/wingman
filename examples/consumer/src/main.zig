@@ -4,6 +4,37 @@ const adler32 = @import("wingman").adler32;
 const crc32 = @import("wingman").crc32;
 const xxhash32 = @import("wingman").xxhash32;
 const xxhash64 = @import("wingman").xxhash64;
+const riff = @import("wingman").riff;
+
+test "RIFF borrowed chunks and externally resolved geometry" {
+    const bytes = "RIFF\x0e\x00\x00\x00TESTdata\x01\x00\x00\x00x\xa5tail";
+    const form = try riff.parse(bytes);
+    try std.testing.expectEqualStrings("TEST", &form.form_type);
+    try std.testing.expectEqual(22, form.source.len);
+    var chunks = form.iterator();
+    const chunk = (try chunks.next()).?;
+    try std.testing.expectEqualStrings("data", chunk.id);
+    try std.testing.expectEqualStrings("x", chunk.data);
+    try std.testing.expectEqual(0xa5, chunk.padding.?);
+    try std.testing.expectEqual(null, try chunks.next());
+    var resolved: riff.ChunkIterator = .{ .source = "data\xff\xff\xff\xffx\x00" };
+    try std.testing.expectError(error.InvalidRiff, resolved.nextResolved(3));
+    try std.testing.expectEqual(0, resolved.offset);
+    try std.testing.expectEqualStrings("x", (try resolved.nextResolved(1)).?.data);
+}
+
+test "RIFF writer literal bytes and lazy nested lists" {
+    var bytes: [22]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&bytes);
+    try riff.writeHeader("DEMO".*, try riff.chunkSize(1), &writer);
+    try riff.writeChunk("note".*, "x", &writer);
+    try std.testing.expectEqualStrings("RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00", &bytes);
+    var outer: riff.ChunkIterator = .{ .source = "LIST\x05\x00\x00\x00INFOx\x00" };
+    const list = try (try outer.next()).?.list();
+    try std.testing.expectEqualStrings("INFO", &list.list_type);
+    var children = list.iterator();
+    try std.testing.expectError(error.InvalidRiff, children.next());
+}
 
 test "classic xxHash fixed facts and seeded streaming" {
     try std.testing.expectEqual(@as(u32, 0x32d153ff), xxhash32.hash("abc"));

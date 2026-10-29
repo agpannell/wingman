@@ -40,6 +40,12 @@ pub fn build(b: *std.Build) void {
             .executable = "xxhashsum",
             .description = "Compute seeded and seed-zero XXH32 and XXH64 hashes",
         },
+        .{
+            .step = "riff-example",
+            .source = "examples/riff.zig",
+            .executable = "riff-inspect",
+            .description = "Write and inspect a RIFF container with nested typed chunks",
+        },
     };
     for (examples) |example| {
         const module = b.createModule(
