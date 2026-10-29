@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     }{
         .{
             .step = "example",
-            .source = "examples/checksum.zig",
+            .source = "examples/adler32.zig",
             .executable = "adler32sum",
             .description = "Compute Adler-32 from complete, streamed and combined text",
         },

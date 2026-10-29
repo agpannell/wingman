@@ -53,7 +53,7 @@ test "zlib footer bytes" {
 }
 ```
 
-The runnable [checksum example](../examples/checksum.zig) shows complete, incremental and combined
+The runnable [Adler-32 example](../examples/adler32.zig) shows complete, incremental and combined
 input and writes the footer bytes.
 
 ## Combining separately processed chunks
