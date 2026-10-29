@@ -6,6 +6,39 @@ const xxhash32 = @import("wingman").xxhash32;
 const xxhash64 = @import("wingman").xxhash64;
 const riff = @import("wingman").riff;
 const pcm = @import("wingman").pcm;
+const g711 = @import("wingman").g711;
+
+test "G.711 scalar facts normalized output and PCM16 composition" {
+    try std.testing.expectEqual(-8, g711.decodeAlaw(0x55));
+    try std.testing.expectEqual(8, g711.decodeAlaw(0xd5));
+    try std.testing.expectEqual(0, g711.decodeMulaw(0x7f));
+    try std.testing.expectEqual(0, g711.decodeMulaw(0xff));
+    const source = [_]u8{ 0, 128, 127, 255 };
+    var output: [6]f32 = @splat(42);
+    const samples = try g711.decodeInto(&source, &output, .mulaw);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -32124.0 / 32768.0, 32124.0 / 32768.0, 0, 0 },
+        samples,
+    );
+    try std.testing.expectEqualSlices(f32, &.{ 42, 42 }, output[4..]);
+    var bytes: [8]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{
+        0x84, 0x82, 0x7c, 0x7d, 0, 0, 0, 0,
+    }, try pcm.encodePcm16Into(samples, &bytes));
+}
+
+test "G.711 refusal ordering preserves caller storage" {
+    var shared: [4]f32 = @splat(0.25);
+    const before = shared;
+    const bytes = std.mem.sliceAsBytes(&shared);
+    try std.testing.expectError(
+        error.DestinationTooSmall,
+        g711.decodeInto(bytes[0..4], shared[0..3], .alaw),
+    );
+    try std.testing.expectError(error.Aliasing, g711.decodeInto(bytes[0..4], &shared, .alaw));
+    try std.testing.expectEqualSlices(f32, &before, &shared);
+}
 
 test "PCM packed precision and finite float words from outside the module" {
     const bytes = [_]u8{ 0, 0, 128, 255, 255, 255, 0, 0, 0, 255, 255, 127 };

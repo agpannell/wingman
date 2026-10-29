@@ -12,6 +12,8 @@
 //!
 //! PCM converts little-endian audio samples to caller-owned f32 storage and writes PCM16 through
 //! std.Io.Writer. It retains no input, allocation or channel/rate policy.
+//!
+//! G.711 expands A-law and mu-law voice bytes to exact PCM16 or caller-owned normalized f32.
 
 pub const adler32 = @import("adler32.zig");
 pub const crc32 = @import("crc32.zig");
@@ -19,6 +21,7 @@ pub const xxhash32 = @import("xxhash32.zig");
 pub const xxhash64 = @import("xxhash64.zig");
 pub const riff = @import("riff.zig");
 pub const pcm = @import("pcm.zig");
+pub const g711 = @import("g711.zig");
 
 test {
     _ = adler32;
@@ -27,4 +30,5 @@ test {
     _ = xxhash64;
     _ = riff;
     _ = pcm;
+    _ = g711;
 }

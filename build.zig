@@ -52,6 +52,12 @@ pub fn build(b: *std.Build) void {
             .executable = "pcm-convert",
             .description = "Encode PCM16 and inspect normalized sample quantization",
         },
+        .{
+            .step = "g711-example",
+            .source = "examples/g711.zig",
+            .executable = "g711-decode",
+            .description = "Expand A-law and mu-law bytes and write their PCM16 values",
+        },
     };
     for (examples) |example| {
         const module = b.createModule(

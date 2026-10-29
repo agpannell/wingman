@@ -6,6 +6,7 @@ The package provides **Adler-32** for zlib, **IEEE CRC-32** for gzip and PNG, an
 incremental input; the checksum libraries also combine independently processed sequences.
 **RIFF** reads and writes bounded containers and chunks used by formats such as WAVE and WebP.
 **PCM** converts raw audio samples to caller-owned floats and writes normalized PCM16.
+**G.711** expands A-law and mu-law voice bytes to exact PCM16 values or normalized floats.
 
 Wingman accepts exact, unaligned byte slices and allocates no memory for these calculations or
 container inspection. RIFF writing uses the caller's `std.Io.Writer` and its storage policy.
@@ -27,6 +28,7 @@ zig build crc32-example
 zig build xxhash-example
 zig build riff-example
 zig build pcm-example
+zig build g711-example
 ```
 
 The Adler-32 example prints checksum `091e01de` for `123456789`, checks that streaming and
@@ -36,6 +38,7 @@ computes the big-endian checksum of PNG's empty `IEND` chunk.
 The xxHash example prints both widths with zero and nonzero seeds and checks fragmented input.
 The RIFF example writes a nested generic container, then prints its form, list and payload extents.
 The PCM example shows exact sample bytes and the quantized positive PCM16 endpoint.
+The G.711 example expands both laws and checks their little-endian PCM16 output.
 
 ```zig
 const std = @import("std");
@@ -73,6 +76,7 @@ specific revision when taking a source dependency.
 | `wingman.xxhash32`, `wingman.xxhash64` | Seeded and seed-zero classic xxHash, with copied streaming state | [xxHash](docs/xxhash.md) |
 | `wingman.riff` | Borrowed container/chunk traversal, nested lists and checked writing through `std.Io.Writer` | [RIFF](docs/riff.md) |
 | `wingman.pcm` | Little-endian sample conversion to `f32` and normalized PCM16 output | [PCM](docs/pcm.md) |
+| `wingman.g711` | A-law and mu-law voice decoding to exact PCM16 or caller-owned `f32` | [G.711](docs/g711.md) |
 
 The guides explain results, state and input lifetimes, byte order, checksum combination and how
 vector sums, polynomial folding and four-lane word mixing work. The source includes independent

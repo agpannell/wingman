@@ -37,6 +37,7 @@ jobs:
           zig build xxhash-example
           zig build riff-example
           zig build pcm-example
+          zig build g711-example
           zig build docs
       - name: Test a separate consumer
         working-directory: examples/consumer
