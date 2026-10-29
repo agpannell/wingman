@@ -1,0 +1,11 @@
+.{
+    .name = .wingman,
+    .version = "0.0.0",
+    .fingerprint = 0x8d482715aab69249,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",             "build.zig.zon",               "src",                             "docs",                  "README.md", "LICENSE",
+        "examples/checksum.zig", "examples/consumer/build.zig", "examples/consumer/build.zig.zon", "examples/consumer/src",
+    },
+}

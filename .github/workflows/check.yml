@@ -1,0 +1,41 @@
+name: Check
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  zig:
+    runs-on: ubuntu-24.04
+    env:
+      ZIG_VERSION: 0.17.0
+      ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install the selected compiler
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+            --output "$archive"
+          echo "$ZIG_SHA256  $archive" | sha256sum --check
+          tar -xf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - name: Check compiler and formatting
+        run: |
+          test "$(zig version)" = "$ZIG_VERSION"
+          zig fmt --check build.zig build.zig.zon src examples
+      - name: Checked baseline tests
+        run: zig build test -Doptimize=ReleaseSafe -Dcpu=baseline --seed=0 --summary all
+      - name: Optimized baseline tests
+        run: zig build test -Doptimize=ReleaseFast -Dcpu=baseline --seed=0 --summary all
+      - name: Run the example and generate the reference
+        run: |
+          zig build example -- Wikipedia
+          zig build docs
+      - name: Test a separate consumer
+        working-directory: examples/consumer
+        run: |
+          zig build test -Doptimize=ReleaseSafe -Dcpu=baseline --summary all
+          zig build test -Doptimize=ReleaseFast -Dcpu=baseline --summary all
