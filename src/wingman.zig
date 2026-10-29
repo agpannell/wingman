@@ -9,12 +9,16 @@
 //!
 //! RIFF reads borrowed container/chunk views and writes checked framing through std.Io.Writer.
 //! Payload decoding and format-specific policy remain with the caller.
+//!
+//! PCM converts little-endian audio samples to caller-owned f32 storage and writes PCM16 through
+//! std.Io.Writer. It retains no input, allocation or channel/rate policy.
 
 pub const adler32 = @import("adler32.zig");
 pub const crc32 = @import("crc32.zig");
 pub const xxhash32 = @import("xxhash32.zig");
 pub const xxhash64 = @import("xxhash64.zig");
 pub const riff = @import("riff.zig");
+pub const pcm = @import("pcm.zig");
 
 test {
     _ = adler32;
@@ -22,4 +26,5 @@ test {
     _ = xxhash32;
     _ = xxhash64;
     _ = riff;
+    _ = pcm;
 }

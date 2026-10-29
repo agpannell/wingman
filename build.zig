@@ -46,6 +46,12 @@ pub fn build(b: *std.Build) void {
             .executable = "riff-inspect",
             .description = "Write and inspect a RIFF container with nested typed chunks",
         },
+        .{
+            .step = "pcm-example",
+            .source = "examples/pcm.zig",
+            .executable = "pcm-convert",
+            .description = "Encode PCM16 and inspect normalized sample quantization",
+        },
     };
     for (examples) |example| {
         const module = b.createModule(

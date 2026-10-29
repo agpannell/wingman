@@ -5,6 +5,44 @@ const crc32 = @import("wingman").crc32;
 const xxhash32 = @import("wingman").xxhash32;
 const xxhash64 = @import("wingman").xxhash64;
 const riff = @import("wingman").riff;
+const pcm = @import("wingman").pcm;
+
+test "PCM packed precision and finite float words from outside the module" {
+    const bytes = [_]u8{ 0, 0, 128, 255, 255, 255, 0, 0, 0, 255, 255, 127 };
+    var destination: [6]f32 = @splat(123);
+    const result = try pcm.decodeInto(&bytes, &destination, .{ .encoding = .signed24 });
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -1, -1.0 / 8388608.0, 0, 8388607.0 / 8388608.0 },
+        result,
+    );
+    try std.testing.expectEqualSlices(f32, &.{ 123, 123 }, destination[4..]);
+    try std.testing.expectEqual(3, pcm.Encoding.signed24.byteCount());
+    try std.testing.expectError(error.InvalidData, pcm.sampleCount(5, .{ .encoding = .signed24 }));
+    const float_bytes = [_]u8{ 0, 0, 0, 128, 0, 0, 0, 64 };
+    const floats = try pcm.decodeInto(&float_bytes, &destination, .{ .encoding = .float32 });
+    try std.testing.expectEqual(0x80000000, @as(u32, @bitCast(floats[0])));
+    try std.testing.expectEqual(2, floats[1]);
+}
+
+test "PCM16 caller storage and Writer validate before output" {
+    const samples = [_]f32{ -1, -0.5, 0, 0.5, 1 };
+    var bytes: [12]u8 = @splat(0xa7);
+    const encoded = try pcm.encodePcm16Into(&samples, &bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 192, 0, 0, 0, 64, 255, 127 }, encoded);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa7, 0xa7 }, bytes[10..]);
+    var writer_bytes: [10]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_bytes);
+    try pcm.writePcm16(&samples, &writer);
+    try std.testing.expectEqualSlices(u8, encoded, writer.buffered());
+    try std.testing.expectError(error.InvalidSamples, pcm.validatePcm16(&.{1.5}));
+    const before = bytes;
+    try std.testing.expectError(
+        error.InvalidSamples,
+        pcm.encodePcm16Into(&.{std.math.nan(f32)}, &bytes),
+    );
+    try std.testing.expectEqualSlices(u8, &before, &bytes);
+}
 
 test "RIFF borrowed chunks and externally resolved geometry" {
     const bytes = "RIFF\x0e\x00\x00\x00TESTdata\x01\x00\x00\x00x\xa5tail";
