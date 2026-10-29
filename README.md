@@ -1,18 +1,38 @@
 # Wingman
 
-Focused Zig libraries for byte processing, with explicit ownership and documented format contracts.
-The package provides **Adler-32** for zlib, **IEEE CRC-32** for gzip and PNG, and classic
-**XXH32/XXH64** hashes for lookup keys and content checksums. Each supports complete buffers and
-incremental input; the checksum libraries also combine independently processed sequences.
-**RIFF** reads and writes bounded containers and chunks used by formats such as WAVE and WebP.
-**PCM** converts raw audio samples to caller-owned floats and writes normalized PCM16.
-**G.711** expands A-law and mu-law voice bytes to exact PCM16 values or normalized floats.
+Zig libraries for checksums, binary containers and audio samples. Use each library independently,
+with explicit input lifetimes, caller-owned storage and documented format contracts.
 
-Wingman accepts exact, unaligned byte slices and allocates no memory for these calculations or
-container inspection. RIFF writing uses the caller's `std.Io.Writer` and its storage policy.
-PCM conversion also allocates nothing; it leaves rate, channels and container policy with callers.
-The checksum kernels select portable or SIMD implementations from the compile-time target.
-Input chunks can be released as soon as an update returns.
+## Libraries
+
+Import libraries from `@import("wingman")`. The linked guides explain when to use each one, its
+ownership and failure rules, and the ideas behind its implementation.
+
+### Checksums and hashes
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
+| [`adler32`](docs/adler32.md) | zlib checksums, streaming and checksum combination | `example` |
+| [`crc32`](docs/crc32.md) | IEEE CRC-32 for gzip and PNG, streaming and combination | `crc32-example` |
+| [`xxhash32`, `xxhash64`](docs/xxhash.md) | Classic seeded hashes with copied streaming state | `xxhash-example` |
+
+These noncryptographic values detect accidental corruption or support lookups; matching values
+do not establish input identity or authenticate a message. IEEE CRC-32 differs from CRC-32C and
+the x86 instruction named CRC32.
+
+### Containers and audio
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
+| [`riff`](docs/riff.md) | Borrowed container/chunk traversal, nested lists and checked writing | `riff-example` |
+| [`pcm`](docs/pcm.md) | Little-endian integer/float sample conversion and PCM16 writing | `pcm-example` |
+| [`g711`](docs/g711.md) | A-law and mu-law decoding to exact PCM16 or normalized floats | `g711-example` |
+| [`adpcm`](docs/adpcm.md) | Microsoft and IMA/DVI WAVE block decoding, including validated frame prefixes | `adpcm-example` |
+
+RIFF handles container framing; payload interpretation belongs to its caller. The audio libraries
+convert sample representations. Callers supply the required layout or block geometry and own
+container, sample-rate and playback policy. A valid RIFF envelope alone does not establish a valid
+media file, and the ADPCM library accepts complete blocks rather than parsing a WAVE file.
 
 ## Try it
 
@@ -22,23 +42,31 @@ From this checkout:
 ```sh
 zig version
 zig build test --seed=0 --summary all
-zig build example
 zig build example -- Wikipedia
-zig build crc32-example
-zig build xxhash-example
-zig build riff-example
-zig build pcm-example
-zig build g711-example
+zig build examples
 ```
 
-The Adler-32 example prints checksum `091e01de` for `123456789`, checks that streaming and
-concatenation give the same result, and shows the four bytes used in a zlib footer.
-The CRC example prints `cbf43926` for the same input, shows gzip's little-endian CRC field and
-computes the big-endian checksum of PNG's empty `IEND` chunk.
-The xxHash example prints both widths with zero and nonzero seeds and checks fragmented input.
-The RIFF example writes a nested generic container, then prints its form, list and payload extents.
-The PCM example shows exact sample bytes and the quantized positive PCM16 endpoint.
-The G.711 example expands both laws and checks their little-endian PCM16 output.
+The Adler-32 example checks streaming and checksum combination, then shows the zlib footer bytes
+`11 e6 03 98` for `Wikipedia`. `zig build examples` runs every example in the tables above.
+Run one with `zig build <example-step>`; the checksum, hash and RIFF examples also accept text
+after `--`.
+
+The examples exercise complete public API calls: format-specific checksum bytes, seeded hashes,
+nested chunks, sample quantization and compressed-block decoding with PCM16 output. Each checks
+its results as it runs. The [source files](examples/) are small standalone starting points.
+
+## Use it in a project
+
+The [standalone consumer](examples/consumer/) shows a complete Zig build with a named `wingman`
+dependency. It runs independently of the root test build:
+
+```sh
+cd examples/consumer
+zig build test -Doptimize=ReleaseSafe --summary all
+```
+
+Use `dependency.module("wingman")` to import the package. The current API is pre-release; pin a
+specific revision when taking a source dependency. For example:
 
 ```zig
 const std = @import("std");
@@ -54,61 +82,43 @@ test "complete and streaming checksums" {
 }
 ```
 
-## Use it in a project
+## Ownership and implementation
 
-The [standalone consumer](examples/consumer/) shows a complete Zig build with a named `wingman`
-dependency. It runs independently of the root test build:
+The libraries accept exact, unaligned input bytes and perform no hidden allocation. Hash and
+checksum states copy what they need, so an input chunk can be released after `update` returns.
+RIFF views borrow their input; keep that storage alive while using the views. Audio conversion
+writes caller-provided output. RIFF and PCM writing use the caller's `std.Io.Writer`; callers
+choose its storage, handle backend failures and flush it.
 
-```sh
-cd examples/consumer
-zig build test -Doptimize=ReleaseSafe --summary all
-```
+The guides specify numeric encoding, admitted regions and partial-output behavior for each API.
+They also explain the mechanisms behind the contracts: vector sums, polynomial folding,
+four-lane word mixing, checked chunk extents, sample quantization and adaptive prediction.
+Tests stay with their implementations and include independent values, scalar comparisons,
+state and storage boundaries, and protected-page input checks where applicable.
 
-Use `dependency.module("wingman")` to import the package. The current API is pre-release; pin a
-specific revision when taking a source dependency.
-
-## Library and engineering guide
-
-| Library | Purpose | Guide |
-| --- | --- | --- |
-| `wingman.adler32` | Complete and incremental checksums; combine independently processed sequences | [Adler-32](docs/adler32.md) |
-| `wingman.crc32` | IEEE checksums for gzip content and PNG chunks, including streaming and combination | [CRC-32](docs/crc32.md) |
-| `wingman.xxhash32`, `wingman.xxhash64` | Seeded and seed-zero classic xxHash, with copied streaming state | [xxHash](docs/xxhash.md) |
-| `wingman.riff` | Borrowed container/chunk traversal, nested lists and checked writing through `std.Io.Writer` | [RIFF](docs/riff.md) |
-| `wingman.pcm` | Little-endian sample conversion to `f32` and normalized PCM16 output | [PCM](docs/pcm.md) |
-| `wingman.g711` | A-law and mu-law voice decoding to exact PCM16 or caller-owned `f32` | [G.711](docs/g711.md) |
-
-The guides explain results, state and input lifetimes, byte order, checksum combination and how
-vector sums, polynomial folding and four-lane word mixing work. The source includes independent
-fixed values, scalar comparisons, state-boundary tests and protected-page input checks.
-The RIFF guide explains declared extents, lazy child validation, word padding and caller-owned
-payload policy; a valid envelope alone does not establish a valid media file.
-
-Generate the API reference with `zig build docs`. Open `zig-out/docs/index.html` through a local
-HTTP server. Run `python3 -m http.server --directory zig-out/docs 8000`, then visit
+Generate the API reference with `zig build docs`. Serve `zig-out/docs` over HTTP, for example
+with `python3 -m http.server --directory zig-out/docs 8000`, then open
 `http://localhost:8000`.
 
-## Contributing
+## Contributing and validation
 
-Tests and examples use Zig 0.17.0 with LLVM.
-
-Format Zig and Markdown to 100 columns. Before sending a change, run the tests in both checked and
-optimized modes:
+Tests and examples use Zig 0.17.0 with LLVM. Format Zig and Markdown to 100 columns. Run the tests
+in checked and optimized modes, every example, and the generated reference:
 
 ```sh
 zig fmt --check build.zig build.zig.zon src examples
 zig build test -Doptimize=ReleaseSafe --seed=0 --summary all
 zig build test -Doptimize=ReleaseFast --seed=0 --summary all
+zig build examples
 zig build docs
 ```
 
-Use `-Dtarget` and `-Dcpu` for a different compile-time target. A binary built for additional CPU
-features requires hardware with those features. The implementation has no runtime CPU dispatcher.
-The CI configuration checks baseline x86-64 Linux; its results do not establish support on every
-architecture. These noncryptographic checksums detect accidental corruption; matching values do
-not establish that two inputs are identical. CRC-32 here uses the IEEE polynomial, which differs
-from CRC-32C and the x86 instruction named CRC32.
+Use `-Dtarget` and `-Dcpu` for a different compile-time target. Checksum kernels select portable
+or SIMD implementations from that target; there is no runtime CPU dispatcher. A binary built
+with additional CPU features requires those features on the machine that runs it. CI checks
+baseline x86-64 Linux, including the separate consumer; its results do not establish support on
+every architecture.
 
 ## License
 
-[MIT](LICENSE). Algorithm references are credited beside the relevant source.
+[MIT](LICENSE). Algorithm and format references are credited beside the relevant source.

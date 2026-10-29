@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
         "Run library tests and executable documentation examples",
     ).dependOn(&b.addRunArtifact(tests).step);
 
+    const all_examples = b.step("examples", "Run all library examples");
     const examples = [_]struct {
         step: []const u8,
         source: []const u8,
@@ -58,6 +59,12 @@ pub fn build(b: *std.Build) void {
             .executable = "g711-decode",
             .description = "Expand A-law and mu-law bytes and write their PCM16 values",
         },
+        .{
+            .step = "adpcm-example",
+            .source = "examples/adpcm.zig",
+            .executable = "adpcm-decode",
+            .description = "Decode Microsoft and IMA blocks and validate prefix output",
+        },
     };
     for (examples) |example| {
         const module = b.createModule(
@@ -70,6 +77,7 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(executable);
         run.addPassthruArgs();
         b.step(example.step, example.description).dependOn(&run.step);
+        all_examples.dependOn(&run.step);
     }
 
     const reference = b.addObject(.{ .name = "wingman", .root_module = wingman, .use_llvm = true });

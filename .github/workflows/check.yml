@@ -30,15 +30,12 @@ jobs:
         run: zig build test -Doptimize=ReleaseSafe -Dcpu=baseline --seed=0 --summary all
       - name: Optimized baseline tests
         run: zig build test -Doptimize=ReleaseFast -Dcpu=baseline --seed=0 --summary all
-      - name: Run the example and generate the reference
+      - name: Run all examples
         run: |
           zig build example -- Wikipedia
-          zig build crc32-example
-          zig build xxhash-example
-          zig build riff-example
-          zig build pcm-example
-          zig build g711-example
-          zig build docs
+          zig build examples
+      - name: Generate the API reference
+        run: zig build docs
       - name: Test a separate consumer
         working-directory: examples/consumer
         run: |

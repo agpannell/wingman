@@ -1,34 +1,33 @@
-//! Focused byte-processing libraries with explicit caller ownership.
+//! Independent libraries for checksums, binary containers and audio samples.
 //!
-//! Adler-32 and IEEE CRC-32 compute checksums without allocating or retaining input. Each library
-//! provides hash for a complete buffer, Hasher for fragments, and combine for independently
-//! processed sequences. Each owns its format, API documentation and executable examples.
+//! Use adler32 or crc32 for format-specific checksums, and xxhash32 or xxhash64 for seeded hashes.
+//! Each supports complete input and caller-owned streaming state; the checksum libraries also
+//! combine separately processed sequences.
 //!
-//! XXH32 and XXH64 provide seeded hashes for lookup keys and content checksums. Their Hasher states
-//! copy pending bytes and provide non-consuming snapshots; no input or allocator is retained.
+//! Use riff for container framing, pcm for raw sample conversion, and g711 or adpcm for compressed
+//! sample decoding. Callers supply the format geometry and own container and playback policy.
 //!
-//! RIFF reads borrowed container/chunk views and writes checked framing through std.Io.Writer.
-//! Payload decoding and format-specific policy remain with the caller.
-//!
-//! PCM converts little-endian audio samples to caller-owned f32 storage and writes PCM16 through
-//! std.Io.Writer. It retains no input, allocation or channel/rate policy.
-//!
-//! G.711 expands A-law and mu-law voice bytes to exact PCM16 or caller-owned normalized f32.
+//! RIFF views borrow input. Hash states copy pending bytes, and audio decoders write caller-owned
+//! output. No library hides allocation. RIFF and PCM writing use the caller's std.Io.Writer.
 
 pub const adler32 = @import("adler32.zig");
 pub const crc32 = @import("crc32.zig");
 pub const xxhash32 = @import("xxhash32.zig");
 pub const xxhash64 = @import("xxhash64.zig");
+
 pub const riff = @import("riff.zig");
 pub const pcm = @import("pcm.zig");
 pub const g711 = @import("g711.zig");
+pub const adpcm = @import("adpcm.zig");
 
 test {
     _ = adler32;
     _ = crc32;
     _ = xxhash32;
     _ = xxhash64;
+
     _ = riff;
     _ = pcm;
     _ = g711;
+    _ = adpcm;
 }

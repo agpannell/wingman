@@ -7,155 +7,9 @@ const xxhash64 = @import("wingman").xxhash64;
 const riff = @import("wingman").riff;
 const pcm = @import("wingman").pcm;
 const g711 = @import("wingman").g711;
+const adpcm = @import("wingman").adpcm;
 
-test "G.711 scalar facts normalized output and PCM16 composition" {
-    try std.testing.expectEqual(-8, g711.decodeAlaw(0x55));
-    try std.testing.expectEqual(8, g711.decodeAlaw(0xd5));
-    try std.testing.expectEqual(0, g711.decodeMulaw(0x7f));
-    try std.testing.expectEqual(0, g711.decodeMulaw(0xff));
-    const source = [_]u8{ 0, 128, 127, 255 };
-    var output: [6]f32 = @splat(42);
-    const samples = try g711.decodeInto(&source, &output, .mulaw);
-    try std.testing.expectEqualSlices(
-        f32,
-        &.{ -32124.0 / 32768.0, 32124.0 / 32768.0, 0, 0 },
-        samples,
-    );
-    try std.testing.expectEqualSlices(f32, &.{ 42, 42 }, output[4..]);
-    var bytes: [8]u8 = undefined;
-    try std.testing.expectEqualSlices(u8, &.{
-        0x84, 0x82, 0x7c, 0x7d, 0, 0, 0, 0,
-    }, try pcm.encodePcm16Into(samples, &bytes));
-}
-
-test "G.711 refusal ordering preserves caller storage" {
-    var shared: [4]f32 = @splat(0.25);
-    const before = shared;
-    const bytes = std.mem.sliceAsBytes(&shared);
-    try std.testing.expectError(
-        error.DestinationTooSmall,
-        g711.decodeInto(bytes[0..4], shared[0..3], .alaw),
-    );
-    try std.testing.expectError(error.Aliasing, g711.decodeInto(bytes[0..4], &shared, .alaw));
-    try std.testing.expectEqualSlices(f32, &before, &shared);
-}
-
-test "PCM packed precision and finite float words from outside the module" {
-    const bytes = [_]u8{ 0, 0, 128, 255, 255, 255, 0, 0, 0, 255, 255, 127 };
-    var destination: [6]f32 = @splat(123);
-    const result = try pcm.decodeInto(&bytes, &destination, .{ .encoding = .signed24 });
-    try std.testing.expectEqualSlices(
-        f32,
-        &.{ -1, -1.0 / 8388608.0, 0, 8388607.0 / 8388608.0 },
-        result,
-    );
-    try std.testing.expectEqualSlices(f32, &.{ 123, 123 }, destination[4..]);
-    try std.testing.expectEqual(3, pcm.Encoding.signed24.byteCount());
-    try std.testing.expectError(error.InvalidData, pcm.sampleCount(5, .{ .encoding = .signed24 }));
-    const float_bytes = [_]u8{ 0, 0, 0, 128, 0, 0, 0, 64 };
-    const floats = try pcm.decodeInto(&float_bytes, &destination, .{ .encoding = .float32 });
-    try std.testing.expectEqual(0x80000000, @as(u32, @bitCast(floats[0])));
-    try std.testing.expectEqual(2, floats[1]);
-}
-
-test "PCM16 caller storage and Writer validate before output" {
-    const samples = [_]f32{ -1, -0.5, 0, 0.5, 1 };
-    var bytes: [12]u8 = @splat(0xa7);
-    const encoded = try pcm.encodePcm16Into(&samples, &bytes);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 192, 0, 0, 0, 64, 255, 127 }, encoded);
-    try std.testing.expectEqualSlices(u8, &.{ 0xa7, 0xa7 }, bytes[10..]);
-    var writer_bytes: [10]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&writer_bytes);
-    try pcm.writePcm16(&samples, &writer);
-    try std.testing.expectEqualSlices(u8, encoded, writer.buffered());
-    try std.testing.expectError(error.InvalidSamples, pcm.validatePcm16(&.{1.5}));
-    const before = bytes;
-    try std.testing.expectError(
-        error.InvalidSamples,
-        pcm.encodePcm16Into(&.{std.math.nan(f32)}, &bytes),
-    );
-    try std.testing.expectEqualSlices(u8, &before, &bytes);
-}
-
-test "RIFF borrowed chunks and externally resolved geometry" {
-    const bytes = "RIFF\x0e\x00\x00\x00TESTdata\x01\x00\x00\x00x\xa5tail";
-    const form = try riff.parse(bytes);
-    try std.testing.expectEqualStrings("TEST", &form.form_type);
-    try std.testing.expectEqual(22, form.source.len);
-    var chunks = form.iterator();
-    const chunk = (try chunks.next()).?;
-    try std.testing.expectEqualStrings("data", chunk.id);
-    try std.testing.expectEqualStrings("x", chunk.data);
-    try std.testing.expectEqual(0xa5, chunk.padding.?);
-    try std.testing.expectEqual(null, try chunks.next());
-    var resolved: riff.ChunkIterator = .{ .source = "data\xff\xff\xff\xffx\x00" };
-    try std.testing.expectError(error.InvalidRiff, resolved.nextResolved(3));
-    try std.testing.expectEqual(0, resolved.offset);
-    try std.testing.expectEqualStrings("x", (try resolved.nextResolved(1)).?.data);
-}
-
-test "RIFF writer literal bytes and lazy nested lists" {
-    var bytes: [22]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&bytes);
-    try riff.writeHeader("DEMO".*, try riff.chunkSize(1), &writer);
-    try riff.writeChunk("note".*, "x", &writer);
-    try std.testing.expectEqualStrings("RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00", &bytes);
-    var outer: riff.ChunkIterator = .{ .source = "LIST\x05\x00\x00\x00INFOx\x00" };
-    const list = try (try outer.next()).?.list();
-    try std.testing.expectEqualStrings("INFO", &list.list_type);
-    var children = list.iterator();
-    try std.testing.expectError(error.InvalidRiff, children.next());
-}
-
-test "classic xxHash fixed facts and seeded streaming" {
-    try std.testing.expectEqual(@as(u32, 0x32d153ff), xxhash32.hash("abc"));
-    try std.testing.expectEqual(@as(u64, 0x44bc2cf5ad770999), xxhash64.hash("abc"));
-    try std.testing.expectEqual(@as(u32, 0xaa3da8ff), xxhash32.hashSeeded(1, "abc"));
-    try std.testing.expectEqual(@as(u64, 0x13c1d910702770e6), xxhash64.hashSeeded(42, "abc"));
-    var state32: xxhash32.Hasher = undefined;
-    var state64: xxhash64.Hasher = undefined;
-    state32.reset(0xffffffff);
-    state64.reset(0x8000000000000001);
-    state32.update("a");
-    state64.update("a");
-    const prefix32 = state32.final();
-    const prefix64 = state64.final();
-    var copy32 = state32;
-    var copy64 = state64;
-    state32.update("bc");
-    state64.update("bc");
-    copy32.update("d");
-    copy64.update("d");
-    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "a"), prefix32);
-    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "a"), prefix64);
-    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "abc"), state32.final());
-    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "abc"), state64.final());
-    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "ad"), copy32.final());
-    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "ad"), copy64.final());
-}
-
-test "classic xxHash numeric encoding and zero-seed reset" {
-    var canonical32: [4]u8 = undefined;
-    var canonical64: [8]u8 = undefined;
-    std.mem.writeInt(u32, &canonical32, xxhash32.hash("abc"), .big);
-    std.mem.writeInt(u64, &canonical64, xxhash64.hash("abc"), .big);
-    try std.testing.expectEqual([4]u8{ 0x32, 0xd1, 0x53, 0xff }, canonical32);
-    try std.testing.expectEqual([8]u8{
-        0x44, 0xbc, 0x2c, 0xf5, 0xad, 0x77, 0x09, 0x99,
-    }, canonical64);
-    var state32: xxhash32.Hasher = .init;
-    var state64: xxhash64.Hasher = .init;
-    state32.update("discard");
-    state64.update("discard");
-    state32 = .init;
-    state64 = .init;
-    state32.update("");
-    state64.update("");
-    try std.testing.expectEqual(@as(u32, 0x02cc5d05), state32.final());
-    try std.testing.expectEqual(@as(u64, 0xef46db3751d8e999), state64.final());
-}
-
-test "one-shot streaming and byte order" {
+test "Adler-32 one-shot streaming and byte order" {
     const result = adler32.hash("Wikipedia");
     try std.testing.expectEqual(@as(u32, 0x11e60398), result);
     var state: adler32.Hasher = .init;
@@ -167,6 +21,30 @@ test "one-shot streaming and byte order" {
     var footer: [4]u8 = undefined;
     std.mem.writeInt(u32, &footer, result, .big);
     try std.testing.expectEqual([4]u8{ 0x11, 0xe6, 0x03, 0x98 }, footer);
+}
+
+test "Adler-32 retired inputs independent states and combination" {
+    var input = "123456789".*;
+    var state: adler32.Hasher = .init;
+    state.update(&input);
+    @memset(&input, 0xff);
+    try std.testing.expectEqual(@as(u32, 0x091e01de), state.final());
+    var copy = state;
+    state = .init;
+    state.update("");
+    try std.testing.expectEqual(@as(u32, 1), state.final());
+    copy.update("0");
+    try std.testing.expectEqual(std.hash.Adler32.hash("1234567890"), copy.final());
+
+    const chunks = [_][]const u8{ "123", "456", "789" };
+    const operator = adler32.CombineOperator.forLength(3);
+    var combined: u32 = 1;
+    for (chunks) |chunk| combined = operator.apply(combined, adler32.hash(chunk));
+    try std.testing.expectEqual(@as(u32, 0x091e01de), combined);
+    try std.testing.expectEqual(
+        @as(u32, 0x11e60398),
+        adler32.combine(adler32.hash("Wiki"), adler32.hash("pedia"), 5),
+    );
 }
 
 test "IEEE CRC streaming snapshots copies and retired input" {
@@ -222,26 +100,199 @@ test "IEEE CRC reusable combination operators" {
     try std.testing.expectEqual(crc32.combine(1, 2, wide_length), wide.apply(1, 2));
 }
 
-test "retired inputs independent states and checksum combination" {
-    var input = "123456789".*;
-    var state: adler32.Hasher = .init;
-    state.update(&input);
-    @memset(&input, 0xff);
-    try std.testing.expectEqual(@as(u32, 0x091e01de), state.final());
-    var copy = state;
-    state = .init;
-    state.update("");
-    try std.testing.expectEqual(@as(u32, 1), state.final());
-    copy.update("0");
-    try std.testing.expectEqual(std.hash.Adler32.hash("1234567890"), copy.final());
+test "classic xxHash fixed facts and seeded streaming" {
+    try std.testing.expectEqual(@as(u32, 0x32d153ff), xxhash32.hash("abc"));
+    try std.testing.expectEqual(@as(u64, 0x44bc2cf5ad770999), xxhash64.hash("abc"));
+    try std.testing.expectEqual(@as(u32, 0xaa3da8ff), xxhash32.hashSeeded(1, "abc"));
+    try std.testing.expectEqual(@as(u64, 0x13c1d910702770e6), xxhash64.hashSeeded(42, "abc"));
+    var state32: xxhash32.Hasher = undefined;
+    var state64: xxhash64.Hasher = undefined;
+    state32.reset(0xffffffff);
+    state64.reset(0x8000000000000001);
+    state32.update("a");
+    state64.update("a");
+    const prefix32 = state32.final();
+    const prefix64 = state64.final();
+    var copy32 = state32;
+    var copy64 = state64;
+    state32.update("bc");
+    state64.update("bc");
+    copy32.update("d");
+    copy64.update("d");
+    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "a"), prefix32);
+    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "a"), prefix64);
+    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "abc"), state32.final());
+    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "abc"), state64.final());
+    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "ad"), copy32.final());
+    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "ad"), copy64.final());
+}
 
-    const chunks = [_][]const u8{ "123", "456", "789" };
-    const operator = adler32.CombineOperator.forLength(3);
-    var combined: u32 = 1;
-    for (chunks) |chunk| combined = operator.apply(combined, adler32.hash(chunk));
-    try std.testing.expectEqual(@as(u32, 0x091e01de), combined);
-    try std.testing.expectEqual(
-        @as(u32, 0x11e60398),
-        adler32.combine(adler32.hash("Wiki"), adler32.hash("pedia"), 5),
+test "classic xxHash numeric encoding and zero-seed reset" {
+    var canonical32: [4]u8 = undefined;
+    var canonical64: [8]u8 = undefined;
+    std.mem.writeInt(u32, &canonical32, xxhash32.hash("abc"), .big);
+    std.mem.writeInt(u64, &canonical64, xxhash64.hash("abc"), .big);
+    try std.testing.expectEqual([4]u8{ 0x32, 0xd1, 0x53, 0xff }, canonical32);
+    try std.testing.expectEqual([8]u8{
+        0x44, 0xbc, 0x2c, 0xf5, 0xad, 0x77, 0x09, 0x99,
+    }, canonical64);
+    var state32: xxhash32.Hasher = .init;
+    var state64: xxhash64.Hasher = .init;
+    state32.update("discard");
+    state64.update("discard");
+    state32 = .init;
+    state64 = .init;
+    state32.update("");
+    state64.update("");
+    try std.testing.expectEqual(@as(u32, 0x02cc5d05), state32.final());
+    try std.testing.expectEqual(@as(u64, 0xef46db3751d8e999), state64.final());
+}
+
+test "RIFF borrowed chunks and externally resolved geometry" {
+    const bytes = "RIFF\x0e\x00\x00\x00TESTdata\x01\x00\x00\x00x\xa5tail";
+    const form = try riff.parse(bytes);
+    try std.testing.expectEqualStrings("TEST", &form.form_type);
+    try std.testing.expectEqual(22, form.source.len);
+    var chunks = form.iterator();
+    const chunk = (try chunks.next()).?;
+    try std.testing.expectEqualStrings("data", chunk.id);
+    try std.testing.expectEqualStrings("x", chunk.data);
+    try std.testing.expectEqual(0xa5, chunk.padding.?);
+    try std.testing.expectEqual(null, try chunks.next());
+    var resolved: riff.ChunkIterator = .{ .source = "data\xff\xff\xff\xffx\x00" };
+    try std.testing.expectError(error.InvalidRiff, resolved.nextResolved(3));
+    try std.testing.expectEqual(0, resolved.offset);
+    try std.testing.expectEqualStrings("x", (try resolved.nextResolved(1)).?.data);
+}
+
+test "RIFF writer literal bytes and lazy nested lists" {
+    var bytes: [22]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&bytes);
+    try riff.writeHeader("DEMO".*, try riff.chunkSize(1), &writer);
+    try riff.writeChunk("note".*, "x", &writer);
+    try std.testing.expectEqualStrings("RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00", &bytes);
+    var outer: riff.ChunkIterator = .{ .source = "LIST\x05\x00\x00\x00INFOx\x00" };
+    const list = try (try outer.next()).?.list();
+    try std.testing.expectEqualStrings("INFO", &list.list_type);
+    var children = list.iterator();
+    try std.testing.expectError(error.InvalidRiff, children.next());
+}
+
+test "PCM packed precision and finite float words from outside the module" {
+    const bytes = [_]u8{ 0, 0, 128, 255, 255, 255, 0, 0, 0, 255, 255, 127 };
+    var destination: [6]f32 = @splat(123);
+    const result = try pcm.decodeInto(&bytes, &destination, .{ .encoding = .signed24 });
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -1, -1.0 / 8388608.0, 0, 8388607.0 / 8388608.0 },
+        result,
+    );
+    try std.testing.expectEqualSlices(f32, &.{ 123, 123 }, destination[4..]);
+    try std.testing.expectEqual(3, pcm.Encoding.signed24.byteCount());
+    try std.testing.expectError(error.InvalidData, pcm.sampleCount(5, .{ .encoding = .signed24 }));
+    const float_bytes = [_]u8{ 0, 0, 0, 128, 0, 0, 0, 64 };
+    const floats = try pcm.decodeInto(&float_bytes, &destination, .{ .encoding = .float32 });
+    try std.testing.expectEqual(0x80000000, @as(u32, @bitCast(floats[0])));
+    try std.testing.expectEqual(2, floats[1]);
+}
+
+test "PCM16 caller storage and Writer validate before output" {
+    const samples = [_]f32{ -1, -0.5, 0, 0.5, 1 };
+    var bytes: [12]u8 = @splat(0xa7);
+    const encoded = try pcm.encodePcm16Into(&samples, &bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 192, 0, 0, 0, 64, 255, 127 }, encoded);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa7, 0xa7 }, bytes[10..]);
+    var writer_bytes: [10]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_bytes);
+    try pcm.writePcm16(&samples, &writer);
+    try std.testing.expectEqualSlices(u8, encoded, writer.buffered());
+    try std.testing.expectError(error.InvalidSamples, pcm.validatePcm16(&.{1.5}));
+    const before = bytes;
+    try std.testing.expectError(
+        error.InvalidSamples,
+        pcm.encodePcm16Into(&.{std.math.nan(f32)}, &bytes),
+    );
+    try std.testing.expectEqualSlices(u8, &before, &bytes);
+}
+
+test "G.711 scalar facts normalized output and PCM16 composition" {
+    try std.testing.expectEqual(-8, g711.decodeAlaw(0x55));
+    try std.testing.expectEqual(8, g711.decodeAlaw(0xd5));
+    try std.testing.expectEqual(0, g711.decodeMulaw(0x7f));
+    try std.testing.expectEqual(0, g711.decodeMulaw(0xff));
+    const source = [_]u8{ 0, 128, 127, 255 };
+    var output: [6]f32 = @splat(42);
+    const samples = try g711.decodeInto(&source, &output, .mulaw);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -32124.0 / 32768.0, 32124.0 / 32768.0, 0, 0 },
+        samples,
+    );
+    try std.testing.expectEqualSlices(f32, &.{ 42, 42 }, output[4..]);
+    var bytes: [8]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{
+        0x84, 0x82, 0x7c, 0x7d, 0, 0, 0, 0,
+    }, try pcm.encodePcm16Into(samples, &bytes));
+}
+
+test "G.711 refusal ordering preserves caller storage" {
+    var shared: [4]f32 = @splat(0.25);
+    const before = shared;
+    const bytes = std.mem.sliceAsBytes(&shared);
+    try std.testing.expectError(
+        error.DestinationTooSmall,
+        g711.decodeInto(bytes[0..4], shared[0..3], .alaw),
+    );
+    try std.testing.expectError(error.Aliasing, g711.decodeInto(bytes[0..4], &shared, .alaw));
+    try std.testing.expectEqualSlices(f32, &before, &shared);
+}
+
+test "ADPCM Microsoft literal samples from caller-owned coefficients" {
+    const coefficients = [_]u8{ 0, 1, 0, 0 };
+    const source = [_]u8{ 0, 16, 0, 100, 0, 0x9c, 0xff, 0x12 };
+    const format: adpcm.Format = .{
+        .encoding = .microsoft_wave,
+        .channels = 1,
+        .block_bytes = 8,
+        .frames_per_block = 4,
+        .coefficients = &coefficients,
+    };
+    try std.testing.expectEqual(4, try adpcm.frameCount(source.len, format));
+    var output: [6]f32 = @splat(42);
+    const decoded = try adpcm.decodeInto(&source, &output, format);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -100.0 / 32768.0, 100.0 / 32768.0, 116.0 / 32768.0, 148.0 / 32768.0 },
+        decoded,
+    );
+    try std.testing.expectEqualSlices(f32, &.{ 42, 42 }, output[4..]);
+    var bytes: [8]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{
+        0x9c, 0xff, 100, 0, 116, 0, 148, 0,
+    }, try pcm.encodePcm16Into(decoded, &bytes));
+}
+
+test "ADPCM prefix still rejects omitted invalid IMA blocks" {
+    const format: adpcm.Format = .{
+        .encoding = .ima_wave,
+        .channels = 1,
+        .block_bytes = 4,
+        .frames_per_block = 1,
+    };
+    const source = [_]u8{ 0, 128, 0, 0, 0, 0, 89, 0 };
+    var output: [2]f32 = @splat(42);
+    try std.testing.expectError(
+        error.DestinationTooSmall,
+        adpcm.decodePrefixInto(&source, &.{}, 1, format),
+    );
+    try std.testing.expectError(
+        error.InvalidData,
+        adpcm.decodePrefixInto(&source, &output, 1, format),
+    );
+    try std.testing.expectEqual(-1, output[0]);
+    try std.testing.expectEqual(42, output[1]);
+    try std.testing.expectError(
+        error.InvalidData,
+        adpcm.decodePrefixInto(&source, &output, 0, format),
     );
 }
