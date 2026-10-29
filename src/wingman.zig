@@ -1,11 +1,13 @@
 //! Focused byte-processing libraries with explicit caller ownership.
 //!
-//! Adler-32 computes checksums without allocating or retaining input. Use adler32.hash for a
-//! complete buffer, adler32.Hasher for fragments, and adler32.combine for independently processed
-//! sequences. Each library owns its format, API documentation and executable examples.
+//! Adler-32 and IEEE CRC-32 compute checksums without allocating or retaining input. Each library
+//! provides hash for a complete buffer, Hasher for fragments, and combine for independently
+//! processed sequences. Each owns its format, API documentation and executable examples.
 
 pub const adler32 = @import("adler32.zig");
+pub const crc32 = @import("crc32.zig");
 
 test {
     _ = adler32;
+    _ = crc32;
 }

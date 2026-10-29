@@ -1,8 +1,8 @@
 # Wingman
 
 Focused Zig libraries for byte processing, with explicit ownership and documented format contracts.
-The package currently provides **Adler-32**: a noncryptographic checksum used by zlib to detect
-accidental changes to data.
+The package provides **Adler-32** for zlib and **IEEE CRC-32** for gzip and PNG. Both detect
+accidental changes to data and support complete buffers, incremental input and checksum combination.
 
 Wingman accepts exact, unaligned byte slices, allocates no memory for checksumming and selects
 portable or SIMD implementations from the compile-time target. Input chunks can be released as
@@ -18,10 +18,13 @@ zig version
 zig build test --seed=0 --summary all
 zig build example
 zig build example -- Wikipedia
+zig build crc32-example
 ```
 
-The default example prints checksum `091e01de` for `123456789`, checks that streaming and
+The Adler-32 example prints checksum `091e01de` for `123456789`, checks that streaming and
 concatenation give the same result, and shows the four bytes used in a zlib footer.
+The CRC example prints `cbf43926` for the same input, shows gzip's little-endian CRC field and
+computes the big-endian checksum of PNG's empty `IEND` chunk.
 
 ```zig
 const std = @import("std");
@@ -55,10 +58,11 @@ specific revision when taking a source dependency.
 | Library | Purpose | Guide |
 | --- | --- | --- |
 | `wingman.adler32` | Complete and incremental checksums; combine independently processed sequences | [Adler-32](docs/adler32.md) |
+| `wingman.crc32` | IEEE checksums for gzip content and PNG chunks, including streaming and combination | [CRC-32](docs/crc32.md) |
 
-The guide explains results, state and input lifetimes, byte order, checksum combination and how
-bounded vector sums preserve the checksum arithmetic. The source includes independent fixed
-values, scalar comparisons, state-boundary tests and protected-page input checks.
+The guides explain results, state and input lifetimes, byte order, checksum combination and how
+vector sums or polynomial folding preserve the checksum arithmetic. The source includes independent
+fixed values, scalar comparisons, state-boundary tests and protected-page input checks.
 
 Generate the API reference with `zig build docs`. Open `zig-out/docs/index.html` through a local
 HTTP server. Run `python3 -m http.server --directory zig-out/docs 8000`, then visit
@@ -81,7 +85,9 @@ zig build docs
 Use `-Dtarget` and `-Dcpu` for a different compile-time target. A binary built for additional CPU
 features requires hardware with those features. The implementation has no runtime CPU dispatcher.
 The CI configuration checks baseline x86-64 Linux; its results do not establish support on every
-architecture. Adler-32's small checksum is suited to accidental corruption detection.
+architecture. These noncryptographic checksums detect accidental corruption; matching values do
+not establish that two inputs are identical. CRC-32 here uses the IEEE polynomial, which differs
+from CRC-32C and the x86 instruction named CRC32.
 
 ## License
 

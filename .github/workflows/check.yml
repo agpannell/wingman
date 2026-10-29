@@ -33,6 +33,7 @@ jobs:
       - name: Run the example and generate the reference
         run: |
           zig build example -- Wikipedia
+          zig build crc32-example
           zig build docs
       - name: Test a separate consumer
         working-directory: examples/consumer
