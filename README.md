@@ -1,12 +1,13 @@
 # Wingman
 
 Focused Zig libraries for byte processing, with explicit ownership and documented format contracts.
-The package provides **Adler-32** for zlib and **IEEE CRC-32** for gzip and PNG. Both detect
-accidental changes to data and support complete buffers, incremental input and checksum combination.
+The package provides **Adler-32** for zlib, **IEEE CRC-32** for gzip and PNG, and classic
+**XXH32/XXH64** hashes for lookup keys and content checksums. Each supports complete buffers and
+incremental input; the checksum libraries also combine independently processed sequences.
 
-Wingman accepts exact, unaligned byte slices, allocates no memory for checksumming and selects
-portable or SIMD implementations from the compile-time target. Input chunks can be released as
-soon as an update returns.
+Wingman accepts exact, unaligned byte slices and allocates no memory for these calculations.
+The checksum kernels select portable or SIMD implementations from the compile-time target.
+Input chunks can be released as soon as an update returns.
 
 ## Try it
 
@@ -19,12 +20,14 @@ zig build test --seed=0 --summary all
 zig build example
 zig build example -- Wikipedia
 zig build crc32-example
+zig build xxhash-example
 ```
 
 The Adler-32 example prints checksum `091e01de` for `123456789`, checks that streaming and
 concatenation give the same result, and shows the four bytes used in a zlib footer.
 The CRC example prints `cbf43926` for the same input, shows gzip's little-endian CRC field and
 computes the big-endian checksum of PNG's empty `IEND` chunk.
+The xxHash example prints both widths with zero and nonzero seeds and checks fragmented input.
 
 ```zig
 const std = @import("std");
@@ -59,9 +62,10 @@ specific revision when taking a source dependency.
 | --- | --- | --- |
 | `wingman.adler32` | Complete and incremental checksums; combine independently processed sequences | [Adler-32](docs/adler32.md) |
 | `wingman.crc32` | IEEE checksums for gzip content and PNG chunks, including streaming and combination | [CRC-32](docs/crc32.md) |
+| `wingman.xxhash32`, `wingman.xxhash64` | Seeded and seed-zero classic xxHash, with copied streaming state | [xxHash](docs/xxhash.md) |
 
 The guides explain results, state and input lifetimes, byte order, checksum combination and how
-vector sums or polynomial folding preserve the checksum arithmetic. The source includes independent
+vector sums, polynomial folding and four-lane word mixing work. The source includes independent
 fixed values, scalar comparisons, state-boundary tests and protected-page input checks.
 
 Generate the API reference with `zig build docs`. Open `zig-out/docs/index.html` through a local

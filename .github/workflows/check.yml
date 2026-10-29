@@ -34,6 +34,7 @@ jobs:
         run: |
           zig build example -- Wikipedia
           zig build crc32-example
+          zig build xxhash-example
           zig build docs
       - name: Test a separate consumer
         working-directory: examples/consumer

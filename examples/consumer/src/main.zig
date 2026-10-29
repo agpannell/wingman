@@ -2,6 +2,56 @@
 const std = @import("std");
 const adler32 = @import("wingman").adler32;
 const crc32 = @import("wingman").crc32;
+const xxhash32 = @import("wingman").xxhash32;
+const xxhash64 = @import("wingman").xxhash64;
+
+test "classic xxHash fixed facts and seeded streaming" {
+    try std.testing.expectEqual(@as(u32, 0x32d153ff), xxhash32.hash("abc"));
+    try std.testing.expectEqual(@as(u64, 0x44bc2cf5ad770999), xxhash64.hash("abc"));
+    try std.testing.expectEqual(@as(u32, 0xaa3da8ff), xxhash32.hashSeeded(1, "abc"));
+    try std.testing.expectEqual(@as(u64, 0x13c1d910702770e6), xxhash64.hashSeeded(42, "abc"));
+    var state32: xxhash32.Hasher = undefined;
+    var state64: xxhash64.Hasher = undefined;
+    state32.reset(0xffffffff);
+    state64.reset(0x8000000000000001);
+    state32.update("a");
+    state64.update("a");
+    const prefix32 = state32.final();
+    const prefix64 = state64.final();
+    var copy32 = state32;
+    var copy64 = state64;
+    state32.update("bc");
+    state64.update("bc");
+    copy32.update("d");
+    copy64.update("d");
+    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "a"), prefix32);
+    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "a"), prefix64);
+    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "abc"), state32.final());
+    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "abc"), state64.final());
+    try std.testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, "ad"), copy32.final());
+    try std.testing.expectEqual(std.hash.XxHash64.hash(0x8000000000000001, "ad"), copy64.final());
+}
+
+test "classic xxHash numeric encoding and zero-seed reset" {
+    var canonical32: [4]u8 = undefined;
+    var canonical64: [8]u8 = undefined;
+    std.mem.writeInt(u32, &canonical32, xxhash32.hash("abc"), .big);
+    std.mem.writeInt(u64, &canonical64, xxhash64.hash("abc"), .big);
+    try std.testing.expectEqual([4]u8{ 0x32, 0xd1, 0x53, 0xff }, canonical32);
+    try std.testing.expectEqual([8]u8{
+        0x44, 0xbc, 0x2c, 0xf5, 0xad, 0x77, 0x09, 0x99,
+    }, canonical64);
+    var state32: xxhash32.Hasher = .init;
+    var state64: xxhash64.Hasher = .init;
+    state32.update("discard");
+    state64.update("discard");
+    state32 = .init;
+    state64 = .init;
+    state32.update("");
+    state64.update("");
+    try std.testing.expectEqual(@as(u32, 0x02cc5d05), state32.final());
+    try std.testing.expectEqual(@as(u64, 0xef46db3751d8e999), state64.final());
+}
 
 test "one-shot streaming and byte order" {
     const result = adler32.hash("Wikipedia");

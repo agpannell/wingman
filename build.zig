@@ -16,41 +16,43 @@ pub fn build(b: *std.Build) void {
         "Run library tests and executable documentation examples",
     ).dependOn(&b.addRunArtifact(tests).step);
 
-    const example_module = b.createModule(
+    const examples = [_]struct {
+        step: []const u8,
+        source: []const u8,
+        executable: []const u8,
+        description: []const u8,
+    }{
         .{
-            .root_source_file = b.path("examples/checksum.zig"),
-            .target = target,
-            .optimize = optimize,
+            .step = "example",
+            .source = "examples/checksum.zig",
+            .executable = "adler32sum",
+            .description = "Compute Adler-32 from complete, streamed and combined text",
         },
-    );
-    example_module.addImport("wingman", wingman);
-    const example = b.addExecutable(
-        .{ .name = "adler32sum", .root_module = example_module, .use_llvm = true },
-    );
-    const run_example = b.addRunArtifact(example);
-    run_example.addPassthruArgs();
-    b.step(
-        "example",
-        "Compute Adler-32 from complete, streamed and combined text",
-    ).dependOn(&run_example.step);
-
-    const crc_example_module = b.createModule(
         .{
-            .root_source_file = b.path("examples/crc32.zig"),
-            .target = target,
-            .optimize = optimize,
+            .step = "crc32-example",
+            .source = "examples/crc32.zig",
+            .executable = "crc32sum",
+            .description = "Compute IEEE CRC-32 and encode gzip and PNG checksum fields",
         },
-    );
-    crc_example_module.addImport("wingman", wingman);
-    const crc_example = b.addExecutable(
-        .{ .name = "crc32sum", .root_module = crc_example_module, .use_llvm = true },
-    );
-    const run_crc_example = b.addRunArtifact(crc_example);
-    run_crc_example.addPassthruArgs();
-    b.step(
-        "crc32-example",
-        "Compute IEEE CRC-32 and encode gzip and PNG checksum fields",
-    ).dependOn(&run_crc_example.step);
+        .{
+            .step = "xxhash-example",
+            .source = "examples/xxhash.zig",
+            .executable = "xxhashsum",
+            .description = "Compute seeded and seed-zero XXH32 and XXH64 hashes",
+        },
+    };
+    for (examples) |example| {
+        const module = b.createModule(
+            .{ .root_source_file = b.path(example.source), .target = target, .optimize = optimize },
+        );
+        module.addImport("wingman", wingman);
+        const executable = b.addExecutable(
+            .{ .name = example.executable, .root_module = module, .use_llvm = true },
+        );
+        const run = b.addRunArtifact(executable);
+        run.addPassthruArgs();
+        b.step(example.step, example.description).dependOn(&run.step);
+    }
 
     const reference = b.addObject(.{ .name = "wingman", .root_module = wingman, .use_llvm = true });
     const install_reference = b.addInstallDirectory(
