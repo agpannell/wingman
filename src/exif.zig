@@ -68,6 +68,7 @@ pub const View = struct {
     /// Checks the TIFF header, complete main directory bounds, record budgets and cycles. Limits
     /// precede reading another directory or an over-budget directory's entry body. Pixel/field
     /// payloads are checked when selected; unknown tags and maker notes stay opaque.
+    /// Unrepresentable or out-of-source directory extents return InvalidExif after limit admission.
     pub fn open(source: []const u8, options: InspectOptions) Error!View {
         const limits = options.limits;
         if (source.len < 8) return error.InvalidExif;
@@ -188,6 +189,7 @@ pub const View = struct {
 
     /// Selects one directory at a TIFF-relative offset, checking entry/record limits and bounds.
     /// Its header and entries use an independent ceiling; main-chain visits are not subtracted.
+    /// Unrepresentable extents and out-of-source storage return InvalidExif after limit admission.
     /// This does not recursively follow its pointers or claim that its tag semantics are valid.
     pub fn directoryAt(self: View, offset: u32) Error!Directory {
         if (self.limits.records == 0) return error.MetadataLimitExceeded;
@@ -198,15 +200,15 @@ pub const View = struct {
         const count_bytes = try self.range(offset, 2);
         const count = std.mem.readInt(u16, count_bytes[0..2], self.endian);
         if (count > maximum_entries) return error.MetadataLimitExceeded;
-        const size = @as(usize, count) * 12;
+        const extent = try directoryExtent(usize, count);
         const body_offset = std.math.add(u32, offset, 2) catch return error.InvalidExif;
-        const body = try self.range(body_offset, size + 4);
+        const body = try self.range(body_offset, extent.total);
         return .{
             .view = self,
             .offset = offset,
             .count = count,
-            .entries = body[0..size],
-            .next_offset = std.mem.readInt(u32, body[size..][0..4], self.endian),
+            .entries = body[0..extent.entries],
+            .next_offset = std.mem.readInt(u32, body[extent.entries..][0..4], self.endian),
         };
     }
 
@@ -216,6 +218,115 @@ pub const View = struct {
         return self.source[offset..][0..count];
     }
 };
+
+// The size parameter lets narrow-width tests exercise the parser's exact extent calculation.
+fn directoryExtent(
+    comptime Size: type,
+    count: u16,
+) error{InvalidExif}!struct { entries: Size, total: Size } {
+    const entries = std.math.mul(Size, @as(Size, count), 12) catch return error.InvalidExif;
+    const total = std.math.add(Size, entries, 4) catch return error.InvalidExif;
+    return .{ .entries = entries, .total = total };
+}
+
+test "Exif directory extents reject narrow arithmetic overflow before slicing" {
+    var count: u32 = 0;
+    while (count <= std.math.maxInt(u16)) : (count += 1) {
+        const full = count * 12 + 4;
+        const extent = directoryExtent(u16, @intCast(count));
+        if (full > std.math.maxInt(u16)) {
+            try std.testing.expectError(error.InvalidExif, extent);
+        } else {
+            const admitted = try extent;
+            try std.testing.expectEqual(full, admitted.total);
+            try std.testing.expectEqual(count * 12, admitted.entries);
+        }
+    }
+    // At 5461 only the trailer addition overflows; 5462 also overflows the entry body.
+    try std.testing.expectEqual(65524, (try directoryExtent(u16, 5460)).total);
+    try std.testing.expectError(error.InvalidExif, directoryExtent(u16, 5461));
+    try std.testing.expectError(error.InvalidExif, directoryExtent(u16, 5462));
+    try std.testing.expectEqual(786424, (try directoryExtent(u32, 65535)).total);
+}
+
+test "Exif full directory extents preserve valid high counts and limit precedence" {
+    for ([_]std.builtin.Endian{ .little, .big }) |endian| {
+        for ([_]u16{ 0, 1, 4096, 5460, 5461, 5462, 65535 }) |count| {
+            const size = 14 + @as(usize, count) * 12;
+            const bytes = try std.testing.allocator.alloc(u8, size);
+            defer std.testing.allocator.free(bytes);
+            @memset(bytes, 0);
+            @memcpy(bytes[0..2], if (endian == .little) "II" else "MM");
+            std.mem.writeInt(u16, bytes[2..4], 42, endian);
+            std.mem.writeInt(u32, bytes[4..8], 8, endian);
+            std.mem.writeInt(u16, bytes[8..10], count, endian);
+            const options: InspectOptions = .{
+                .limits = .{ .entries = count, .records = 1 + @as(usize, count) },
+            };
+            const view = try View.open(bytes, options);
+            const directory = try view.directoryAt(8);
+            try std.testing.expectEqual(count, directory.count);
+            try std.testing.expectEqual(0, directory.next_offset);
+            try std.testing.expectEqual(size - 14, directory.entries.len);
+            try std.testing.expectEqual(bytes.ptr + 10, directory.entries.ptr);
+            try std.testing.expectError(
+                error.InvalidExif,
+                View.open(bytes[0 .. size - 1], options),
+            );
+            try std.testing.expectError(error.InvalidExif, View.open(bytes[0..9], options));
+            if (count > 4096) {
+                try std.testing.expectError(error.MetadataLimitExceeded, View.open(bytes, .{}));
+            }
+            if (count != 0) {
+                var refused = options;
+                refused.limits.entries -= 1;
+                try std.testing.expectError(
+                    error.MetadataLimitExceeded,
+                    View.open(bytes[0..10], refused),
+                );
+                refused = options;
+                refused.limits.records -= 1;
+                try std.testing.expectError(
+                    error.MetadataLimitExceeded,
+                    View.open(bytes[0..10], refused),
+                );
+            }
+        }
+    }
+}
+
+test "Exif child selection checks its own complete high-count extent" {
+    for ([_]std.builtin.Endian{ .little, .big }) |endian| {
+        const count = 5461;
+        const bytes = try std.testing.allocator.alloc(u8, 32 + count * 12);
+        defer std.testing.allocator.free(bytes);
+        @memset(bytes, 0);
+        @memcpy(bytes[0..2], if (endian == .little) "II" else "MM");
+        std.mem.writeInt(u16, bytes[2..4], 42, endian);
+        std.mem.writeInt(u32, bytes[4..8], 8, endian);
+        std.mem.writeInt(u16, bytes[8..10], 1, endian);
+        std.mem.writeInt(u16, bytes[10..12], 0x8769, endian);
+        std.mem.writeInt(u16, bytes[12..14], 4, endian);
+        std.mem.writeInt(u32, bytes[14..18], 1, endian);
+        std.mem.writeInt(u32, bytes[18..22], 26, endian);
+        std.mem.writeInt(u16, bytes[26..28], count, endian);
+        const options: InspectOptions = .{ .limits = .{ .entries = count, .records = count + 1 } };
+        const view = try View.open(bytes, options);
+        const child = (try (try view.primary()).child(0x8769)).?;
+        try std.testing.expectEqual(count, child.count);
+        try std.testing.expectEqual(bytes.ptr + 28, child.entries.ptr);
+
+        const truncated = try View.open(bytes[0 .. bytes.len - 1], options);
+        try std.testing.expectError(error.InvalidExif, (try truncated.primary()).child(0x8769));
+        var refused = options;
+        refused.limits.records -= 1;
+        const limited = try View.open(bytes[0..28], refused);
+        try std.testing.expectError(
+            error.MetadataLimitExceeded,
+            (try limited.primary()).child(0x8769),
+        );
+    }
+}
 
 /// Checked directory storage; entry payload interpretation is an explicit selection. Obtain through
 /// a `View` directory method or `Directory.child` and preserve the returned source, byte order and

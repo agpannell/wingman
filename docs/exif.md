@@ -93,6 +93,9 @@ The additional `records` ceiling counts each directory header plus its entries a
 `maxInt(usize)`. Admission checks a directory's available allowance before reading its entry body;
 a resource refusal can therefore precede a malformed body. Brent's checkpoint algorithm detects
 main-chain cycles without allocating a visited set or reading ahead into unadmitted directories.
+After limit admission, directory entry bytes and the next-directory pointer must fit the target's
+size type and the source. Unrepresentable or out-of-source extents return `InvalidExif`;
+configured structural ceilings return `MetadataLimitExceeded`.
 
 Explicit `directoryAt` and child selections each apply their own header/entry ceiling from the
 view's limits. They do not subtract the main-chain record count, accumulate across calls or prove
