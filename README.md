@@ -68,13 +68,15 @@ payload from its enclosing image and choose orientation or profile transforms ex
 
 ### Motion capture
 
-Use `bvh` to retain a captured skeleton and its recorded movement, then evaluate joint poses.
-Its results use the package's `RigidTransform` type for row-major binary64 rotation and translation;
-applications choose coordinate conversion, interpolation and playback.
+Use `bvh` for self-contained skeleton/motion clips, or `acclaim` to pair one ASF skeleton with
+multiple AMC clips. Both evaluate joint poses using the package's `RigidTransform` type for
+row-major binary64 rotation and translation. Their guides explain intrinsic BVH rotations and
+Acclaim's fixed-axis calibration; applications choose coordinate conversion, interpolation and playback.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`bvh`](docs/bvh.md) | Owned skeletons and motion channels, caller-output local/global joint poses | `bvh-example` |
+| [`acclaim`](docs/acclaim.md) | Paired ASF/AMC ownership, sparse samples and reusable prepared bone poses | `acclaim-example` |
 
 ## Try it
 
@@ -139,9 +141,10 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
   with the original allocator, after all sample views retire.
 - Exif directories, field data and thumbnail rasters borrow TIFF input. Copied scalar values and
   returned RGB pixels are independent of those views.
-- BVH motions own copied names, joint records and every sample. Their views borrow the motion;
-  release the complete owner once with the original allocator. Pose output is caller-owned and
-  independent after evaluation. Rigid transforms retain no storage or allocator.
+- BVH motions own their skeleton and samples. Acclaim skeletons own shared backing; clips and
+  evaluators borrow it and must retire first. Each owner is released once with its construction
+  allocator. Views borrow their owner; completed pose output is independent caller storage.
+  Rigid transforms retain no storage or allocator.
 
 Serial hashing and decoding need no scheduler. Parallel BLAKE3 updates and WAVE conversion take
 `std.Io`, caller-owned worker storage and explicit options; every submitted job finishes before
@@ -152,7 +155,7 @@ The guides specify numeric encoding, admitted regions and partial-output behavio
 They also explain the mechanisms behind the contracts: vector sums, polynomial folding,
 four-lane word mixing, binary hash trees, checked chunk/directory extents, sample quantization,
 adaptive prediction, overlapping LZ4 matches and bounded HC parsing, precise thumbnail color,
-and declared-order skeletal rotations.
+declared-order skeletal rotations, sparse-frame completion and reusable axis calibration.
 Tests stay with their implementations and include independent values, scalar comparisons,
 state and storage boundaries, and protected-page input checks where applicable.
 

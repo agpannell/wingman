@@ -84,6 +84,12 @@ pub fn build(b: *std.Build) void {
             .description = "Decode Microsoft and IMA blocks and validate prefix output",
         },
         .{
+            .step = "acclaim-example",
+            .source = "examples/acclaim.zig",
+            .executable = "acclaim-motion",
+            .description = "Read paired ASF/AMC motion and evaluate prepared bone poses",
+        },
+        .{
             .step = "bvh-example",
             .source = "examples/bvh.zig",
             .executable = "bvh-motion",

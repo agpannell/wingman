@@ -35,6 +35,7 @@ pub const localPoseInto = pose.localPoseInto;
 pub const globalPoseInto = pose.globalPoseInto;
 
 test {
+    _ = @import("common/ascii_number.zig");
     _ = model;
     _ = text;
     _ = parse;

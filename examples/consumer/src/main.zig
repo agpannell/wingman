@@ -12,6 +12,7 @@ const g711 = @import("wingman").g711;
 const adpcm = @import("wingman").adpcm;
 const exif = @import("wingman").exif;
 const bvh = @import("wingman").bvh;
+const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
 
 test "Adler-32 one-shot streaming and byte order" {
@@ -645,4 +646,60 @@ test "BVH owned samples and public rigid transforms compose outside the package"
         try std.testing.expectApproxEqAbs(expected, actual, 1e-16);
     }
     try std.testing.expectEqualDeep(RigidTransform.identity, storage[3]);
+}
+
+test "Acclaim paired clips reuse one skeleton and prepared public transforms" {
+    var source =
+        (":version 1.10\n:units\n angle deg\n:root\n order TX TY TZ RX RY RZ\n axis XYZ\n" ++
+            " position 0 0 0\n orientation 0 0 0\n:bonedata\nbegin\n id 9\n name arm\n" ++
+            " direction 1 0 0\n length 2\n axis 0 0 0 XYZ\n dof rz\nend\n:hierarchy\nbegin\n" ++
+            " root arm\nend\n").*;
+    var skeleton = try acclaim.parseSkeletonAlloc(std.testing.allocator, &source, null, .{});
+    defer skeleton.deinit(std.testing.allocator);
+    @memset(&source, 0xff);
+    try std.testing.expectEqual(1, skeleton.view().findBone("arm").?);
+    try std.testing.expectEqual(9, skeleton.bones[1].id);
+    var degrees = ":DEGREES\n3\nroot 1 2 3 0 0 0\narm 90\n".*;
+    var first = try acclaim.parseMotionAlloc(
+        std.testing.allocator,
+        &degrees,
+        skeleton.view(),
+        null,
+        .{},
+    );
+    defer first.deinit(std.testing.allocator);
+    @memset(&degrees, 0xff);
+    var radians = ":RADIANS\n9\nroot 4 5 6 0 0 0\narm 1.5707963267948966\n".*;
+    var second = try acclaim.parseMotionAlloc(
+        std.testing.allocator,
+        &radians,
+        skeleton.view(),
+        null,
+        .{},
+    );
+    defer second.deinit(std.testing.allocator);
+    @memset(&radians, 0xff);
+    var evaluator = try acclaim.PoseEvaluator.initAlloc(
+        std.testing.allocator,
+        skeleton.view(),
+        .{},
+    );
+    defer evaluator.deinit(std.testing.allocator);
+    try std.testing.expectEqual(3, first.frame(0).?.number);
+    try std.testing.expectEqual(9, second.frame(0).?.number);
+    try std.testing.expectEqual(acclaim.AngleUnit.degrees, first.angle_unit);
+    try std.testing.expectEqual(acclaim.AngleUnit.radians, second.angle_unit);
+    try std.testing.expect(first.frame(1) == null and second.frame(1) == null);
+
+    var storage: [3]RigidTransform = @splat(.identity);
+    const samples = [_]acclaim.Sample{ first.frame(0).?, second.frame(0).? };
+    for (samples, [_][3]f64{ .{ 1, 4, 3 }, .{ 4, 7, 6 } }) |sample, expected| {
+        const global = try evaluator.globalPoseInto(sample, &storage);
+        try std.testing.expectEqual(2, global.len);
+        const endpoint = global[1].transformPoint(.{ 2, 0, 0 });
+        for (endpoint, expected) |actual, reference| {
+            try std.testing.expectApproxEqAbs(reference, actual, 1e-14);
+        }
+        try std.testing.expectEqualDeep(RigidTransform.identity, storage[2]);
+    }
 }

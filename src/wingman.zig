@@ -17,10 +17,10 @@
 //! supported uncompressed RGB/YCbCr thumbnails; orientation and profile transforms stay with
 //! callers.
 //!
-//! bvh owns skeletal hierarchies and timed motion channels, then evaluates local/global poses into
-//! caller storage. RigidTransform carries column-vector rotation and translation without
-//! allocation. Playback, interpolation, retargeting and producer coordinate conversion stay with
-//! callers.
+//! bvh owns self-contained skeletal motion; acclaim pairs reusable ASF skeletons with AMC clips and
+//! cached pose calibration. Both write local/global RigidTransform values into caller storage,
+//! retaining their distinct rotation and unit contracts. Playback, interpolation, retargeting and
+//! producer coordinate conversion stay with callers.
 //!
 //! Container views and WAVE format coefficients can borrow encoded input. Decoded WAVE views borrow
 //! output samples; allocated Audio owners are released with the original allocator. Parallel WAVE
@@ -45,6 +45,7 @@ pub const adpcm = @import("adpcm.zig");
 pub const exif = @import("exif.zig");
 
 pub const bvh = @import("bvh.zig");
+pub const acclaim = @import("acclaim.zig");
 pub const RigidTransform = @import("common/rigid_transform.zig").RigidTransform;
 
 test {
@@ -66,5 +67,6 @@ test {
     _ = exif;
 
     _ = bvh;
+    _ = acclaim;
     _ = @import("common/rigid_transform.zig");
 }

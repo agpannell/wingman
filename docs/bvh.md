@@ -122,7 +122,9 @@ data and views, `text.zig` owns bounded lexical/numeric admission, `parse.zig` m
 motions, and `pose.zig` interprets channels and composes parents. Authored controls live in
 `fixtures.zig`; tests remain beside their implementations. Shared
 [`RigidTransform` support](../src/common/rigid_transform.zig) owns geometric arithmetic and its inline
-tests. Callers use the exported `wingman.RigidTransform` type.
+tests. Callers use the exported `wingman.RigidTransform` type. BVH and Acclaim also share the strict
+numeric reader in [`common/ascii_number.zig`](../src/common/ascii_number.zig); its assertions stay
+with that implementation.
 
 Short plain decimals use exactly represented significands and powers of ten with one binary64
 division; other spellings use the selected standard parser. Pose evaluation constructs full
