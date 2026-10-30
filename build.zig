@@ -48,6 +48,12 @@ pub fn build(b: *std.Build) void {
             .description = "Hash complete and streamed text and verify seekable BLAKE3 output",
         },
         .{
+            .step = "lz4-example",
+            .source = "examples/lz4.zig",
+            .executable = "lz4-roundtrip",
+            .description = "Encode and recover raw LZ4 blocks and checksummed frames",
+        },
+        .{
             .step = "wav-example",
             .source = "examples/wav.zig",
             .executable = "wave-audio",

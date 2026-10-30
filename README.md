@@ -1,6 +1,6 @@
 # Wingman
 
-Zig libraries for checksums, cryptographic hashing, binary containers, audio and image metadata.
+Zig libraries for checksums, hashing, compression, binary containers, audio and image metadata.
 Use each independently or compose their views and conversion APIs, with explicit storage, lifetimes
 and format contracts.
 
@@ -22,6 +22,15 @@ Adler-32, CRC-32 and classic xxHash detect accidental corruption or support look
 noncryptographic values do not establish input identity or authenticate a message. BLAKE3 provides
 a cryptographic digest and separate keyed and key-derivation modes. IEEE CRC-32 differs from
 CRC-32C and the x86 instruction named CRC32.
+
+### Compression
+
+Use `lz4` for compatible raw blocks or standard frames. A raw block relies on its enclosing record
+for boundaries, decoded size and integrity; a frame records block geometry and optional checksums.
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
+| [`lz4`](docs/lz4.md) | Raw/frame encoding and decoding, dictionaries, resumable codecs and bounded HC search | `lz4-example` |
 
 ### Audio files and containers
 
@@ -70,11 +79,11 @@ zig build examples
 
 The Adler-32 example checks streaming and checksum combination, then shows the zlib footer bytes
 `11 e6 03 98` for `Wikipedia`. `zig build examples` runs every example in the tables above.
-Run one with `zig build <example-step>`; the checksum, hash and RIFF examples also accept text
+Run one with `zig build <example-step>`; the checksum, hash, LZ4 and RIFF examples also accept text
 after `--`.
 
 The examples exercise complete public API calls: format-specific checksum bytes, seeded hashes,
-nested chunks, sample quantization, compressed-block decoding, complete WAVE audio and image
+compressed blocks and frames, nested chunks, sample quantization, complete WAVE audio and image
 attributes. Each checks its results as it runs. The [source files](examples/) are small standalone
 starting points.
 
@@ -110,6 +119,8 @@ test "complete and streaming checksums" {
 Input byte slices need no padding or extra alignment. Storage and lifetimes are explicit:
 
 - Checksum and hash states copy what they need; input chunks can be released after `update` returns.
+- LZ4 complete calls retain no input; resumable owners borrow their workspace and copy accepted
+  fragments. Output stays private until completion and any required integrity checks succeed.
 - RIFF and WAVE inspection views borrow encoded input. Keep it alive while using those views or
   the Microsoft coefficient bytes in a WAVE format description.
 - Raw audio decoders write caller-provided storage. WAVE decoding offers either caller samples
@@ -126,7 +137,7 @@ callers choose its storage, handle backend failures and flush it.
 The guides specify numeric encoding, admitted regions and partial-output behavior for each API.
 They also explain the mechanisms behind the contracts: vector sums, polynomial folding,
 four-lane word mixing, binary hash trees, checked chunk/directory extents, sample quantization,
-adaptive prediction and precise thumbnail color.
+adaptive prediction, overlapping LZ4 matches and bounded HC parsing, and precise thumbnail color.
 Tests stay with their implementations and include independent values, scalar comparisons,
 state and storage boundaries, and protected-page input checks where applicable.
 

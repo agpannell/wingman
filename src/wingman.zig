@@ -1,9 +1,12 @@
-//! Independent libraries for checksums, hashing, containers, audio and image metadata.
+//! Independent libraries for checksums, hashing, compression, containers, audio and image metadata.
 //!
 //! adler32 and crc32 provide format-specific checksums; xxhash32 and xxhash64 provide seeded
 //! hashes. Each supports complete input and caller-owned streaming state, and the checksum
 //! libraries combine separately processed sequences. blake3 provides cryptographic hashing, keyed
 //! authentication and context-separated key derivation with seekable output.
+//!
+//! lz4 provides raw blocks and standard frames, with dictionaries, bounded HC encoding and
+//! resumable codecs using caller-owned storage.
 //!
 //! wav connects WAVE/RF64 containers to sample decoding and PCM16 RIFF writing. riff provides
 //! generic chunk framing. pcm, g711 and adpcm convert raw sample representations or complete codec
@@ -24,6 +27,8 @@ pub const xxhash32 = @import("xxhash32.zig");
 pub const xxhash64 = @import("xxhash64.zig");
 pub const blake3 = @import("blake3.zig");
 
+pub const lz4 = @import("lz4.zig");
+
 pub const wav = @import("wav.zig");
 pub const riff = @import("riff.zig");
 
@@ -39,6 +44,8 @@ test {
     _ = xxhash32;
     _ = xxhash64;
     _ = blake3;
+
+    _ = lz4;
 
     _ = wav;
     _ = riff;
