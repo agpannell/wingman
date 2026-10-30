@@ -142,6 +142,20 @@ pub const ChunkIterator = struct {
     }
 };
 
+/// Internal complete-file pass restart. The previous successful pass must be retired and the same
+/// source and exclusive scratch kept live. This reuses lookup ordering, never pass consumption.
+/// Public Container.iterator always starts fresh, including when callers reuse scratch storage.
+pub fn restart(iterator: *ChunkIterator) void {
+    std.debug.assert(iterator.offset == iterator.view.source.len);
+    iterator.offset = iterator.view.chunks_start;
+    iterator.used_rf64_data_size = false;
+    if (iterator.directory_index.len <= 32) {
+        @memset(iterator.directory_index, .{ .table_index = 0, .next_match = 0 });
+    } else if (iterator.directory_index_ready) {
+        resetDirectoryCursors(iterator.directory_index);
+    }
+}
+
 const ChunkView = struct { id: []const u8, data: []const u8, padding: ?u8, next_offset: usize };
 
 fn nextChunk(iterator: *ChunkIterator) ParseError!ChunkView {
@@ -285,6 +299,10 @@ fn prepareDirectoryIndex(table: []const u8, entries: []ChunkIndexEntry) void {
     }.less);
     // Equal IDs use a cursor at their first sorted slot. The remaining slots stay immutable lookup
     // keys, preserving the original order for each ID.
+    resetDirectoryCursors(entries);
+}
+
+fn resetDirectoryCursors(entries: []ChunkIndexEntry) void {
     for (entries, 0..) |*entry, index| entry.next_match = @intCast(index);
 }
 
@@ -357,6 +375,41 @@ test "RF64 directory index reserves eight bytes without hidden alignment padding
     try std.testing.expectEqual(1, @alignOf(ChunkIndexEntry));
 }
 
+test "complete-file restarts leave unused large RF64 ordering unprepared" {
+    const fixture = @import("fixtures.zig");
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 31, 32, 33, 97 }) |count| {
+        const table = try allocator.alloc(fixture.Rf64Size, count);
+        defer allocator.free(table);
+        @memset(table, .{ .id = "JUNK".*, .size = 1 });
+        const metadata = [_]fixture.Rf64Chunk{.{ .id = "JUNK".*, .data = "x", .sentinel = false }};
+        const source = try fixture.makeRf64Metadata(allocator, table, &metadata);
+        defer allocator.free(source);
+        const scratch = try allocator.alloc(ChunkIndexEntry, count + 1);
+        defer allocator.free(scratch);
+        @memset(std.mem.sliceAsBytes(scratch), 0x5a);
+        const view = try parse(source);
+        var chunks = try view.iterator(scratch);
+        for (0..3) |pass| {
+            if (pass != 0) {
+                restart(&chunks);
+                try std.testing.expect(!chunks.used_rf64_data_size);
+            }
+            try std.testing.expectEqual(view.chunks_start, chunks.offset);
+            while (try chunks.next()) |_| {}
+            try std.testing.expect(chunks.used_rf64_data_size);
+            try std.testing.expect(!chunks.directory_index_ready);
+            for (0..count) |ordinal| {
+                try std.testing.expectEqual(@as(?bool, false), chunks.tableEntryUsed(ordinal));
+            }
+            if (count > 32) {
+                try std.testing.expect(std.mem.allEqual(u8, std.mem.sliceAsBytes(scratch), 0x5a));
+            }
+            try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&scratch[count]), 0x5a));
+        }
+    }
+}
+
 test "RF64 directories preserve per-ID source order across lookup sizes and unaligned storage" {
     const fixture = @import("fixtures.zig");
     const allocator = std.testing.allocator;
@@ -424,39 +477,42 @@ test "RF64 directories preserve per-ID source order across lookup sizes and unal
                 const view = try parse(source);
                 try std.testing.expectEqual(count, view.scratchCount());
                 for (0..2) |_| {
-                    @memset(expected_used, false);
                     var chunks = try view.iterator(scratch);
-                    try std.testing.expectEqual(@as(?bool, null), chunks.tableEntryUsed(count));
-                    for (0..count) |ordinal| {
-                        try std.testing.expectEqual(
-                            @as(?bool, false),
-                            chunks.tableEntryUsed(ordinal),
-                        );
-                    }
-                    var payload_offset = view.chunks_start + 8;
-                    for (metadata, order) |expected, ordinal| {
-                        const chunk = (try chunks.next()).?;
-                        try std.testing.expectEqualSlices(u8, &expected.id, chunk.id);
-                        try std.testing.expectEqualSlices(u8, expected.data, chunk.data);
-                        try std.testing.expectEqual(
-                            @intFromPtr(source.ptr) + payload_offset,
-                            @intFromPtr(chunk.data.ptr),
-                        );
-                        expected_used[ordinal] = true;
-                        for (expected_used, 0..) |used, index| {
+                    for (0..3) |pass| {
+                        if (pass != 0) restart(&chunks);
+                        @memset(expected_used, false);
+                        try std.testing.expectEqual(@as(?bool, null), chunks.tableEntryUsed(count));
+                        for (0..count) |ordinal| {
                             try std.testing.expectEqual(
-                                @as(?bool, used),
-                                chunks.tableEntryUsed(index),
+                                @as(?bool, false),
+                                chunks.tableEntryUsed(ordinal),
                             );
                         }
-                        payload_offset += 8 + expected.data.len + (expected.data.len & 1);
+                        var payload_offset = view.chunks_start + 8;
+                        for (metadata, order) |expected, ordinal| {
+                            const chunk = (try chunks.next()).?;
+                            try std.testing.expectEqualSlices(u8, &expected.id, chunk.id);
+                            try std.testing.expectEqualSlices(u8, expected.data, chunk.data);
+                            try std.testing.expectEqual(
+                                @intFromPtr(source.ptr) + payload_offset,
+                                @intFromPtr(chunk.data.ptr),
+                            );
+                            expected_used[ordinal] = true;
+                            for (expected_used, 0..) |used, index| {
+                                try std.testing.expectEqual(
+                                    @as(?bool, used),
+                                    chunks.tableEntryUsed(index),
+                                );
+                            }
+                            payload_offset += 8 + expected.data.len + (expected.data.len & 1);
+                        }
+                        try std.testing.expectEqualStrings("fmt ", (try chunks.next()).?.id);
+                        const data = (try chunks.next()).?;
+                        try std.testing.expectEqualStrings("data", data.id);
+                        try std.testing.expectEqualSlices(u8, &.{0xff}, data.data);
+                        try std.testing.expectEqual(null, try chunks.next());
+                        try std.testing.expectEqual(null, try chunks.next());
                     }
-                    try std.testing.expectEqualStrings("fmt ", (try chunks.next()).?.id);
-                    const data = (try chunks.next()).?;
-                    try std.testing.expectEqualStrings("data", data.id);
-                    try std.testing.expectEqualSlices(u8, &.{0xff}, data.data);
-                    try std.testing.expectEqual(null, try chunks.next());
-                    try std.testing.expectEqual(null, try chunks.next());
                 }
                 try std.testing.expectEqualSlices(u8, encoded, source);
                 for (

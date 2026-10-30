@@ -115,6 +115,19 @@ Repeated IDs consume directory entries in authored order. Up to32 records use di
 larger directories sort caller scratch lazily by ID and ordinal, then use indexed lookup.
 `tableEntryUsed(ordinal)` observes consumption without advancing the iterator.
 
+Complete-file operations reuse that ordering between internal passes while resetting each pass's
+consumption. A requirements or caller-buffer decode prepares an index at most once. Allocating
+decode has two scratch reservations: inspection retires before sample allocation, then conversion
+uses fresh scratch. Each reservation prepares at most once. Independent public iterators and
+separate API calls always start fresh; scratch contents are not a persistent cache.
+
+Index preparation remains O(N log N) for N directory records, with eight bytes of scratch per
+record and a physically present twelve-byte record in `ds64`. Tables without a non-data sentinel
+avoid preparation. For untrusted files, bound input bytes before parsing, then inspect
+`parse(source).scratchCount()` before reserving scratch or choosing allocating decode. Use decoded
+requirements/caller storage or a suitable allocator budget for output. An allocator limit alone
+does not bound CPU time; the host controls request concurrency and execution policy.
+
 ```zig
 const std = @import("std");
 const wav = @import("wingman").wav;

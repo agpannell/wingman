@@ -110,7 +110,9 @@ pub fn decodeRequirements(
     source: []const u8,
     directory_index: []ChunkIndexEntry,
 ) DecodeError!DecodeRequirements {
-    return inspectDataChunks(try parse(source), directory_index);
+    const view = try parse(source);
+    var chunks = try view.iterator(directory_index);
+    return inspectDataChunks(&chunks);
 }
 
 /// Decodes a complete file into independent samples. All temporary scratch and partial ownership
@@ -143,19 +145,12 @@ pub fn decodeInto(
 ) DecodeError!AudioView {
     const view = try parse(source);
     try admitStorage(view, destination, directory_index, &.{});
-    const requirements = try inspectDataChunks(view, directory_index);
+    var chunks = try view.iterator(directory_index);
+    const requirements = try inspectDataChunks(&chunks);
     if (destination.len < requirements.samples) return error.DestinationTooSmall;
     const output = destination[0..requirements.samples];
-    try decodeDataChunks(
-        false,
-        undefined,
-        view,
-        directory_index,
-        requirements.format,
-        output,
-        &.{},
-        .{},
-    );
+    container.restart(&chunks);
+    try decodeDataChunks(false, undefined, &chunks, requirements.format, output, &.{}, .{});
     return audioView(requirements.format, output);
 }
 
@@ -216,19 +211,12 @@ pub fn decodeParallelInto(
 ) ParallelDecodeError!AudioView {
     const view = try parse(source);
     try admitStorage(view, destination, directory_index, workers);
-    const requirements = try inspectDataChunks(view, directory_index);
+    var chunks = try view.iterator(directory_index);
+    const requirements = try inspectDataChunks(&chunks);
     if (destination.len < requirements.samples) return error.DestinationTooSmall;
     const output = destination[0..requirements.samples];
-    try decodeDataChunks(
-        true,
-        io,
-        view,
-        directory_index,
-        requirements.format,
-        output,
-        workers,
-        options,
-    );
+    container.restart(&chunks);
+    try decodeDataChunks(true, io, &chunks, requirements.format, output, workers, options);
     return audioView(requirements.format, output);
 }
 
@@ -282,7 +270,8 @@ fn decodeOwned(
     const requirements = blk: {
         const index = try allocator.alloc(ChunkIndexEntry, view.scratchCount());
         defer allocator.free(index);
-        break :blk try inspectDataChunks(view, index);
+        var chunks = try view.iterator(index);
+        break :blk try inspectDataChunks(&chunks);
     };
     const owner = try memory.allocateSamples(allocator, requirements.samples);
     errdefer allocator.free(owner.storage);
@@ -290,11 +279,11 @@ fn decodeOwned(
     // This order lets a tail-reclaiming allocator free both the index and all sample padding.
     const index = try allocator.alloc(ChunkIndexEntry, view.scratchCount());
     defer allocator.free(index);
+    var chunks = try view.iterator(index);
     try decodeDataChunks(
         scheduled,
         io,
-        view,
-        index,
+        &chunks,
         requirements.format,
         owner.samples,
         workers,
@@ -309,11 +298,8 @@ fn decodeOwned(
     };
 }
 
-fn inspectDataChunks(
-    view: Container,
-    directory_index: []ChunkIndexEntry,
-) DecodeError!DecodeRequirements {
-    var chunks = try view.iterator(directory_index);
+fn inspectDataChunks(chunks: *ChunkIterator) DecodeError!DecodeRequirements {
+    const view = chunks.view;
     var format_bytes: ?[]const u8 = null;
     var fact_frames: ?u32 = null;
     var saw_data = false;
@@ -330,7 +316,8 @@ fn inspectDataChunks(
     }
     const info = try parseFormat(format_bytes orelse return error.InvalidWave);
     if (!saw_data) return error.InvalidWave;
-    const complete = try countDataSamples(view, directory_index, info);
+    container.restart(chunks);
+    const complete = try countDataSamples(chunks, info);
     const count: usize = blk: {
         if (info.encoding != .ima_adpcm and info.encoding != .ms_adpcm) break :blk complete;
         const fact = fact_frames orelse break :blk complete;
@@ -351,12 +338,7 @@ fn inspectDataChunks(
     };
 }
 
-fn countDataSamples(
-    view: Container,
-    directory_index: []ChunkIndexEntry,
-    info: Format,
-) DecodeError!usize {
-    var chunks = try view.iterator(directory_index);
+fn countDataSamples(chunks: *ChunkIterator, info: Format) DecodeError!usize {
     var count: usize = 0;
     while (try chunks.next()) |chunk| {
         if (std.mem.eql(u8, chunk.id, "data")) {
@@ -375,14 +357,12 @@ fn countDataSamples(
 fn decodeDataChunks(
     comptime scheduled: bool,
     io: std.Io,
-    view: Container,
-    directory_index: []ChunkIndexEntry,
+    chunks: *ChunkIterator,
     info: Format,
     samples: []f32,
     workers: []Worker,
     options: ParallelOptions,
 ) (if (scheduled) ParallelDecodeError else DecodeError)!void {
-    var chunks = try view.iterator(directory_index);
     var offset: usize = 0;
     while (try chunks.next()) |chunk| {
         if (std.mem.eql(u8, chunk.id, "data")) {
