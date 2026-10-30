@@ -1,6 +1,7 @@
 # Wingman
 
-Zig libraries for checksums, hashing, compression, binary containers, audio and image metadata.
+Zig libraries for checksums, hashing, compression, binary containers, audio, image metadata and
+motion capture.
 Use each independently or compose their views and conversion APIs, with explicit storage, lifetimes
 and format contracts.
 
@@ -65,6 +66,16 @@ payload from its enclosing image and choose orientation or profile transforms ex
 | --- | --- | --- |
 | [`exif`](docs/exif.md) | Borrowed fields, orientation, thumbnail ranges and supported RGB/YCbCr thumbnail pixels | `exif-example` |
 
+### Motion capture
+
+Use `bvh` to retain a captured skeleton and its recorded movement, then evaluate joint poses.
+Its results use the package's `RigidTransform` type for row-major binary64 rotation and translation;
+applications choose coordinate conversion, interpolation and playback.
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
+| [`bvh`](docs/bvh.md) | Owned skeletons and motion channels, caller-output local/global joint poses | `bvh-example` |
+
 ## Try it
 
 Use **Zig 0.17.0**, available from the [official downloads](https://ziglang.org/download/).
@@ -83,9 +94,9 @@ Run one with `zig build <example-step>`; the checksum, hash, LZ4 and RIFF exampl
 after `--`.
 
 The examples exercise complete public API calls: format-specific checksum bytes, seeded hashes,
-compressed blocks and frames, nested chunks, sample quantization, complete WAVE audio and image
-attributes. Each checks its results as it runs. The [source files](examples/) are small standalone
-starting points.
+compressed blocks and frames, nested chunks, sample quantization, complete WAVE audio, image
+attributes and skeletal movement. Each checks its results as it runs. The [source files](examples/)
+are small standalone starting points.
 
 ## Use it in a project
 
@@ -128,6 +139,9 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
   with the original allocator, after all sample views retire.
 - Exif directories, field data and thumbnail rasters borrow TIFF input. Copied scalar values and
   returned RGB pixels are independent of those views.
+- BVH motions own copied names, joint records and every sample. Their views borrow the motion;
+  release the complete owner once with the original allocator. Pose output is caller-owned and
+  independent after evaluation. Rigid transforms retain no storage or allocator.
 
 Serial hashing and decoding need no scheduler. Parallel BLAKE3 updates and WAVE conversion take
 `std.Io`, caller-owned worker storage and explicit options; every submitted job finishes before
@@ -137,7 +151,8 @@ callers choose its storage, handle backend failures and flush it.
 The guides specify numeric encoding, admitted regions and partial-output behavior for each API.
 They also explain the mechanisms behind the contracts: vector sums, polynomial folding,
 four-lane word mixing, binary hash trees, checked chunk/directory extents, sample quantization,
-adaptive prediction, overlapping LZ4 matches and bounded HC parsing, and precise thumbnail color.
+adaptive prediction, overlapping LZ4 matches and bounded HC parsing, precise thumbnail color,
+and declared-order skeletal rotations.
 Tests stay with their implementations and include independent values, scalar comparisons,
 state and storage boundaries, and protected-page input checks where applicable.
 

@@ -1,4 +1,5 @@
-//! Independent libraries for checksums, hashing, compression, containers, audio and image metadata.
+//! Independent libraries for checksums, hashing, compression, containers, audio, image metadata and
+//! motion capture.
 //!
 //! adler32 and crc32 provide format-specific checksums; xxhash32 and xxhash64 provide seeded
 //! hashes. Each supports complete input and caller-owned streaming state, and the checksum
@@ -14,6 +15,11 @@
 //!
 //! exif borrows classic TIFF image attributes and thumbnail storage without allocation. It samples
 //! supported uncompressed RGB/YCbCr thumbnails; orientation and profile transforms stay with
+//! callers.
+//!
+//! bvh owns skeletal hierarchies and timed motion channels, then evaluates local/global poses into
+//! caller storage. RigidTransform carries column-vector rotation and translation without
+//! allocation. Playback, interpolation, retargeting and producer coordinate conversion stay with
 //! callers.
 //!
 //! Container views and WAVE format coefficients can borrow encoded input. Decoded WAVE views borrow
@@ -38,6 +44,9 @@ pub const adpcm = @import("adpcm.zig");
 
 pub const exif = @import("exif.zig");
 
+pub const bvh = @import("bvh.zig");
+pub const RigidTransform = @import("common/rigid_transform.zig").RigidTransform;
+
 test {
     _ = adler32;
     _ = crc32;
@@ -55,4 +64,7 @@ test {
     _ = adpcm;
 
     _ = exif;
+
+    _ = bvh;
+    _ = @import("common/rigid_transform.zig");
 }

@@ -84,6 +84,12 @@ pub fn build(b: *std.Build) void {
             .description = "Decode Microsoft and IMA blocks and validate prefix output",
         },
         .{
+            .step = "bvh-example",
+            .source = "examples/bvh.zig",
+            .executable = "bvh-motion",
+            .description = "Read owned BVH motion and evaluate local and global joint poses",
+        },
+        .{
             .step = "exif-example",
             .source = "examples/exif.zig",
             .executable = "exif-inspect",

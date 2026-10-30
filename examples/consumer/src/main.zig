@@ -11,6 +11,8 @@ const pcm = @import("wingman").pcm;
 const g711 = @import("wingman").g711;
 const adpcm = @import("wingman").adpcm;
 const exif = @import("wingman").exif;
+const bvh = @import("wingman").bvh;
+const RigidTransform = @import("wingman").RigidTransform;
 
 test "Adler-32 one-shot streaming and byte order" {
     const result = adler32.hash("Wikipedia");
@@ -602,4 +604,45 @@ test "LZ4 standard frames checksums concatenation and skippable boundaries" {
     try std.testing.expect(std.mem.allEqual(u8, output[complete.produced..], 0xa5));
     frame[frame.len - 1] ^= 1;
     try std.testing.expectError(error.ChecksumMismatch, lz4.decodeFrame(frame, &output, .{}));
+}
+
+test "BVH owned samples and public rigid transforms compose outside the package" {
+    var source =
+        ("HIERARCHY ROOT hips { OFFSET 1 2 3 CHANNELS 4 Xposition Yposition Zposition " ++
+            "Zrotation JOINT tip { OFFSET 0 2 0 CHANNELS 0 End Site { OFFSET 0 1 0 } } }\n" ++
+            "MOTION Frames: 1 Frame Time: 0.125\n4 5 6 90\n").*;
+    var motion = try bvh.parseAlloc(std.testing.allocator, &source, null, .{});
+    defer motion.deinit(std.testing.allocator);
+    @memset(&source, 0xff);
+    try std.testing.expectEqualStrings("hips", motion.skeleton.joints[0].name.?);
+    try std.testing.expectEqual(3, motion.skeleton.joints.len);
+    try std.testing.expectEqual(4, motion.skeleton.channel_count);
+    try std.testing.expectEqual(0.125, motion.frame_time);
+    try std.testing.expect(motion.frame(1) == null);
+    const sample = motion.frame(0).?;
+    try std.testing.expectEqualSlices(f64, &.{ 4, 5, 6, 90 }, sample.jointValues(0).?);
+    try std.testing.expectEqual(0, sample.jointValues(1).?.len);
+
+    var storage: [4]RigidTransform = @splat(.identity);
+    const global = try bvh.globalPoseInto(sample, &storage, .{});
+    for (global, [_][3]f64{ .{ 5, 7, 9 }, .{ 3, 7, 9 }, .{ 2, 7, 9 } }) |actual, expected| {
+        for (actual.translation, expected) |value, reference| {
+            try std.testing.expectApproxEqAbs(reference, value, 1e-14);
+        }
+        try std.testing.expect(actual.isFinite());
+    }
+    try std.testing.expectEqualDeep(RigidTransform.identity, storage[3]);
+    const point = global[0].transformPoint(.{ 1, 0, 0 });
+    for (point, [_]f64{ 5, 8, 9 }) |actual, expected| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-14);
+    }
+    const replaced = try bvh.localPoseInto(
+        sample,
+        &storage,
+        .{ .position_channels = .replace_offset, .length_scale = 0.01 },
+    );
+    for (replaced[0].translation, [_]f64{ 0.04, 0.05, 0.06 }) |actual, expected| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-16);
+    }
+    try std.testing.expectEqualDeep(RigidTransform.identity, storage[3]);
 }
