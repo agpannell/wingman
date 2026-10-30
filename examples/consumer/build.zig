@@ -12,6 +12,6 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = consumer, .use_llvm = true });
     b.step(
         "test",
-        "Exercise the public checksum API from a separate package",
+        "Exercise the public libraries from a separate package",
     ).dependOn(&b.addRunArtifact(tests).step);
 }

@@ -42,6 +42,12 @@ pub fn build(b: *std.Build) void {
             .description = "Compute seeded and seed-zero XXH32 and XXH64 hashes",
         },
         .{
+            .step = "wav-example",
+            .source = "examples/wav.zig",
+            .executable = "wave-audio",
+            .description = "Write, inspect and decode WAVE with owned and caller storage",
+        },
+        .{
             .step = "riff-example",
             .source = "examples/riff.zig",
             .executable = "riff-inspect",
@@ -66,10 +72,10 @@ pub fn build(b: *std.Build) void {
             .description = "Decode Microsoft and IMA blocks and validate prefix output",
         },
         .{
-            .step = "wav-example",
-            .source = "examples/wav.zig",
-            .executable = "wave-audio",
-            .description = "Write, inspect and decode WAVE with owned and caller storage",
+            .step = "exif-example",
+            .source = "examples/exif.zig",
+            .executable = "exif-inspect",
+            .description = "Inspect Exif attributes and sample an uncompressed thumbnail",
         },
     };
     for (examples) |example| {

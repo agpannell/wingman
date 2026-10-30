@@ -1,7 +1,7 @@
 # Wingman
 
-Zig libraries for checksums, binary containers and audio samples. Use each library independently,
-with explicit input lifetimes, caller-owned storage and documented format contracts.
+Zig libraries for checksums, binary containers, audio and image metadata. Use each independently or
+compose their views and conversion APIs, with explicit storage, lifetimes and format contracts.
 
 ## Libraries
 
@@ -20,20 +20,38 @@ These noncryptographic values detect accidental corruption or support lookups; m
 do not establish input identity or authenticate a message. IEEE CRC-32 differs from CRC-32C and
 the x86 instruction named CRC32.
 
-### Containers and audio
+### Audio files and containers
+
+Use `wav` when you have a WAVE/RF64 audio file. Use `riff` for generic chunk framing in RIFF
+formats such as WAVE or WebP; inspecting that envelope alone does not validate its payload.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
-| [`wav`](docs/wav.md) | Complete WAVE/RF64 decoding and PCM16 RIFF writing, with explicit storage and `std.Io` | `wav-example` |
+| [`wav`](docs/wav.md) | Supported WAVE/RF64 audio decoding and PCM16 RIFF writing | `wav-example` |
 | [`riff`](docs/riff.md) | Borrowed container/chunk traversal, nested lists and checked writing | `riff-example` |
+
+### Audio samples
+
+Use these libraries when the sample representation or block geometry is already known. The WAVE
+loader composes them with file metadata; they can also serve other containers or protocols.
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
 | [`pcm`](docs/pcm.md) | Little-endian integer/float sample conversion and PCM16 writing | `pcm-example` |
 | [`g711`](docs/g711.md) | A-law and mu-law decoding to exact PCM16 or normalized floats | `g711-example` |
 | [`adpcm`](docs/adpcm.md) | Microsoft and IMA/DVI WAVE block decoding, including validated frame prefixes | `adpcm-example` |
 
-WAVE connects container metadata to sample decoding. RIFF handles generic framing; a valid
-envelope alone does not establish a valid media file. The raw PCM, G.711 and ADPCM libraries take
-sample layouts or complete blocks independently of containers. Callers own playback, resampling
-and speaker placement.
+The raw codecs convert samples or complete blocks without parsing a file. Callers own playback,
+resampling and speaker placement. The linked guides state supported layouts and numerical limits.
+
+### Image metadata
+
+Use `exif` for classic TIFF image attributes and stored thumbnail data. Callers extract the TIFF
+payload from its enclosing image and choose orientation or profile transforms explicitly.
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
+| [`exif`](docs/exif.md) | Borrowed fields, orientation, thumbnail ranges and supported RGB/YCbCr thumbnail pixels | `exif-example` |
 
 ## Try it
 
@@ -53,8 +71,9 @@ Run one with `zig build <example-step>`; the checksum, hash and RIFF examples al
 after `--`.
 
 The examples exercise complete public API calls: format-specific checksum bytes, seeded hashes,
-nested chunks, sample quantization, compressed-block decoding and complete WAVE audio. Each checks
-its results as it runs. The [source files](examples/) are small standalone starting points.
+nested chunks, sample quantization, compressed-block decoding, complete WAVE audio and image
+attributes. Each checks its results as it runs. The [source files](examples/) are small standalone
+starting points.
 
 ## Use it in a project
 
@@ -85,16 +104,26 @@ test "complete and streaming checksums" {
 
 ## Ownership and implementation
 
-The libraries accept exact, unaligned input bytes and perform no hidden allocation. Hash and
-checksum states copy what they need, so an input chunk can be released after `update` returns.
-RIFF views borrow their input; keep that storage alive while using the views. Raw audio conversion
-writes caller-provided output. WAVE also offers explicit allocating owners and parallel conversion
-through `std.Io`; every submitted job finishes before return. RIFF, PCM and WAVE writing use the
-caller's `std.Io.Writer`; callers choose its storage, handle backend failures and flush it.
+Input byte slices need no padding or extra alignment. Storage and lifetimes are explicit:
+
+- Checksum and hash states copy what they need; input chunks can be released after `update` returns.
+- RIFF and WAVE inspection views borrow encoded input. Keep it alive while using those views or
+  the Microsoft coefficient bytes in a WAVE format description.
+- Raw audio decoders write caller-provided storage. WAVE decoding offers either caller samples
+  or an allocated `wav.Audio` owner independent of encoded input. Release that owner exactly once
+  with the original allocator, after all sample views retire.
+- Exif directories, field data and thumbnail rasters borrow TIFF input. Copied scalar values and
+  returned RGB pixels are independent of those views.
+
+Serial decoding needs no scheduler. Parallel WAVE conversion takes `std.Io`, caller-owned worker
+storage and explicit options; every submitted job finishes before success, error or cancellation
+returns. RIFF, PCM and WAVE writers use the caller's `std.Io.Writer`; callers choose its storage,
+handle backend failures and flush it.
 
 The guides specify numeric encoding, admitted regions and partial-output behavior for each API.
 They also explain the mechanisms behind the contracts: vector sums, polynomial folding,
-four-lane word mixing, checked chunk extents, sample quantization and adaptive prediction.
+four-lane word mixing, checked chunk/directory extents, sample quantization, adaptive prediction
+and precise thumbnail color.
 Tests stay with their implementations and include independent values, scalar comparisons,
 state and storage boundaries, and protected-page input checks where applicable.
 

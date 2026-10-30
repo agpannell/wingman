@@ -1,26 +1,35 @@
-//! Independent libraries for checksums, binary containers and audio samples.
+//! Independent libraries for checksums, containers, audio and image metadata.
 //!
-//! Use adler32 or crc32 for format-specific checksums, and xxhash32 or xxhash64 for seeded hashes.
-//! Each supports complete input and caller-owned streaming state; the checksum libraries also
-//! combine separately processed sequences.
+//! adler32 and crc32 provide format-specific checksums; xxhash32 and xxhash64 provide seeded
+//! hashes. Each supports complete input and caller-owned streaming state, and the checksum
+//! libraries combine separately processed sequences.
 //!
-//! Use wav for complete WAVE/RF64 audio files, riff for generic container framing, pcm for raw
-//! sample conversion, and g711 or adpcm for compressed blocks. Playback remains caller-owned.
+//! wav connects WAVE/RF64 containers to sample decoding and PCM16 RIFF writing. riff provides
+//! generic chunk framing. pcm, g711 and adpcm convert raw sample representations or complete codec
+//! blocks when the layout is already known; playback and resampling stay with callers.
 //!
-//! RIFF views borrow input. Hash states copy pending bytes, and audio decoders write caller-owned
-//! output. WAVE also offers explicitly allocating owners and bounded std.Io conversion. No library
-//! hides allocation. RIFF, PCM and WAVE writing use the caller's std.Io.Writer.
+//! exif borrows classic TIFF image attributes and thumbnail storage without allocation. It samples
+//! supported uncompressed RGB/YCbCr thumbnails; orientation and profile transforms stay with
+//! callers.
+//!
+//! Container views and WAVE format coefficients can borrow encoded input. Decoded WAVE views borrow
+//! output samples; allocated Audio owners are released with the original allocator. Parallel WAVE
+//! conversion uses std.Io and bounded caller workers, joining every job before return. Writer APIs
+//! use the caller's std.Io.Writer and leave flushing to the caller.
 
 pub const adler32 = @import("adler32.zig");
 pub const crc32 = @import("crc32.zig");
 pub const xxhash32 = @import("xxhash32.zig");
 pub const xxhash64 = @import("xxhash64.zig");
 
+pub const wav = @import("wav.zig");
 pub const riff = @import("riff.zig");
+
 pub const pcm = @import("pcm.zig");
 pub const g711 = @import("g711.zig");
 pub const adpcm = @import("adpcm.zig");
-pub const wav = @import("wav.zig");
+
+pub const exif = @import("exif.zig");
 
 test {
     _ = adler32;
@@ -28,9 +37,12 @@ test {
     _ = xxhash32;
     _ = xxhash64;
 
+    _ = wav;
     _ = riff;
+
     _ = pcm;
     _ = g711;
     _ = adpcm;
-    _ = wav;
+
+    _ = exif;
 }
