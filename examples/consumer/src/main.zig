@@ -4,6 +4,7 @@ const adler32 = @import("wingman").adler32;
 const crc32 = @import("wingman").crc32;
 const xxhash32 = @import("wingman").xxhash32;
 const xxhash64 = @import("wingman").xxhash64;
+const blake3 = @import("wingman").blake3;
 const riff = @import("wingman").riff;
 const pcm = @import("wingman").pcm;
 const g711 = @import("wingman").g711;
@@ -393,4 +394,82 @@ test "Exif admission and field interpretation have separate boundaries" {
     try std.testing.expectEqual(129, entry.field_type);
     try std.testing.expectError(error.UnsupportedExif, entry.data());
     try std.testing.expectEqual(1, (try view.directoryAt(view.first_ifd)).count);
+}
+
+test "BLAKE3 complete input retired bytes snapshots and selected output" {
+    const state = try std.testing.allocator.create(blake3.Hasher);
+    defer std.testing.allocator.destroy(state);
+    defer state.clear();
+    const digest = try state.hash("abc");
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings(
+        "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+        &hex,
+    );
+    var input = "abc".*;
+    state.reset();
+    try state.update(input[0..1]);
+    const prefix = state.final();
+    try state.update(input[1..]);
+    @memset(&input, 0xff);
+    try std.testing.expectEqual(digest, state.final());
+    try std.testing.expect(!std.mem.eql(u8, &prefix, &digest));
+    var extended: [96]u8 = undefined;
+    try state.finalizeSeek(0, &extended);
+    var selected: [40]u8 = undefined;
+    try state.finalizeSeek(31, &selected);
+    try std.testing.expectEqualSlices(u8, &digest, extended[0..32]);
+    try std.testing.expectEqualSlices(u8, extended[31..71], &selected);
+    try state.update("d");
+    var expected: blake3.Digest = undefined;
+    std.crypto.hash.Blake3.hash("abcd", &expected, .{});
+    try std.testing.expectEqual(expected, state.final());
+    @memset(&selected, 0xa5);
+    try std.testing.expectError(
+        error.SizeOverflow,
+        state.finalizeSeek(std.math.maxInt(u64), &selected),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &selected, 0xa5));
+}
+
+test "BLAKE3 keyed and derived modes own retained state" {
+    const state = try std.testing.allocator.create(blake3.Hasher);
+    defer std.testing.allocator.destroy(state);
+    defer state.clear();
+    const key = "whats the Elvish word for friend".*;
+    state.resetKeyed(key);
+    try state.update("");
+    const keyed_hex = std.fmt.bytesToHex(state.final(), .lower);
+    try std.testing.expectEqualStrings(
+        "92b2b75604ed3c761f9d6f62392c8a9227ad0ea3f09573e783f1498a4ed60d26",
+        &keyed_hex,
+    );
+    try state.resetDerive("BLAKE3 2019-12-27 16:29:52 test vectors context");
+    try state.update("");
+    const derived_hex = std.fmt.bytesToHex(state.final(), .lower);
+    try std.testing.expectEqualStrings(
+        "2cc39783c223154fea8dfb7c1b1660f2ac2dcbd1c1de8277b0b0dd39b7e50d7d",
+        &derived_hex,
+    );
+    state.clear();
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(state), 0));
+    _ = try state.hash("abc");
+}
+
+test "BLAKE3 public parallel API permits inline provider and retires workers" {
+    const input = try std.testing.allocator.alloc(u8, 262144);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    const state = try std.testing.allocator.create(blake3.Hasher);
+    defer std.testing.allocator.destroy(state);
+    defer state.clear();
+    const workers = try std.testing.allocator.alloc(blake3.Worker, 4);
+    defer std.testing.allocator.free(workers);
+    defer for (workers) |*worker| worker.clear();
+    state.reset();
+    try state.updateParallel(std.Io.failing, input, workers, .{});
+    var expected: blake3.Digest = undefined;
+    std.crypto.hash.Blake3.hash(input, &expected, .{});
+    try std.testing.expectEqual(expected, state.final());
+    for (workers) |worker| try std.testing.expectEqual(0, worker.input.len);
 }

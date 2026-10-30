@@ -1,7 +1,8 @@
 # Wingman
 
-Zig libraries for checksums, binary containers, audio and image metadata. Use each independently or
-compose their views and conversion APIs, with explicit storage, lifetimes and format contracts.
+Zig libraries for checksums, cryptographic hashing, binary containers, audio and image metadata.
+Use each independently or compose their views and conversion APIs, with explicit storage, lifetimes
+and format contracts.
 
 ## Libraries
 
@@ -15,10 +16,12 @@ ownership and failure rules, and the ideas behind its implementation.
 | [`adler32`](docs/adler32.md) | zlib checksums, streaming and checksum combination | `example` |
 | [`crc32`](docs/crc32.md) | IEEE CRC-32 for gzip and PNG, streaming and combination | `crc32-example` |
 | [`xxhash32`, `xxhash64`](docs/xxhash.md) | Classic seeded hashes with copied streaming state | `xxhash-example` |
+| [`blake3`](docs/blake3.md) | Cryptographic digests, keyed hashing, key derivation and seekable output | `blake3-example` |
 
-These noncryptographic values detect accidental corruption or support lookups; matching values
-do not establish input identity or authenticate a message. IEEE CRC-32 differs from CRC-32C and
-the x86 instruction named CRC32.
+Adler-32, CRC-32 and classic xxHash detect accidental corruption or support lookups; their
+noncryptographic values do not establish input identity or authenticate a message. BLAKE3 provides
+a cryptographic digest and separate keyed and key-derivation modes. IEEE CRC-32 differs from
+CRC-32C and the x86 instruction named CRC32.
 
 ### Audio files and containers
 
@@ -115,15 +118,15 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
 - Exif directories, field data and thumbnail rasters borrow TIFF input. Copied scalar values and
   returned RGB pixels are independent of those views.
 
-Serial decoding needs no scheduler. Parallel WAVE conversion takes `std.Io`, caller-owned worker
-storage and explicit options; every submitted job finishes before success, error or cancellation
-returns. RIFF, PCM and WAVE writers use the caller's `std.Io.Writer`; callers choose its storage,
-handle backend failures and flush it.
+Serial hashing and decoding need no scheduler. Parallel BLAKE3 updates and WAVE conversion take
+`std.Io`, caller-owned worker storage and explicit options; every submitted job finishes before
+success, error or cancellation returns. RIFF, PCM and WAVE writers use the caller's `std.Io.Writer`;
+callers choose its storage, handle backend failures and flush it.
 
 The guides specify numeric encoding, admitted regions and partial-output behavior for each API.
 They also explain the mechanisms behind the contracts: vector sums, polynomial folding,
-four-lane word mixing, checked chunk/directory extents, sample quantization, adaptive prediction
-and precise thumbnail color.
+four-lane word mixing, binary hash trees, checked chunk/directory extents, sample quantization,
+adaptive prediction and precise thumbnail color.
 Tests stay with their implementations and include independent values, scalar comparisons,
 state and storage boundaries, and protected-page input checks where applicable.
 
@@ -144,7 +147,7 @@ zig build examples
 zig build docs
 ```
 
-Use `-Dtarget` and `-Dcpu` for a different compile-time target. Checksum kernels select portable
+Use `-Dtarget` and `-Dcpu` for a different compile-time target. Hash and checksum kernels select portable
 or SIMD implementations from that target; there is no runtime CPU dispatcher. A binary built
 with additional CPU features requires those features on the machine that runs it. CI checks
 baseline x86-64 Linux, including the separate consumer; its results do not establish support on

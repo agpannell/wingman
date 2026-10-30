@@ -42,6 +42,12 @@ pub fn build(b: *std.Build) void {
             .description = "Compute seeded and seed-zero XXH32 and XXH64 hashes",
         },
         .{
+            .step = "blake3-example",
+            .source = "examples/blake3.zig",
+            .executable = "blake3sum",
+            .description = "Hash complete and streamed text and verify seekable BLAKE3 output",
+        },
+        .{
             .step = "wav-example",
             .source = "examples/wav.zig",
             .executable = "wave-audio",
