@@ -11,9 +11,48 @@ const pcm = @import("wingman").pcm;
 const g711 = @import("wingman").g711;
 const adpcm = @import("wingman").adpcm;
 const exif = @import("wingman").exif;
+const icc = @import("wingman").icc;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+
+test "ICC borrowed tag bodies preserve version-specific storage outside the package" {
+    var bytes: [156]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[0..4], bytes.len, .big);
+    bytes[8] = 4;
+    @memcpy(bytes[12..24], "mntrRGB XYZ ");
+    @memcpy(bytes[36..40], "acsp");
+    std.mem.writeInt(u32, bytes[128..132], 1, .big);
+    @memcpy(bytes[132..136], "desc");
+    std.mem.writeInt(u32, bytes[136..140], 144, .big);
+    std.mem.writeInt(u32, bytes[140..144], 11, .big);
+    @memcpy(bytes[144..148], "text");
+    @memcpy(bytes[152..155], "abc");
+    const profile = try icc.Profile.open(&bytes, .{ .limits = .{ .tags = 1 } });
+    const version = profile.version;
+    const tag = (try profile.find("desc".*)).?;
+    try std.testing.expectEqualStrings("RGB ", &profile.color_space);
+    try std.testing.expectEqualStrings("XYZ ", &profile.connection_space);
+    try std.testing.expectEqual(0, profile.rendering_intent);
+    try std.testing.expectEqualStrings("text\x00\x00\x00\x00abc", tag.data);
+    try std.testing.expectEqual(@intFromPtr(&bytes) + 144, @intFromPtr(tag.data.ptr));
+    try std.testing.expect(profile.tag(std.math.maxInt(usize)) == null);
+    try std.testing.expect(try profile.find("wtpt".*) == null);
+    try std.testing.expectError(
+        error.MetadataLimitExceeded,
+        icc.Profile.open(&bytes, .{ .limits = .{ .tags = 0 } }),
+    );
+
+    // The previous borrows have retired. Version two permits this unpadded final body.
+    bytes[8] = 2;
+    std.mem.writeInt(u32, bytes[0..4], 155, .big);
+    const legacy = try icc.Profile.open(bytes[0..155], .{ .limits = .{ .tags = 1 } });
+    try std.testing.expectEqual(4, version[0]);
+    try std.testing.expectEqual(2, legacy.version[0]);
+    try std.testing.expectEqual(155, legacy.source.len);
+    try std.testing.expectEqual(11, legacy.tag(0).?.data.len);
+    try std.testing.expectEqualStrings("abc", legacy.tag(0).?.data[8..]);
+}
 
 test "Adler-32 one-shot streaming and byte order" {
     const result = adler32.hash("Wikipedia");

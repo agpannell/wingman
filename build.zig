@@ -96,6 +96,12 @@ pub fn build(b: *std.Build) void {
             .description = "Read owned BVH motion and evaluate local and global joint poses",
         },
         .{
+            .step = "icc-example",
+            .source = "examples/icc.zig",
+            .executable = "icc-inspect",
+            .description = "Inspect borrowed ICC profile headers and shared tag bodies",
+        },
+        .{
             .step = "exif-example",
             .source = "examples/exif.zig",
             .executable = "exif-inspect",

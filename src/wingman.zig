@@ -13,9 +13,9 @@
 //! generic chunk framing. pcm, g711 and adpcm convert raw sample representations or complete codec
 //! blocks when the layout is already known; playback and resampling stay with callers.
 //!
-//! exif borrows classic TIFF image attributes and thumbnail storage without allocation. It samples
-//! supported uncompressed RGB/YCbCr thumbnails; orientation and profile transforms stay with
-//! callers.
+//! exif borrows classic TIFF attributes and thumbnail storage, including supported RGB/YCbCr
+//! thumbnail samples. icc inspects bounded uncompressed color-profile headers and opaque tag
+//! bodies. Orientation, complete profile validation and color transforms stay with callers.
 //!
 //! bvh owns self-contained skeletal motion; acclaim pairs reusable ASF skeletons with AMC clips and
 //! cached pose calibration. Both write local/global RigidTransform values into caller storage,
@@ -43,6 +43,7 @@ pub const g711 = @import("g711.zig");
 pub const adpcm = @import("adpcm.zig");
 
 pub const exif = @import("exif.zig");
+pub const icc = @import("icc.zig");
 
 pub const bvh = @import("bvh.zig");
 pub const acclaim = @import("acclaim.zig");
@@ -65,6 +66,7 @@ test {
     _ = adpcm;
 
     _ = exif;
+    _ = icc;
 
     _ = bvh;
     _ = acclaim;

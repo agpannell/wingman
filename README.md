@@ -59,12 +59,14 @@ resampling and speaker placement. The linked guides state supported layouts and 
 
 ### Image metadata
 
-Use `exif` for classic TIFF image attributes and stored thumbnail data. Callers extract the TIFF
-payload from its enclosing image and choose orientation or profile transforms explicitly.
+Use `exif` for classic TIFF image attributes and stored thumbnail data, or `icc` for uncompressed
+color-profile headers and raw tag bodies. Callers extract metadata from its container and choose
+orientation or color transforms; inspection alone does not validate a complete color profile.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`exif`](docs/exif.md) | Borrowed fields, orientation, thumbnail ranges and supported RGB/YCbCr thumbnail pixels | `exif-example` |
+| [`icc`](docs/icc.md) | Bounded v2/v4 profile headers, raw tag lookup and shared body storage | `icc-example` |
 
 ### Motion capture
 
@@ -139,8 +141,9 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
 - Raw audio decoders write caller-provided storage. WAVE decoding offers either caller samples
   or an allocated `wav.Audio` owner independent of encoded input. Release that owner exactly once
   with the original allocator, after all sample views retire.
-- Exif directories, field data and thumbnail rasters borrow TIFF input. Copied scalar values and
-  returned RGB pixels are independent of those views.
+- Exif directories, field data and thumbnail rasters borrow TIFF input; ICC profiles and tag bodies
+  borrow complete uncompressed profile bytes. Copied headers/scalars and returned RGB pixels are
+  independent of those views.
 - BVH motions own their skeleton and samples. Acclaim skeletons own shared backing; clips and
   evaluators borrow it and must retire first. Each owner is released once with its construction
   allocator. Views borrow their owner; completed pose output is independent caller storage.
