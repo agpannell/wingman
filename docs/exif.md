@@ -14,6 +14,10 @@ Use [Zig 0.17.0 and the package setup](../README.md#use-it-in-a-project). The co
 [Exif example](../examples/exif.zig) constructs a small TIFF payload, reads its stored orientation,
 checks thumbnail strip storage and samples two RGB pixels.
 
+The [public entry](../src/exif.zig) presents the API. Under `src/exif/`, `tiff.zig` owns borrowed
+directories, fields and metadata selection; `raster.zig` owns thumbnail admission, sampling and
+color calibration. Their inline tests use owned immutable controls in `fixtures.zig`.
+
 ## Inspect borrowed metadata
 
 Every view, directory, entry, thumbnail and strip borrows the complete TIFF source. Keep its
