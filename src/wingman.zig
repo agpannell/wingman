@@ -21,7 +21,8 @@
 //! SFNT table directories and TTC/OTC collection members. Table payloads remain opaque, with
 //! explicit checksums; glyph interpretation, shaping and rendering stay with callers.
 //!
-//! ktx2 inspects and writes texture containers with caller-supplied encoded mip levels.
+//! ktx2 inspects and writes texture containers with caller-supplied encoded mip levels. etc encodes
+//! and decodes ETC1 color and unsigned EAC component blocks.
 //!
 //! bvh owns self-contained skeletal motion; acclaim pairs reusable ASF skeletons with AMC clips and
 //! cached pose calibration. Both write local/global RigidTransform values into caller storage,
@@ -52,6 +53,7 @@ pub const exif = @import("exif.zig");
 pub const icc = @import("icc.zig");
 
 pub const ktx2 = @import("ktx2.zig");
+pub const etc = @import("etc.zig");
 
 pub const dfont = @import("dfont.zig");
 pub const sfnt = @import("sfnt.zig");
@@ -80,6 +82,7 @@ test {
     _ = icc;
 
     _ = ktx2;
+    _ = etc;
 
     _ = dfont;
     _ = sfnt;

@@ -68,14 +68,16 @@ orientation or color transforms; inspection alone does not validate a complete c
 | [`exif`](docs/exif.md) | Borrowed fields, orientation, thumbnail ranges and supported RGB/YCbCr thumbnail pixels | `exif-example` |
 | [`icc`](docs/icc.md) | Bounded v2/v4 profile headers, raw tag lookup and shared body storage | `icc-example` |
 
-### Texture containers
+### Textures
 
 Use `ktx2` to inspect or write texture containers carrying supplied mip levels, metadata and
-format descriptors. The library checks container structure; codecs and GPU upload remain caller work.
+format descriptors. Use `etc` to encode or decode individual ETC1 color and unsigned EAC
+component blocks. Applications assemble image tiles and handle GPU upload.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`ktx2`](docs/ktx2.md) | Borrowed texture levels, metadata, descriptors and supplied-level writing | `ktx2-example` |
+| [`etc`](docs/etc.md) | ETC1 color and unsigned EAC alpha8/R11 block encoding and decoding | `etc-example` |
 
 ### Font containers
 

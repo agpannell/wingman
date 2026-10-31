@@ -13,11 +13,31 @@ const adpcm = @import("wingman").adpcm;
 const exif = @import("wingman").exif;
 const icc = @import("wingman").icc;
 const ktx2 = @import("wingman").ktx2;
+const etc = @import("wingman").etc;
 const dfont = @import("wingman").dfont;
 const sfnt = @import("wingman").sfnt;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+
+test "ETC and EAC blocks preserve constants and report refused work" {
+    const pixels: [16][4]u8 = @splat(.{ 0, 0, 0, 17 });
+    var block: [8]u8 = undefined;
+    try etc.encodeBlock(&pixels, &block, .{});
+    var decoded: [64]u8 = undefined;
+    try etc.decodeBlock(&block, &decoded);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, decoded[0..4]);
+    const samples: [16]u8 = @splat(103);
+    try etc.encodeAlphaBlock(&samples, &block, .{});
+    try std.testing.expect(block[1] >> 4 != 0);
+    var alpha: [16]u8 = undefined;
+    try etc.decodeAlphaBlock(&block, &alpha);
+    try std.testing.expectEqualSlices(u8, &samples, &alpha);
+    try std.testing.expectError(
+        error.WorkBudgetExceeded,
+        etc.encodeBlock(&pixels, &block, .{ .maximum_work_units = 0 }),
+    );
+}
 
 test "KTX2 writes and borrows an explicitly supplied level" {
     const samples = [_]ktx2.Sample{

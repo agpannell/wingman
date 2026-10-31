@@ -102,6 +102,12 @@ pub fn build(b: *std.Build) void {
             .description = "Inspect and write supplied KTX2 texture levels",
         },
         .{
+            .step = "etc-example",
+            .source = "examples/etc.zig",
+            .executable = "etc-blocks",
+            .description = "Encode and decode ETC1 color and EAC component blocks",
+        },
+        .{
             .step = "dfont-example",
             .source = "examples/dfont.zig",
             .executable = "dfont-inspect",
