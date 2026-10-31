@@ -31,13 +31,11 @@ pub fn decodeInto(source: []const u8, destination: []f32, law: Law) DecodeError!
     if (destination.len < source.len) return error.DestinationTooSmall;
     const output = destination[0..source.len];
     if (overlaps(source, std.mem.sliceAsBytes(output))) return error.Aliasing;
-    for (source, output) |byte, *sample| {
-        const expanded = switch (law) {
-            .alaw => decodeAlaw(byte),
-            .mulaw => decodeMulaw(byte),
-        };
-        sample.* = @as(f32, @floatFromInt(expanded)) / 32768;
-    }
+    const table = switch (law) {
+        .alaw => &alaw_table,
+        .mulaw => &mulaw_table,
+    };
+    for (source, output) |byte, *sample| sample.* = table[byte];
     return output;
 }
 
@@ -72,6 +70,45 @@ pub fn decodeAlaw(encoded: u8) i16 {
     }
     const sample = if (value & 0x80 != 0) magnitude else -magnitude;
     return @intCast(sample);
+}
+
+// Normalizing the exact integer expansion once also preserves positive zero for both mu-law zeros.
+const alaw_table = normalizedSamples(.alaw);
+const mulaw_table = normalizedSamples(.mulaw);
+
+fn normalizedSamples(comptime law: Law) [256]f32 {
+    @setEvalBranchQuota(10_000);
+    var samples: [256]f32 = undefined;
+    for (&samples, 0..) |*sample, index| {
+        const byte: u8 = @intCast(index);
+        const expanded = switch (law) {
+            .alaw => decodeAlaw(byte),
+            .mulaw => decodeMulaw(byte),
+        };
+        sample.* = @as(f32, @floatFromInt(expanded)) / 32768;
+    }
+    return samples;
+}
+
+test "bulk expansion preserves every scalar law value and unused output" {
+    var source: [256]u8 = undefined;
+    for (&source, 0..) |*byte, index| byte.* = @intCast(index);
+    var output: [257]f32 = undefined;
+    for ([_]Law{ .alaw, .mulaw }) |law| {
+        for (0..source.len + 1) |count| {
+            @memset(&output, 42);
+            const decoded = try decodeInto(source[0..count], &output, law);
+            for (decoded, source[0..count]) |sample, byte| {
+                const expanded = switch (law) {
+                    .alaw => decodeAlaw(byte),
+                    .mulaw => decodeMulaw(byte),
+                };
+                const expected = @as(f32, @floatFromInt(expanded)) / 32768;
+                try testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(sample)));
+            }
+            try testing.expect(std.mem.allEqual(f32, output[count..], 42));
+        }
+    }
 }
 
 test "G.711 endpoints zero signs and segment boundaries" {
