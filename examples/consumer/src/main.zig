@@ -12,9 +12,67 @@ const g711 = @import("wingman").g711;
 const adpcm = @import("wingman").adpcm;
 const exif = @import("wingman").exif;
 const icc = @import("wingman").icc;
+const sfnt = @import("wingman").sfnt;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+
+test "SFNT shared table borrows and head checksum exceptions work outside the package" {
+    var bytes: [60]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[0..4], 0x00010000, .big);
+    std.mem.writeInt(u16, bytes[4..6], 2, .big);
+    @memcpy(bytes[12..16], "DATA");
+    @memcpy(bytes[28..32], "head");
+    std.mem.writeInt(u32, bytes[16..20], 0x0f121518, .big);
+    std.mem.writeInt(u32, bytes[32..36], 0x06080a0c, .big);
+    for ([_]usize{ 12, 28 }) |record_offset| {
+        std.mem.writeInt(u32, bytes[record_offset + 8 ..][0..4], 48, .big);
+        std.mem.writeInt(u32, bytes[record_offset + 12 ..][0..4], 12, .big);
+    }
+    @memcpy(bytes[48..60], &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 });
+    const directory = try sfnt.Directory.open(&bytes);
+    const ordinary = (try directory.find("DATA".*)).?;
+    const head = (try directory.find("head".*)).?;
+    try std.testing.expectEqual(.truetype, directory.flavor);
+    try std.testing.expect(directory.ordered);
+    try std.testing.expectEqual(ordinary.data.ptr, head.data.ptr);
+    try std.testing.expectEqual(@intFromPtr(&bytes) + 48, @intFromPtr(head.data.ptr));
+    try std.testing.expect(ordinary.checksumMatches() and head.checksumMatches());
+    try std.testing.expectEqual(0x0f121518, sfnt.checksum(head.data));
+    try std.testing.expectEqual(0x06080a0c, head.computedChecksum());
+    try std.testing.expect(directory.table(std.math.maxInt(usize)) == null);
+    try std.testing.expect(try directory.find("none".*) == null);
+    try std.testing.expectEqual(0xb1b0afba, sfnt.checksum_target);
+    try std.testing.expectError(error.InvalidFont, sfnt.Directory.open(bytes[0..59]));
+}
+
+test "SFNT collection selection keeps table offsets absolute outside the package" {
+    var bytes: [64]u8 = @splat(0);
+    @memcpy(bytes[0..4], "ttcf");
+    std.mem.writeInt(u32, bytes[4..8], 0x00010000, .big);
+    std.mem.writeInt(u32, bytes[8..12], 1, .big);
+    std.mem.writeInt(u32, bytes[12..16], 20, .big);
+    std.mem.writeInt(u32, bytes[20..24], 0x4f54544f, .big);
+    std.mem.writeInt(u16, bytes[24..26], 1, .big);
+    @memcpy(bytes[32..36], "CFF ");
+    std.mem.writeInt(u32, bytes[40..44], 61, .big);
+    std.mem.writeInt(u32, bytes[44..48], 3, .big);
+    @memcpy(bytes[61..64], "abc");
+    const collection = try sfnt.Collection.open(&bytes);
+    const directory = try collection.face(0);
+    const direct = try sfnt.Directory.openAt(&bytes, 20);
+    const table = (try directory.find("CFF ".*)).?;
+    try std.testing.expectEqual(.v1, collection.version);
+    try std.testing.expectEqual(.opentype_cff, directory.flavor);
+    try std.testing.expectEqual(20, directory.offset);
+    try std.testing.expectEqualSlices(u8, "abc", table.data);
+    try std.testing.expectEqual(direct.table(0).?.data.ptr, table.data.ptr);
+    try std.testing.expectEqual(@intFromPtr(&bytes) + 61, @intFromPtr(table.data.ptr));
+    try std.testing.expect(!table.checksumMatches());
+    try std.testing.expectEqual(null, collection.signature);
+    try std.testing.expectError(error.InvalidFace, collection.face(1));
+    try std.testing.expectError(error.UnsupportedFormat, sfnt.Directory.open(&bytes));
+}
 
 test "ICC borrowed tag bodies preserve version-specific storage outside the package" {
     var bytes: [156]u8 = @splat(0);

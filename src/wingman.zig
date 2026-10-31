@@ -1,5 +1,5 @@
-//! Independent libraries for checksums, hashing, compression, containers, audio, image metadata and
-//! motion capture.
+//! Independent libraries for checksums, hashing, compression, containers, audio, image metadata,
+//! font containers and motion capture.
 //!
 //! adler32 and crc32 provide format-specific checksums; xxhash32 and xxhash64 provide seeded
 //! hashes. Each supports complete input and caller-owned streaming state, and the checksum
@@ -16,6 +16,9 @@
 //! exif borrows classic TIFF attributes and thumbnail storage, including supported RGB/YCbCr
 //! thumbnail samples. icc inspects bounded uncompressed color-profile headers and opaque tag
 //! bodies. Orientation, complete profile validation and color transforms stay with callers.
+//!
+//! sfnt borrows SFNT table directories and TTC/OTC collection members. Table payloads remain
+//! opaque, with explicit checksums; glyph interpretation, shaping and rendering stay with callers.
 //!
 //! bvh owns self-contained skeletal motion; acclaim pairs reusable ASF skeletons with AMC clips and
 //! cached pose calibration. Both write local/global RigidTransform values into caller storage,
@@ -45,6 +48,8 @@ pub const adpcm = @import("adpcm.zig");
 pub const exif = @import("exif.zig");
 pub const icc = @import("icc.zig");
 
+pub const sfnt = @import("sfnt.zig");
+
 pub const bvh = @import("bvh.zig");
 pub const acclaim = @import("acclaim.zig");
 pub const RigidTransform = @import("common/rigid_transform.zig").RigidTransform;
@@ -67,6 +72,8 @@ test {
 
     _ = exif;
     _ = icc;
+
+    _ = sfnt;
 
     _ = bvh;
     _ = acclaim;

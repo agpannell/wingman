@@ -96,6 +96,12 @@ pub fn build(b: *std.Build) void {
             .description = "Read owned BVH motion and evaluate local and global joint poses",
         },
         .{
+            .step = "sfnt-example",
+            .source = "examples/sfnt.zig",
+            .executable = "sfnt-inspect",
+            .description = "Inspect borrowed font tables, collection members and checksums",
+        },
+        .{
             .step = "icc-example",
             .source = "examples/icc.zig",
             .executable = "icc-inspect",

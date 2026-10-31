@@ -1,7 +1,7 @@
 # Wingman
 
-Zig libraries for checksums, hashing, compression, binary containers, audio, image metadata and
-motion capture.
+Zig libraries for checksums, hashing, compression, binary containers, audio, image metadata, font
+containers and motion capture.
 Use each independently or compose their views and conversion APIs, with explicit storage, lifetimes
 and format contracts.
 
@@ -68,6 +68,16 @@ orientation or color transforms; inspection alone does not validate a complete c
 | [`exif`](docs/exif.md) | Borrowed fields, orientation, thumbnail ranges and supported RGB/YCbCr thumbnail pixels | `exif-example` |
 | [`icc`](docs/icc.md) | Bounded v2/v4 profile headers, raw tag lookup and shared body storage | `icc-example` |
 
+### Font containers
+
+Use `sfnt` to enumerate opaque font tables or select a TTC/OTC collection member before handing
+its bytes to a table-specific reader. Opening checks storage ranges; it does not establish that a
+font can render text. Checksums are explicit, and glyphs, layout and rendering stay with callers.
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
+| [`sfnt`](docs/sfnt.md) | Borrowed table directories, collection faces, raw tag lookup and checksums | `sfnt-example` |
+
 ### Motion capture
 
 Use `bvh` for self-contained skeleton/motion clips, or `acclaim` to pair one ASF skeleton with
@@ -99,7 +109,8 @@ after `--`.
 
 The examples exercise complete public API calls: format-specific checksum bytes, seeded hashes,
 compressed blocks and frames, nested chunks, sample quantization, complete WAVE audio, image
-attributes and skeletal movement. Each checks its results as it runs. The [source files](examples/)
+attributes, shared font tables and skeletal movement. Each checks its results as it runs.
+The [source files](examples/)
 are small standalone starting points.
 
 ## Use it in a project
@@ -141,6 +152,8 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
 - Raw audio decoders write caller-provided storage. WAVE decoding offers either caller samples
   or an allocated `wav.Audio` owner independent of encoded input. Release that owner exactly once
   with the original allocator, after all sample views retire.
+- SFNT directories, collection faces and raw tables borrow complete immutable font/container bytes.
+  Copied tags, checksums and flavor values are independent; no allocator or cleanup is retained.
 - Exif directories, field data and thumbnail rasters borrow TIFF input; ICC profiles and tag bodies
   borrow complete uncompressed profile bytes. Copied headers/scalars and returned RGB pixels are
   independent of those views.
