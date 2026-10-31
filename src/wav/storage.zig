@@ -1,14 +1,7 @@
-//! WAVE-owned sample allocation and borrowed-span admission. Byte-backed allocation preserves exact
-//! aligned requests, grows a misaligned tail when possible, and releases a refused probe before
-//! requesting one padded replacement. No allocator or request accounting is retained.
+//! WAVE-owned sample allocation. Byte-backed allocation preserves exact aligned requests, grows a
+//! misaligned tail when possible, and releases a refused probe before requesting one padded
+//! replacement. No allocator or request accounting is retained.
 const std = @import("std");
-
-pub fn overlaps(first: []const u8, second: []const u8) bool {
-    if (first.len == 0 or second.len == 0) return false;
-    const a = @intFromPtr(first.ptr);
-    const b = @intFromPtr(second.ptr);
-    return if (a <= b) b - a < first.len else a - b < second.len;
-}
 
 pub fn allocateSamples(
     allocator: std.mem.Allocator,

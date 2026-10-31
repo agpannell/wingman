@@ -96,6 +96,12 @@ pub fn build(b: *std.Build) void {
             .description = "Read owned BVH motion and evaluate local and global joint poses",
         },
         .{
+            .step = "ktx2-example",
+            .source = "examples/ktx2.zig",
+            .executable = "ktx2-inspect",
+            .description = "Inspect and write supplied KTX2 texture levels",
+        },
+        .{
             .step = "dfont-example",
             .source = "examples/dfont.zig",
             .executable = "dfont-inspect",

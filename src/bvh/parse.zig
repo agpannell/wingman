@@ -1,5 +1,6 @@
 //! Complete owned BVH ingestion, bounded hierarchy materialization and exact sample admission.
 const std = @import("std");
+const overlaps = @import("../common/byte_ranges.zig").overlaps;
 const model = @import("model.zig");
 const text = @import("text.zig");
 const fixtures = @import("fixtures.zig");
@@ -694,13 +695,4 @@ test "BVH storage-byte representability is checked before sample allocation" {
     );
     if (@sizeOf(usize) == 4) try std.testing.expectEqual(error.LimitExceeded, diagnostic.reason);
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-}
-
-// Address-only alias admission; empty spans are disjoint and pointer-end addition is avoided.
-fn overlaps(first: []const u8, second: []const u8) bool {
-    if (first.len == 0 or second.len == 0) return false;
-    const first_address = @intFromPtr(first.ptr);
-    const second_address = @intFromPtr(second.ptr);
-    return if (first_address <= second_address) second_address - first_address < first
-        .len else first_address - second_address < second.len;
 }

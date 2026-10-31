@@ -2,6 +2,7 @@
 //! rotations postmultiply in the declared channel order. Position channels describe coordinates in
 //! parent/file axes, independently of their position among rotation channels.
 const std = @import("std");
+const overlaps = @import("../common/byte_ranges.zig").overlaps;
 const model = @import("model.zig");
 const transforms = @import("../common/rigid_transform.zig");
 const RigidTransform = transforms.RigidTransform;
@@ -526,13 +527,4 @@ test "BVH numeric failure publishes only completed joints and preserves unused t
     try expectVector(.{ 1e308, 0, 0 }, output[0].translation);
     try std.testing.expectEqualDeep(RigidTransform.identity, output[1]);
     try std.testing.expectEqualDeep(RigidTransform.identity, output[2]);
-}
-
-// Address-only alias admission; empty spans are disjoint and pointer-end addition is avoided.
-fn overlaps(first: []const u8, second: []const u8) bool {
-    if (first.len == 0 or second.len == 0) return false;
-    const first_address = @intFromPtr(first.ptr);
-    const second_address = @intFromPtr(second.ptr);
-    return if (first_address <= second_address) second_address - first_address < first
-        .len else first_address - second_address < second.len;
 }

@@ -9,6 +9,7 @@
 //! Algorithm reference: https://www.itu.int/rec/T-REC-G.711/en
 
 const std = @import("std");
+const overlaps = @import("common/byte_ranges.zig").overlaps;
 const testing = std.testing;
 
 /// Select the byte representation declared by the input format or protocol; neither is detected.
@@ -94,12 +95,6 @@ test "G.711 endpoints zero signs and segment boundaries" {
 }
 
 // Compare address differences rather than adding lengths to possibly high addresses.
-fn overlaps(first: []const u8, second: []const u8) bool {
-    if (first.len == 0 or second.len == 0) return false;
-    const a = @intFromPtr(first.ptr);
-    const b = @intFromPtr(second.ptr);
-    return if (a <= b) b - a < first.len else a - b < second.len;
-}
 
 test decodeAlaw {
     try testing.expectEqual(-8, decodeAlaw(0x55));

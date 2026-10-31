@@ -12,11 +12,42 @@ const g711 = @import("wingman").g711;
 const adpcm = @import("wingman").adpcm;
 const exif = @import("wingman").exif;
 const icc = @import("wingman").icc;
+const ktx2 = @import("wingman").ktx2;
 const dfont = @import("wingman").dfont;
 const sfnt = @import("wingman").sfnt;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+
+test "KTX2 writes and borrows an explicitly supplied level" {
+    const samples = [_]ktx2.Sample{
+        .{ .bit_offset = 0, .bit_length = 8, .channel_type = 0, .lower = 0, .upper = 255 },
+    };
+    const descriptor = ktx2.BasicDescriptor{ .color_model = 1, .bytes_plane = .{
+        1, 0, 0, 0, 0, 0, 0, 0,
+    }, .samples = &samples };
+    var descriptor_storage: [44]u8 = undefined;
+    const descriptor_bytes = try descriptor.encodeInto(&descriptor_storage);
+    const pixels = [_]u8{ 23, 42 };
+    const levels = [_]ktx2.Level{.{ .data = &pixels, .uncompressed_size = pixels.len }};
+    const texture: ktx2.EncodeTexture = .{
+        .header = .{ .vk_format = 9, .width = 2, .height = 1 },
+        .descriptor = descriptor_bytes,
+        .levels = &levels,
+    };
+    var output: [256]u8 = @splat(0xa5);
+    const file = try ktx2.encodeInto(&texture, &output, .{});
+    const source = try ktx2.Source.open(file, .{});
+    const level = source.level(0).?;
+    try std.testing.expectEqualSlices(u8, &pixels, level.data);
+    try std.testing.expectEqual(2, level.uncompressed_size);
+    try std.testing.expectEqual(@as(u8, 0xa5), output[file.len]);
+    try std.testing.expectEqual(null, source.level(1));
+    try std.testing.expectError(
+        error.DestinationTooSmall,
+        ktx2.encodeInto(&texture, output[0..1], .{}),
+    );
+}
 
 test "DFONT selected bytes remain resource-relative for the SFNT reader" {
     var bytes: [102]u8 = @splat(0);

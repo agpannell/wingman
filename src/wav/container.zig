@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const riff = @import("../riff.zig");
-const memory = @import("storage.zig");
+const spans = @import("../common/byte_ranges.zig");
 
 /// Malformed headers, directories, chunk extents, padding, or sentinel reuse.
 pub const ParseError = error{ InvalidWave, InsufficientScratch, Aliasing };
@@ -54,7 +54,7 @@ pub const Container = struct {
         const count = self.scratchCount();
         if (directory_index.len < count) return error.InsufficientScratch;
         const scratch = directory_index[0..count];
-        if (memory.overlaps(self.source, std.mem.sliceAsBytes(scratch))) return error.Aliasing;
+        if (spans.overlaps(self.source, std.mem.sliceAsBytes(scratch))) return error.Aliasing;
         if (count <= 32) @memset(scratch, .{ .table_index = 0, .next_match = 0 });
         return .{ .view = self, .offset = self.chunks_start, .directory_index = scratch };
     }

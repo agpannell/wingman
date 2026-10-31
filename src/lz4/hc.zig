@@ -5,6 +5,7 @@
 //! LZ4HC_sequencePrice and its bounded optimal parser.
 
 const std = @import("std");
+const overlaps = @import("../common/byte_ranges.zig").overlaps;
 
 const lz4 = @import("block.zig");
 
@@ -370,13 +371,6 @@ fn extension(length: usize, threshold: usize) usize {
 
 fn literalPrice(length: usize) usize {
     return 1 + length + extension(length, 15);
-}
-
-fn overlaps(a: []const u8, b: []const u8) bool {
-    if (a.len == 0 or b.len == 0) return false;
-    const first = @intFromPtr(a.ptr);
-    const second = @intFromPtr(b.ptr);
-    return if (first <= second) second - first < a.len else first - second < b.len;
 }
 
 // Full blockEncodeBound admission proves all writes, including worst-case match splits. Every match

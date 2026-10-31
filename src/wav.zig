@@ -13,6 +13,7 @@
 //! Writing supports finite normalized mono/stereo PCM16 RIFF, within its 32-bit size limit.
 
 const std = @import("std");
+const spans = @import("common/byte_ranges.zig");
 const builtin = @import("builtin");
 const riff = @import("riff.zig");
 const pcm = @import("pcm.zig");
@@ -178,7 +179,7 @@ pub fn decodeParallelAlloc(
     workers: []Worker,
     options: ParallelOptions,
 ) ParallelDecodeAllocError!Audio {
-    if (memory.overlaps(source, std.mem.sliceAsBytes(workers))) return error.Aliasing;
+    if (spans.overlaps(source, std.mem.sliceAsBytes(workers))) return error.Aliasing;
     return decodeOwned(true, allocator, io, source, workers, options);
 }
 
@@ -240,22 +241,19 @@ fn admitStorage(
     const index_bytes = std.mem.sliceAsBytes(directory_index[0..entries]);
     const samples = std.mem.sliceAsBytes(destination);
     const work = std.mem.sliceAsBytes(workers);
-    if (memory.overlaps(
+    if (spans.overlaps(
         view.source,
         samples,
-    ) or memory.overlaps(
+    ) or spans.overlaps(
         view.source,
         index_bytes,
-    ) or memory.overlaps(
+    ) or spans.overlaps(
         view.source,
         work,
-    ) or memory.overlaps(
+    ) or spans.overlaps(
         samples,
         index_bytes,
-    ) or memory.overlaps(
-        samples,
-        work,
-    ) or memory.overlaps(index_bytes, work)) return error.Aliasing;
+    ) or spans.overlaps(samples, work) or spans.overlaps(index_bytes, work)) return error.Aliasing;
 }
 
 fn decodeOwned(
@@ -437,7 +435,7 @@ pub fn encodePcm16Into(source: AudioView, destination: []u8) EncodeError![]u8 {
     const bytes = try encodePcm16Requirements(source);
     if (destination.len < bytes) return error.DestinationTooSmall;
     const output = destination[0..bytes];
-    if (memory.overlaps(std.mem.sliceAsBytes(source.samples), output)) return error.Aliasing;
+    if (spans.overlaps(std.mem.sliceAsBytes(source.samples), output)) return error.Aliasing;
     var writer = std.Io.Writer.fixed(output);
     writePcm16Admitted(source, bytes, &writer) catch unreachable;
     return output;

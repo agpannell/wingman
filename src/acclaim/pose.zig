@@ -4,6 +4,7 @@
 //! axes about its proximal joint; its children start at its distal endpoint. Preparing the static
 //! axis bases once lets many clips reuse the same calibration without repeating its trigonometry.
 const std = @import("std");
+const overlaps = @import("../common/byte_ranges.zig").overlaps;
 const model = @import("model.zig");
 const rigid = @import("../common/rigid_transform.zig");
 const RigidTransform = rigid.RigidTransform;
@@ -642,13 +643,4 @@ test "global pose rejects finite local inputs whose accumulated positions overfl
     try std.testing.expectError(error.NonFiniteResult, evaluator.globalPoseInto(sample, &output));
     try std.testing.expectEqual(RigidTransform.identity, output[4]);
     for (output) |value| try std.testing.expect(finite(value));
-}
-
-// Compares addresses and lengths without overflowing pointer-end arithmetic.
-fn overlaps(first: []const u8, second: []const u8) bool {
-    if (first.len == 0 or second.len == 0) return false;
-    const first_address = @intFromPtr(first.ptr);
-    const second_address = @intFromPtr(second.ptr);
-    return if (first_address <= second_address) second_address - first_address < first
-        .len else first_address - second_address < second.len;
 }

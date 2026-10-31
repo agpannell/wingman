@@ -5,6 +5,7 @@
 //! [-1, 1]. Conversion allocates nothing and retains no borrowed storage.
 
 const std = @import("std");
+const overlaps = @import("common/byte_ranges.zig").overlaps;
 const testing = std.testing;
 
 /// Encoded little-endian sample containers supported by the decoder.
@@ -147,16 +148,6 @@ test writePcm16 {
     var writer: std.Io.Writer = .fixed(&bytes);
     try writePcm16(&.{ -0.5, 0.5 }, &writer);
     try testing.expectEqualSlices(u8, &.{ 0, 192, 0, 64 }, writer.buffered());
-}
-
-/// Reports whether two borrowed byte spans share any byte; empty spans never overlap. Reads only
-/// addresses and lengths, without inspecting or retaining either span. Pointer-end addition is
-/// avoided so the comparison cannot overflow.
-fn overlaps(first: []const u8, second: []const u8) bool {
-    if (first.len == 0 or second.len == 0) return false;
-    const a = @intFromPtr(first.ptr);
-    const b = @intFromPtr(second.ptr);
-    return if (a <= b) b - a < first.len else a - b < second.len;
 }
 
 const pcm_vector_lanes = std.simd.suggestVectorLength(f32) orelse 1;

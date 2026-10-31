@@ -1,7 +1,7 @@
 # Wingman
 
 Zig libraries for checksums, hashing, compression, binary containers, audio, image metadata, font
-containers and motion capture.
+containers, texture containers and motion capture.
 Use each independently or compose their views and conversion APIs, with explicit storage, lifetimes
 and format contracts.
 
@@ -67,6 +67,15 @@ orientation or color transforms; inspection alone does not validate a complete c
 | --- | --- | --- |
 | [`exif`](docs/exif.md) | Borrowed fields, orientation, thumbnail ranges and supported RGB/YCbCr thumbnail pixels | `exif-example` |
 | [`icc`](docs/icc.md) | Bounded v2/v4 profile headers, raw tag lookup and shared body storage | `icc-example` |
+
+### Texture containers
+
+Use `ktx2` to inspect or write texture containers carrying supplied mip levels, metadata and
+format descriptors. The library checks container structure; codecs and GPU upload remain caller work.
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
+| [`ktx2`](docs/ktx2.md) | Borrowed texture levels, metadata, descriptors and supplied-level writing | `ktx2-example` |
 
 ### Font containers
 
@@ -154,6 +163,7 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
 - Raw audio decoders write caller-provided storage. WAVE decoding offers either caller samples
   or an allocated `wav.Audio` owner independent of encoded input. Release that owner exactly once
   with the original allocator, after all sample views retire.
+- KTX2 source views borrow the complete input; allocating writes return caller-owned bytes.
 - DFONT containers and selected font resources borrow complete immutable resource-file bytes.
   SFNT directories, collection faces and raw tables borrow complete immutable font/container bytes.
   Copied tags, checksums and flavor values are independent; no allocator or cleanup is retained.

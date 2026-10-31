@@ -1,5 +1,5 @@
 //! Independent libraries for checksums, hashing, compression, containers, audio, image metadata,
-//! font containers and motion capture.
+//! font containers, texture containers and motion capture.
 //!
 //! adler32 and crc32 provide format-specific checksums; xxhash32 and xxhash64 provide seeded
 //! hashes. Each supports complete input and caller-owned streaming state, and the checksum
@@ -20,6 +20,8 @@
 //! dfont selects borrowed SFNT resources from Macintosh data-fork resource containers. sfnt borrows
 //! SFNT table directories and TTC/OTC collection members. Table payloads remain opaque, with
 //! explicit checksums; glyph interpretation, shaping and rendering stay with callers.
+//!
+//! ktx2 inspects and writes texture containers with caller-supplied encoded mip levels.
 //!
 //! bvh owns self-contained skeletal motion; acclaim pairs reusable ASF skeletons with AMC clips and
 //! cached pose calibration. Both write local/global RigidTransform values into caller storage,
@@ -49,6 +51,8 @@ pub const adpcm = @import("adpcm.zig");
 pub const exif = @import("exif.zig");
 pub const icc = @import("icc.zig");
 
+pub const ktx2 = @import("ktx2.zig");
+
 pub const dfont = @import("dfont.zig");
 pub const sfnt = @import("sfnt.zig");
 
@@ -74,6 +78,8 @@ test {
 
     _ = exif;
     _ = icc;
+
+    _ = ktx2;
 
     _ = dfont;
     _ = sfnt;

@@ -9,6 +9,7 @@
 //! https://www.mmsp.ece.mcgill.ca/Documents/AudioFormats/WAVE/Docs/RIFFNEW.pdf
 
 const std = @import("std");
+const overlaps = @import("common/byte_ranges.zig").overlaps;
 const testing = std.testing;
 
 /// Specific block layouts, rather than a claim to support every ADPCM dialect.
@@ -476,12 +477,6 @@ test "ADPCM empty input does not size absent blocks" {
 }
 
 // Keep this implementation support private. Only the used destination span is compared.
-fn overlaps(first: []const u8, second: []const u8) bool {
-    if (first.len == 0 or second.len == 0) return false;
-    const a = @intFromPtr(first.ptr);
-    const b = @intFromPtr(second.ptr);
-    return if (a <= b) b - a < first.len else a - b < second.len;
-}
 
 // Independent literal PCM16 facts are normalized here; this helper does not decode compressed data.
 fn expectSamples(expected: []const i16, actual: []const f32) !void {
