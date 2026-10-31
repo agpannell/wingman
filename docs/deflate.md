@@ -7,8 +7,9 @@ preset dictionaries, work limits and caller-owned storage.
 
 A raw DEFLATE stream has no checksum, decoded-size field or dictionary identifier. Formats such as
 zlib and gzip provide their own wrapper and integrity checks; this library accepts the raw stream,
-not those wrappers. The enclosing format or application must select the matching dictionary, bound
-resources and verify integrity before using untrusted output.
+not those wrappers. Use [`wingman.zlib`](zlib.md) for zlib framing. The enclosing format or
+application must select the matching dictionary, bound resources and verify integrity before using
+untrusted output.
 
 Run `zig build deflate-example`, or pass text after `--`. The [example](../examples/deflate.zig)
 encodes and recovers a complete raw stream.

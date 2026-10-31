@@ -60,6 +60,12 @@ pub fn build(b: *std.Build) void {
             .description = "Encode and recover a raw DEFLATE stream",
         },
         .{
+            .step = "zlib-example",
+            .source = "examples/zlib.zig",
+            .executable = "zlib-roundtrip",
+            .description = "Encode and verify a zlib stream",
+        },
+        .{
             .step = "wav-example",
             .source = "examples/wav.zig",
             .executable = "wave-audio",

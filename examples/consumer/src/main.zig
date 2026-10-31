@@ -7,6 +7,7 @@ const xxhash64 = @import("wingman").xxhash64;
 const blake3 = @import("wingman").blake3;
 const lz4 = @import("wingman").lz4;
 const deflate = @import("wingman").deflate;
+const zlib = @import("wingman").zlib;
 const riff = @import("wingman").riff;
 const pcm = @import("wingman").pcm;
 const g711 = @import("wingman").g711;
@@ -20,6 +21,32 @@ const sfnt = @import("wingman").sfnt;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+
+test "zlib verifies a framed stream and rejects a damaged checksum" {
+    const allocator = std.testing.allocator;
+    const encoder = try zlib.EncoderWorkspace.create(allocator);
+    defer encoder.destroy(allocator);
+    const decoder = try zlib.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+    const source = "a zlib consumer; a zlib consumer";
+    const storage = try allocator.alloc(u8, try zlib.encodeBound(source.len, .{}));
+    defer allocator.free(storage);
+    const encoded = try zlib.encode(source, storage, encoder, .{});
+    var output: [source.len]u8 = undefined;
+    const result = try zlib.decode(
+        encoded,
+        &output,
+        .{ .workspace = decoder },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(encoded.len, result.consumed);
+    try std.testing.expectEqualStrings(source, &output);
+    encoded[encoded.len - 1] ^= 1;
+    try std.testing.expectError(
+        error.InvalidStream,
+        zlib.decode(encoded, &output, .{ .workspace = decoder }, .{}),
+    );
+}
 
 test "raw DEFLATE round trip uses caller workspaces and checks extent" {
     const allocator = std.testing.allocator;

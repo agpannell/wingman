@@ -8,7 +8,7 @@ const std = @import("std");
 /// refuses overlapping spans before mutation. Other errors may leave output changed. These failures
 /// do not grow storage or use a fallback allocator.
 pub const Error = error{
-    /// Malformed or truncated raw DEFLATE input.
+    /// Malformed input or a failed framing integrity check.
     InvalidStream,
     /// The selected window or storage configuration is invalid.
     InvalidOptions,
@@ -24,7 +24,7 @@ pub const Error = error{
 /// describe the current input stream and supplied output; they can outlive them. Any derived slice
 /// retains its source/output lifetime. On error no partial counts return.
 pub const DecodeResult = struct {
-    /// Input bytes occupied by the raw stream.
+    /// Encoded bytes occupied by the stream, including framing where applicable.
     consumed: usize,
 
     /// Output bytes written; bytes beyond this count remain unchanged.

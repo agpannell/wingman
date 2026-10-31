@@ -59,7 +59,7 @@ pub const EncodeProfile = enum {
 pub const EncodeLimits = struct {
     /// Accepted source bytes; dictionary bytes are excluded.
     input_bytes: u64 = std.math.maxInt(u64),
-    /// Returned raw DEFLATE bytes.
+    /// Returned encoded bytes, including framing where applicable.
     output_bytes: u64 = std.math.maxInt(u64),
     /// Match probes/comparisons, parser edges and book/header work units. This is an algorithmic
     /// bound, not an instruction or time count.
