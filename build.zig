@@ -96,6 +96,12 @@ pub fn build(b: *std.Build) void {
             .description = "Read owned BVH motion and evaluate local and global joint poses",
         },
         .{
+            .step = "dfont-example",
+            .source = "examples/dfont.zig",
+            .executable = "dfont-inspect",
+            .description = "Select borrowed SFNT resources from a Macintosh data-fork container",
+        },
+        .{
             .step = "sfnt-example",
             .source = "examples/sfnt.zig",
             .executable = "sfnt-inspect",

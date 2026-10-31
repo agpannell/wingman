@@ -1,9 +1,33 @@
-//! Checked big-endian font reads and array positions, without allocation or source mutation.
+//! Checked big-endian font reads, array positions and disjoint storage admission.
 
 const std = @import("std");
 
 /// Arithmetic overflow or an integer whose complete bytes are not present.
 pub const Error = error{InvalidFont};
+
+/// Checks two byte spans without reading them. Empty and adjacent spans are disjoint. Overlap or an
+/// unrepresentable exclusive address end returns StorageOverlap before mutation. Use this for
+/// immutable source, descriptors and caller working storage at allocation-free reader boundaries;
+/// the owning operation still selects every span whose lifetime it protects.
+pub fn admitDisjoint(first: []const u8, second: []const u8) error{StorageOverlap}!void {
+    if (first.len == 0 or second.len == 0) return;
+    const a = @intFromPtr(first.ptr);
+    const b = @intFromPtr(second.ptr);
+    const a_end = std.math.add(usize, a, first.len) catch return error.StorageOverlap;
+    const b_end = std.math.add(usize, b, second.len) catch return error.StorageOverlap;
+    if (a < b_end and b < a_end) return error.StorageOverlap;
+}
+
+test "checked byte storage admits empty adjacency and rejects overlap or wrapped addresses" {
+    var bytes: [24]u8 = undefined;
+    try admitDisjoint(bytes[0..8], bytes[8..16]);
+    try admitDisjoint(bytes[0..8], bytes[16..24]);
+    try admitDisjoint(bytes[0..0], &bytes);
+    try std.testing.expectError(error.StorageOverlap, admitDisjoint(bytes[0..8], bytes[7..16]));
+    try std.testing.expectError(error.StorageOverlap, admitDisjoint(&bytes, bytes[8..16]));
+    const wrapped = @as([*]const u8, @ptrFromInt(std.math.maxInt(usize) - 3))[0..8];
+    try std.testing.expectError(error.StorageOverlap, admitDisjoint(wrapped, bytes[0..1]));
+}
 
 /// Reads a whole-byte signed or unsigned integer in big-endian order. Rejects overflow and
 /// truncation before reading caller-owned bytes. The integer representation must be accepted by

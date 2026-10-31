@@ -70,13 +70,15 @@ orientation or color transforms; inspection alone does not validate a complete c
 
 ### Font containers
 
-Use `sfnt` to enumerate opaque font tables or select a TTC/OTC collection member before handing
+Use `dfont` to select an SFNT resource from a Macintosh data-fork container. Use `sfnt` to
+enumerate opaque font tables or select a TTC/OTC collection member before handing
 its bytes to a table-specific reader. Opening checks storage ranges; it does not establish that a
 font can render text. Checksums are explicit, and glyphs, layout and rendering stay with callers.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`sfnt`](docs/sfnt.md) | Borrowed table directories, collection faces, raw tag lookup and checksums | `sfnt-example` |
+| [`dfont`](docs/dfont.md) | Borrowed SFNT resources from Macintosh data-fork containers | `dfont-example` |
 
 ### Motion capture
 
@@ -152,7 +154,8 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
 - Raw audio decoders write caller-provided storage. WAVE decoding offers either caller samples
   or an allocated `wav.Audio` owner independent of encoded input. Release that owner exactly once
   with the original allocator, after all sample views retire.
-- SFNT directories, collection faces and raw tables borrow complete immutable font/container bytes.
+- DFONT containers and selected font resources borrow complete immutable resource-file bytes.
+  SFNT directories, collection faces and raw tables borrow complete immutable font/container bytes.
   Copied tags, checksums and flavor values are independent; no allocator or cleanup is retained.
 - Exif directories, field data and thumbnail rasters borrow TIFF input; ICC profiles and tag bodies
   borrow complete uncompressed profile bytes. Copied headers/scalars and returned RGB pixels are

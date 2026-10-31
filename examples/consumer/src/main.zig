@@ -12,10 +12,47 @@ const g711 = @import("wingman").g711;
 const adpcm = @import("wingman").adpcm;
 const exif = @import("wingman").exif;
 const icc = @import("wingman").icc;
+const dfont = @import("wingman").dfont;
 const sfnt = @import("wingman").sfnt;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+
+test "DFONT selected bytes remain resource-relative for the SFNT reader" {
+    var bytes: [102]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[0..4], 16, .big);
+    std.mem.writeInt(u32, bytes[4..8], 52, .big);
+    std.mem.writeInt(u32, bytes[8..12], 36, .big);
+    std.mem.writeInt(u32, bytes[12..16], 50, .big);
+    std.mem.writeInt(u32, bytes[16..20], 32, .big);
+    std.mem.writeInt(u32, bytes[20..24], 0x00010000, .big);
+    std.mem.writeInt(u16, bytes[24..26], 1, .big);
+    @memcpy(bytes[32..36], "DATA");
+    std.mem.writeInt(u32, bytes[36..40], 0x01020304, .big);
+    std.mem.writeInt(u32, bytes[40..44], 28, .big);
+    std.mem.writeInt(u32, bytes[44..48], 4, .big);
+    @memcpy(bytes[48..52], &[_]u8{ 1, 2, 3, 4 });
+    std.mem.writeInt(u16, bytes[76..78], 28, .big);
+    std.mem.writeInt(u16, bytes[78..80], 50, .big);
+    @memcpy(bytes[82..86], "sfnt");
+    std.mem.writeInt(u16, bytes[88..90], 10, .big);
+    std.mem.writeInt(u16, bytes[92..94], 0xffff, .big);
+    try std.testing.expect(dfont.hasHeader(&bytes));
+    const container = try dfont.Container.open(&bytes);
+    try std.testing.expectEqual(1, container.faceCount());
+    const font = try container.faceBytes(0);
+    try std.testing.expectEqual(@intFromPtr(&bytes) + 20, @intFromPtr(font.ptr));
+    const directory = try sfnt.Directory.open(font);
+    const table = (try directory.find("DATA".*)).?;
+    try std.testing.expectEqual(28, table.offset);
+    try std.testing.expectEqual(@intFromPtr(&bytes) + 48, @intFromPtr(table.data.ptr));
+    try std.testing.expect(table.checksumMatches());
+    try std.testing.expectError(error.InvalidFace, container.faceBytes(1));
+    bytes[94] = 1; // A compressed reference remains countable but cannot be selected.
+    const compressed = try dfont.Container.open(&bytes);
+    try std.testing.expectEqual(1, compressed.faceCount());
+    try std.testing.expectError(error.UnsupportedFormat, compressed.faceBytes(0));
+}
 
 test "SFNT shared table borrows and head checksum exceptions work outside the package" {
     var bytes: [60]u8 = @splat(0);

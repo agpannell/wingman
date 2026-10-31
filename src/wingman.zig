@@ -17,8 +17,9 @@
 //! thumbnail samples. icc inspects bounded uncompressed color-profile headers and opaque tag
 //! bodies. Orientation, complete profile validation and color transforms stay with callers.
 //!
-//! sfnt borrows SFNT table directories and TTC/OTC collection members. Table payloads remain
-//! opaque, with explicit checksums; glyph interpretation, shaping and rendering stay with callers.
+//! dfont selects borrowed SFNT resources from Macintosh data-fork resource containers. sfnt borrows
+//! SFNT table directories and TTC/OTC collection members. Table payloads remain opaque, with
+//! explicit checksums; glyph interpretation, shaping and rendering stay with callers.
 //!
 //! bvh owns self-contained skeletal motion; acclaim pairs reusable ASF skeletons with AMC clips and
 //! cached pose calibration. Both write local/global RigidTransform values into caller storage,
@@ -48,6 +49,7 @@ pub const adpcm = @import("adpcm.zig");
 pub const exif = @import("exif.zig");
 pub const icc = @import("icc.zig");
 
+pub const dfont = @import("dfont.zig");
 pub const sfnt = @import("sfnt.zig");
 
 pub const bvh = @import("bvh.zig");
@@ -73,6 +75,7 @@ test {
     _ = exif;
     _ = icc;
 
+    _ = dfont;
     _ = sfnt;
 
     _ = bvh;
