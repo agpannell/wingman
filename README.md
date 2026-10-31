@@ -1,7 +1,8 @@
 # Wingman
 
-Zig libraries for checksums, hashing, compression, binary containers, audio, image metadata, font
-containers, texture containers and motion capture.
+Wingman is a collection of composable Zig libraries for working with binary data and media, designed
+for performance, clear interfaces, and explicit control over memory and resources.
+
 Use each independently or compose their views and conversion APIs, with explicit storage, lifetimes
 and format contracts.
 
@@ -26,15 +27,16 @@ CRC-32C and the x86 instruction named CRC32.
 
 ### Compression
 
-Use `lz4` for compatible raw blocks or standard frames, `deflate` for raw RFC 1951 streams and
-`zlib` for RFC 1950 framing around DEFLATE. Raw encodings rely on their enclosing record for
-boundaries and integrity; zlib adds an Adler-32 checksum, and LZ4 frames can include checksums.
+Use `lz4` for compatible raw blocks or standard frames, `deflate` for raw RFC 1951 streams,
+`zlib` for RFC 1950 framing and `gzip` for RFC 1952 members. Raw encodings rely on their enclosing
+record for boundaries and integrity; zlib and gzip carry checksums, and LZ4 frames can include them.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`lz4`](docs/lz4.md) | Raw/frame encoding and decoding, dictionaries, resumable codecs and bounded HC search | `lz4-example` |
 | [`deflate`](docs/deflate.md) | Raw DEFLATE encoding and decoding, dictionaries and resumable streams | `deflate-example` |
 | [`zlib`](docs/zlib.md) | zlib stream framing, checksum verification, dictionaries and Reader decoding | `zlib-example` |
+| [`gzip`](docs/gzip.md) | gzip member encoding, verified decoding, metadata and concatenation | `gzip-example` |
 
 ### Audio files and containers
 

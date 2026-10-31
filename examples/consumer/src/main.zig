@@ -8,6 +8,7 @@ const blake3 = @import("wingman").blake3;
 const lz4 = @import("wingman").lz4;
 const deflate = @import("wingman").deflate;
 const zlib = @import("wingman").zlib;
+const gzip = @import("wingman").gzip;
 const riff = @import("wingman").riff;
 const pcm = @import("wingman").pcm;
 const g711 = @import("wingman").g711;
@@ -21,6 +22,33 @@ const sfnt = @import("wingman").sfnt;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+
+test "gzip verifies a member and rejects a damaged trailer" {
+    const allocator = std.testing.allocator;
+    const encoder = try gzip.EncoderWorkspace.create(allocator);
+    defer encoder.destroy(allocator);
+    const decoder = try gzip.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+    const source = "a gzip consumer; a gzip consumer";
+    const storage = try allocator.alloc(u8, try gzip.encodeBound(source.len, .{}));
+    defer allocator.free(storage);
+    const encoded = try gzip.encode(source, storage, encoder, .{});
+    var output: [source.len]u8 = undefined;
+    const result = try gzip.decode(
+        encoded,
+        &output,
+        .{ .workspace = decoder },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(encoded.len, result.consumed);
+    try std.testing.expectEqual(@as(usize, 1), result.members);
+    try std.testing.expectEqualStrings(source, &output);
+    encoded[encoded.len - 8] ^= 1;
+    try std.testing.expectError(
+        error.InvalidStream,
+        gzip.decode(encoded, &output, .{ .workspace = decoder }, .{}),
+    );
+}
 
 test "zlib verifies a framed stream and rejects a damaged checksum" {
     const allocator = std.testing.allocator;

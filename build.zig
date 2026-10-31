@@ -66,6 +66,12 @@ pub fn build(b: *std.Build) void {
             .description = "Encode and verify a zlib stream",
         },
         .{
+            .step = "gzip-example",
+            .source = "examples/gzip.zig",
+            .executable = "gzip-roundtrip",
+            .description = "Encode and verify a gzip member",
+        },
+        .{
             .step = "wav-example",
             .source = "examples/wav.zig",
             .executable = "wave-audio",
