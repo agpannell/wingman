@@ -54,6 +54,12 @@ pub fn build(b: *std.Build) void {
             .description = "Encode and recover raw LZ4 blocks and checksummed frames",
         },
         .{
+            .step = "deflate-example",
+            .source = "examples/deflate.zig",
+            .executable = "deflate-roundtrip",
+            .description = "Encode and recover a raw DEFLATE stream",
+        },
+        .{
             .step = "wav-example",
             .source = "examples/wav.zig",
             .executable = "wave-audio",

@@ -6,6 +6,7 @@ const xxhash32 = @import("wingman").xxhash32;
 const xxhash64 = @import("wingman").xxhash64;
 const blake3 = @import("wingman").blake3;
 const lz4 = @import("wingman").lz4;
+const deflate = @import("wingman").deflate;
 const riff = @import("wingman").riff;
 const pcm = @import("wingman").pcm;
 const g711 = @import("wingman").g711;
@@ -19,6 +20,28 @@ const sfnt = @import("wingman").sfnt;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+
+test "raw DEFLATE round trip uses caller workspaces and checks extent" {
+    const allocator = std.testing.allocator;
+    const encoder = try deflate.EncoderWorkspace.create(allocator);
+    defer encoder.destroy(allocator);
+    const decoder = try deflate.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+    const source = "independent consumer; independent consumer";
+    const storage = try allocator.alloc(u8, try deflate.encodeBound(source.len));
+    defer allocator.free(storage);
+    const encoded = try deflate.encode(source, storage, encoder, .{});
+    var output: [source.len]u8 = undefined;
+    const result = try deflate.decode(
+        encoded,
+        &output,
+        .{ .workspace = decoder },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(source.len, result.produced);
+    try std.testing.expectEqual(encoded.len, result.consumed);
+    try std.testing.expectEqualStrings(source, &output);
+}
 
 test "ETC and EAC blocks preserve constants and report refused work" {
     const pixels: [16][4]u8 = @splat(.{ 0, 0, 0, 17 });

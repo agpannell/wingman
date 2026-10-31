@@ -26,12 +26,14 @@ CRC-32C and the x86 instruction named CRC32.
 
 ### Compression
 
-Use `lz4` for compatible raw blocks or standard frames. A raw block relies on its enclosing record
-for boundaries, decoded size and integrity; a frame records block geometry and optional checksums.
+Use `lz4` for compatible raw blocks or standard frames, and `deflate` for raw RFC 1951 streams.
+Raw encodings rely on their enclosing record for boundaries and integrity; an LZ4 frame records
+block geometry and optional checksums.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`lz4`](docs/lz4.md) | Raw/frame encoding and decoding, dictionaries, resumable codecs and bounded HC search | `lz4-example` |
+| [`deflate`](docs/deflate.md) | Raw DEFLATE encoding and decoding, dictionaries and resumable streams | `deflate-example` |
 
 ### Audio files and containers
 
@@ -117,8 +119,8 @@ zig build examples
 
 The Adler-32 example checks streaming and checksum combination, then shows the zlib footer bytes
 `11 e6 03 98` for `Wikipedia`. `zig build examples` runs every example in the tables above.
-Run one with `zig build <example-step>`; the checksum, hash, LZ4 and RIFF examples also accept text
-after `--`.
+Run one with `zig build <example-step>`; the checksum, hash, LZ4, DEFLATE and RIFF examples also
+accept text after `--`.
 
 The examples exercise complete public API calls: format-specific checksum bytes, seeded hashes,
 compressed blocks and frames, nested chunks, sample quantization, complete WAVE audio, image

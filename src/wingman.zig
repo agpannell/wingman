@@ -7,7 +7,8 @@
 //! authentication and context-separated key derivation with seekable output.
 //!
 //! lz4 provides raw blocks and standard frames, with dictionaries, bounded HC encoding and
-//! resumable codecs using caller-owned storage.
+//! resumable codecs using caller-owned storage. deflate encodes and decodes raw RFC 1951 streams
+//! with explicit workspaces and optional dictionaries.
 //!
 //! wav connects WAVE/RF64 containers to sample decoding and PCM16 RIFF writing. riff provides
 //! generic chunk framing. pcm, g711 and adpcm convert raw sample representations or complete codec
@@ -41,6 +42,7 @@ pub const xxhash64 = @import("xxhash64.zig");
 pub const blake3 = @import("blake3.zig");
 
 pub const lz4 = @import("lz4.zig");
+pub const deflate = @import("deflate.zig");
 
 pub const wav = @import("wav.zig");
 pub const riff = @import("riff.zig");
@@ -70,6 +72,7 @@ test {
     _ = blake3;
 
     _ = lz4;
+    _ = deflate;
 
     _ = wav;
     _ = riff;
