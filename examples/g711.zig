@@ -1,4 +1,4 @@
-//! Expand G.711 amplitudes and use the PCM writer to produce little-endian PCM16.
+//! Convert G.711 amplitudes and use the PCM writer to produce little-endian PCM16.
 const std = @import("std");
 const g711 = @import("wingman").g711;
 const pcm = @import("wingman").pcm;
@@ -30,5 +30,13 @@ pub fn main(init: std.process.Init) !void {
         for (bytes) |byte| try output.interface.print(" {x:0>2}", .{byte});
         try output.interface.writeByte('\n');
     }
+    const amplitudes = [_]i16{ -32768, -1, 0, 32767 };
+    var encoded: [amplitudes.len]u8 = undefined;
+    var converted: [amplitudes.len]u8 = undefined;
+    const mulaw = try g711.encodeInto(&amplitudes, &encoded, .mulaw);
+    const alaw = try g711.transcodeInto(mulaw, &converted, .mulaw_to_alaw);
+    try output.interface.writeAll("PCM16 -> mu-law -> direct A-law:");
+    for (mulaw, alaw) |mu, a| try output.interface.print(" {x:0>2}/{x:0>2}", .{ mu, a });
+    try output.interface.writeByte('\n');
     try output.interface.flush();
 }

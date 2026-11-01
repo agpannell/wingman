@@ -60,7 +60,7 @@ loader composes them with file metadata; they can also serve other containers or
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`pcm`](docs/pcm.md) | Integer and float PCM conversion with explicit precision and byte order | `pcm-example` |
-| [`g711`](docs/g711.md) | A-law and mu-law decoding to exact PCM16 or normalized floats | `g711-example` |
+| [`g711`](docs/g711.md) | PCM16 encoding/decoding, normalized floats and direct A-law/mu-law conversion | `g711-example` |
 | [`adpcm`](docs/adpcm.md) | Microsoft and IMA/DVI WAVE block decoding, including validated frame prefixes | `adpcm-example` |
 
 The raw codecs convert samples or complete blocks without parsing a file. Callers own playback,

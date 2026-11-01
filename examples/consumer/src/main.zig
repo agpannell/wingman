@@ -595,6 +595,26 @@ test "G.711 refusal ordering preserves caller storage" {
     try std.testing.expectEqualSlices(f32, &before, &shared);
 }
 
+test "G.711 PCM16 encoding and direct law conversion" {
+    const source = [_]i16{ -32768, -1, 0, 32767 };
+    var bytes: [6]u8 = @splat(0xa7);
+    const encoded = try g711.encodeInto(&source, &bytes, .mulaw);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x7f, 0xff, 0x80 }, encoded);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa7, 0xa7 }, bytes[4..]);
+    var samples: [4]i16 = undefined;
+    _ = try g711.decodePcm16Into(encoded, &samples, .mulaw);
+    try std.testing.expectEqualSlices(i16, &.{ -32124, 0, 0, 32124 }, &samples);
+    var converted: [2]u8 = undefined;
+    _ = try g711.transcodeInto(&.{ 0xaf, 0x2f }, &converted, .mulaw_to_alaw);
+    try std.testing.expectEqualSlices(u8, &.{ 0x85, 0x05 }, &converted);
+    var overlapping = [_]u8{ 0xaf, 0x2f, 0x42 };
+    try std.testing.expectError(
+        error.Aliasing,
+        g711.transcodeInto(overlapping[0..2], overlapping[1..3], .mulaw_to_alaw),
+    );
+    try std.testing.expectEqualSlices(u8, &.{ 0xaf, 0x2f, 0x42 }, &overlapping);
+}
+
 test "ADPCM Microsoft literal samples from caller-owned coefficients" {
     const coefficients = [_]u8{ 0, 1, 0, 0 };
     const source = [_]u8{ 0, 16, 0, 100, 0, 0x9c, 0xff, 0x12 };
