@@ -10,6 +10,7 @@ const std = @import("std");
 const memory = @import("common/byte_ranges.zig");
 const binary_float = @import("common/float.zig");
 const rounding = @import("pcm/round.zig");
+const sample_rounding = @import("common/round.zig");
 const testing = std.testing;
 
 /// Encoded sample containers. Unsigned integers use a midpoint bias; signed integers use two's
@@ -84,6 +85,7 @@ test {
     _ = int32;
     _ = float64;
     _ = rounding;
+    _ = sample_rounding;
 }
 
 /// Counts whole encoded samples after validating the representation. Does not inspect float values.
@@ -767,7 +769,7 @@ fn encodeIntegerSamples(
     const scale: f64 = @floatFromInt(midpoint);
     const mask = (@as(u64, 1) << @intCast(bits)) - 1;
     for (source, 0..) |sample, index| {
-        const rounded = rounding.halfAwayScaled(sample, scale);
+        const rounded = sample_rounding.halfAwayScaled(sample, scale);
         const clamped = std.math.clamp(rounded, -midpoint, midpoint - 1);
         const number: i64 = switch (encoding) {
             .unsigned8, .unsigned16, .unsigned24, .unsigned32 => clamped + midpoint,
@@ -898,7 +900,7 @@ fn encodePcm16Samples(source: []const f32, output: []u8) void {
         std.mem.writeInt(
             i16,
             output[i * 2 ..][0..2],
-            @intCast(@min(32767, rounding.halfAwayScaled(sample, 32768))),
+            @intCast(@min(32767, sample_rounding.halfAwayScaled(sample, 32768))),
             .little,
         );
     }

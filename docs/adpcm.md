@@ -1,18 +1,18 @@
-# Microsoft and IMA/DVI ADPCM block decoding
+# Microsoft and IMA/DVI ADPCM blocks
 
 ADPCM stores small corrections to predicted audio amplitudes and changes their scale as decoding
 proceeds. This uses fewer payload bits than PCM16 while losing some amplitude precision. Decoding
 recovers the represented samples; it cannot recover information discarded by the encoder.
 
-`wingman.adpcm` decodes the **four-bit Microsoft and IMA/DVI WAVE block layouts** into caller-owned
-normalized floats. Supply the layout and complete encoded blocks from a container parser or
-protocol. This library handles sample reconstruction independently of WAVE parsing, sampling rate,
-playback and allocation policy. A **frame** contains one sample per channel at the same instant.
-Mono and stereo are supported; stereo output alternates left/right samples in frame order.
+`wingman.adpcm` encodes and decodes the **four-bit Microsoft and IMA/DVI WAVE block layouts** using
+caller-owned storage. Supply the layout and block framing from a container parser or protocol. This
+library operates independently of WAVE parsing, sampling rate, playback and allocation policy. A
+**frame** contains one sample per channel at the same instant. Mono and stereo are supported;
+samples are interleaved in frame order.
 
 Use [Zig 0.17.0 and the package setup](../README.md#use-it-in-a-project). From a checkout, run
-`zig build adpcm-example` to decode both layouts, inspect their PCM16 values and validate prefix
-output. [The complete example](../examples/adpcm.zig) also composes with the PCM library.
+`zig build adpcm-example` to decode both layouts, validate prefix output and encode a partial block.
+[The complete example](../examples/adpcm.zig) also composes with the PCM library.
 
 ## Describe the blocks
 
@@ -29,7 +29,7 @@ output. [The complete example](../examples/adpcm.zig) also composes with the PCM
 For IMA, let `C` be the channel count and `P = block_bytes - 4*C`. `P` must be a multiple of `4*C`,
 and `frames_per_block` must equal `1 + 2*P/C`. For Microsoft, use `P = block_bytes - 7*C` and
 `frames_per_block = 2 + 2*P/C`. Seed-only blocks are valid in both layouts. Every operation checks
-these relations and uses checked count arithmetic. The source must contain whole blocks.
+these relations and uses checked count arithmetic. Encoded input must contain whole blocks.
 
 Microsoft requires a nonempty coefficient slice whose length is a multiple of four. Each block's
 predictor index selects one available pair. The raw API accepts custom pairs; it does not enforce
@@ -127,7 +127,65 @@ test "omitted IMA blocks still validate" {
 }
 ```
 
-## Ownership and failure
+## Encode blocks
+
+Choose a strategy explicitly for each call. `.fast` starts IMA at index zero and Microsoft at
+predictor zero with the initial sample difference clamped to 16–32767. `.preview` tests initial
+states against up to 16 supplied coded samples and uses its candidate only when the squared PCM16
+error over the supplied frames is lower than `.fast` for that channel and block. It can require
+substantially more work; it does not promise better perceptual quality or lower error on an
+arbitrary shorter prefix. Equal-error nibble choices use the lowest code, and a strategy tie uses
+the fast state. Each block and channel has independent state.
+
+| API | Result |
+| --- | --- |
+| `encodeRequirements(sample_count, format, tail)` | Exact byte capacity and actual and encoded frame counts, without reading samples |
+| `encodeI16Into(source, destination, format, options)` | Encoded blocks from interleaved exact PCM16 samples |
+| `encodeInto(source, destination, format, options)` | Encoded blocks from interleaved normalized `f32` samples |
+| `EncodeResult` | Used byte prefix, actual `frame_count` and padded `encoded_frame_count` |
+
+Float input must be finite and in `[-1, 1]`. Conversion scales by 32768, rounds halfway away from
+zero and clamps `+1` to 32767. Sample count must be a whole number of frames. The default `.pad`
+tail fills a partial final block with zero PCM samples; `.strict` rejects a partial block. Empty
+input produces no blocks. Padded decoded values need not be silent because ADPCM is lossy. Keep
+the actual frame count separately so a container or caller can discard the padded suffix. Preview
+scores only frames supplied by the caller, so a partial preview block can differ from encoding an
+explicitly zero-extended full block; `.fast` produces the same bytes for those two inputs.
+
+```zig
+const std = @import("std");
+const adpcm = @import("wingman").adpcm;
+
+test "encode and trim a partial IMA block" {
+    const format: adpcm.Format = .{
+        .encoding = .ima_wave,
+        .channels = 1,
+        .block_bytes = 8,
+        .frames_per_block = 9,
+    };
+    const input = [_]i16{ 1000, 1100, 1200 };
+    const required = try adpcm.encodeRequirements(input.len, format, .pad);
+    var bytes: [8]u8 = undefined;
+    const encoded = try adpcm.encodeI16Into(&input, &bytes, format, .{ .strategy = .preview });
+    try std.testing.expectEqual(required.byte_count, encoded.bytes.len);
+    try std.testing.expectEqual(3, encoded.frame_count);
+    try std.testing.expectEqual(9, encoded.encoded_frame_count);
+    var decoded: [3]f32 = undefined;
+    const samples = try adpcm.decodePrefixInto(encoded.bytes, &decoded, encoded.frame_count, format);
+    try std.testing.expectEqual(3, samples.len);
+}
+```
+
+Encoding checks geometry and counts first, then all float values, destination capacity and overlap.
+Admission failures leave the destination unchanged. The source and the complete coefficient slice
+must be disjoint from the used output bytes; unused output capacity may overlap either input.
+The result borrows the destination and no input or state is retained. Microsoft encoding selects
+among at most 256 supplied coefficient pairs, as the block stores its predictor index in one byte.
+The WAVE library reads ADPCM and its `fact` frame count, but its writer currently writes PCM16;
+encoding raw blocks here does not create an ADPCM WAVE file. Some external readers ignore a
+container's frame count and expose the padded frames.
+
+## Decoding ownership and failure
 
 Operations allocate nothing and retain no input, coefficient table, output or scheduler. Keep
 source and coefficients immutable through the call. The result borrows caller-owned destination
@@ -166,6 +224,6 @@ and [IMA arithmetic](https://www.cs.columbia.edu/~hgs/audio/dvi/IMA_ADPCM.pdf) d
 Inline tests cover literal mono/stereo results, signed prediction, unsigned delta, source residues,
 all tested prefix boundaries, omitted failures, storage admission and empty-input count limits.
 
-Three-bit DVI, other ADPCM block layouts, more than two channels, encoding, containers, resampling,
+Three-bit DVI, other ADPCM block layouts, more than two channels, containers, resampling,
 playback and packet handling are outside this library's current surface. No throughput claim is
 made by the examples or contract tests.

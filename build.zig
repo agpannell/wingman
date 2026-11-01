@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
             .step = "adpcm-example",
             .source = "examples/adpcm.zig",
             .executable = "adpcm-decode",
-            .description = "Decode Microsoft and IMA blocks and validate prefix output",
+            .description = "Encode and decode Microsoft and IMA blocks and validate prefixes",
         },
         .{
             .step = "acclaim-example",

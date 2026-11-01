@@ -640,6 +640,34 @@ test "ADPCM Microsoft literal samples from caller-owned coefficients" {
     }, try pcm.encodeInto(decoded, &bytes, .{ .encoding = .signed16 }));
 }
 
+test "ADPCM encoder reports padded capacity and trims supplied frames" {
+    const format: adpcm.Format = .{
+        .encoding = .ima_wave,
+        .channels = 1,
+        .block_bytes = 8,
+        .frames_per_block = 9,
+    };
+    const input = [_]i16{ 1000, 1100, 1200 };
+    const requirements = try adpcm.encodeRequirements(input.len, format, .pad);
+    try std.testing.expectEqual(8, requirements.byte_count);
+    try std.testing.expectEqual(3, requirements.frame_count);
+    try std.testing.expectEqual(9, requirements.encoded_frame_count);
+    try std.testing.expectError(
+        error.InvalidData,
+        adpcm.encodeRequirements(input.len, format, .strict),
+    );
+    var bytes: [8]u8 = undefined;
+    const encoded = try adpcm.encodeI16Into(&input, &bytes, format, .{ .strategy = .preview });
+    const counted: adpcm.CountError!usize = adpcm.frameCount(encoded.bytes.len, format);
+    const frames = counted catch |err| switch (err) {
+        error.InvalidFormat, error.InvalidData, error.SizeOverflow => return err,
+    };
+    try std.testing.expectEqual(9, frames);
+    var samples: [3]f32 = undefined;
+    const prefix = try adpcm.decodePrefixInto(encoded.bytes, &samples, encoded.frame_count, format);
+    try std.testing.expectEqual(input.len, prefix.len);
+}
+
 test "ADPCM prefix still rejects omitted invalid IMA blocks" {
     const format: adpcm.Format = .{
         .encoding = .ima_wave,

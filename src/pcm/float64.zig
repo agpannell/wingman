@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pcm = @import("../pcm.zig");
 const rounding = @import("round.zig");
+const sample_rounding = @import("../common/round.zig");
 const float = @import("../common/float.zig");
 const memory = @import("../common/byte_ranges.zig");
 const testing = std.testing;
@@ -380,7 +381,7 @@ fn encodeSamples(source: []const f64, output: []u8, format: Format) void {
             else => {
                 const midpoint: i64 = @as(i64, 1) << @intCast(bits - 1);
                 const scale: f64 = @floatFromInt(midpoint);
-                const rounded = rounding.halfAwayScaled(sample, scale);
+                const rounded = sample_rounding.halfAwayScaled(sample, scale);
                 const clamped = std.math.clamp(rounded, -midpoint, midpoint - 1);
                 const number = switch (format.encoding) {
                     .unsigned8, .unsigned16, .unsigned24, .unsigned32 => clamped + midpoint,
@@ -448,7 +449,7 @@ fn encodeSigned32(source: []const f64, output: []u8, comptime endian: std.lang.E
         }
     }
     for (source[index..], index..) |sample, position| {
-        const rounded = rounding.halfAwayScaled(sample, 2_147_483_648.0);
+        const rounded = sample_rounding.halfAwayScaled(sample, 2_147_483_648.0);
         const clamped: i32 = @intCast(std.math.clamp(rounded, -2_147_483_648, 2_147_483_647));
         std.mem.writeInt(i32, output[position * 4 ..][0..4], clamped, endian);
     }
