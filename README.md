@@ -3,6 +3,10 @@
 Wingman is a collection of composable Zig libraries for working with binary data and media, designed
 for performance, clear interfaces, and explicit control over memory and resources.
 
+Development status: Wingman is under active development. Performance optimization is ongoing, and
+current results do not yet reflect the project’s performance goals. The public API is not yet stable
+and may change incompatibly between revisions.
+
 Use each independently or compose their views and conversion APIs, with explicit storage, lifetimes
 and format contracts.
 
