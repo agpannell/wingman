@@ -102,6 +102,10 @@ chunks. Each data chunk must independently contain whole frames or ADPCM blocks.
 chunks and trailing bytes are refused. A global ADPCM `fact` count selects an initial frame prefix
 across chunks; every omitted block and adaptive update still validates, including zero output.
 
+Caller-buffer decoding can reuse a single G.711 data chunk in ordinary RIFF after inspecting the
+complete file. Files with multiple data chunks, RF64 and other encodings use the general path;
+both paths retain the same validation and storage rules.
+
 ## Inspect chunks and RF64 sizes
 
 `parse` admits the outer WAVE/RF64 header and required RF64 `ds64` directory. Later chunk extents

@@ -113,7 +113,7 @@ pub fn decodeRequirements(
 ) DecodeError!DecodeRequirements {
     const view = try parse(source);
     var chunks = try view.iterator(directory_index);
-    return inspectDataChunks(&chunks);
+    return inspectDataChunks(&chunks, null);
 }
 
 /// Decodes a complete file into independent samples. All temporary scratch and partial ownership
@@ -147,11 +147,22 @@ pub fn decodeInto(
     const view = try parse(source);
     try admitStorage(view, destination, directory_index, &.{});
     var chunks = try view.iterator(directory_index);
-    const requirements = try inspectDataChunks(&chunks);
+    var single_data: SingleData = .{};
+    const requirements = try inspectDataChunks(
+        &chunks,
+        if (view.rf64_sizes == null) &single_data else null,
+    );
     if (destination.len < requirements.samples) return error.DestinationTooSmall;
     const output = destination[0..requirements.samples];
-    container.restart(&chunks);
-    try decodeDataChunks(false, undefined, &chunks, requirements.format, output, &.{}, .{});
+    if (single_data.admitted) {
+        const data = single_data.bytes.?;
+        if (data.len != 0) {
+            try @call(.never_inline, parallel.convert, .{ requirements.format, data, output });
+        }
+    } else {
+        container.restart(&chunks);
+        try decodeDataChunks(false, undefined, &chunks, requirements.format, output, &.{}, .{});
+    }
     return audioView(requirements.format, output);
 }
 
@@ -213,7 +224,7 @@ pub fn decodeParallelInto(
     const view = try parse(source);
     try admitStorage(view, destination, directory_index, workers);
     var chunks = try view.iterator(directory_index);
-    const requirements = try inspectDataChunks(&chunks);
+    const requirements = try inspectDataChunks(&chunks, null);
     if (destination.len < requirements.samples) return error.DestinationTooSmall;
     const output = destination[0..requirements.samples];
     container.restart(&chunks);
@@ -269,7 +280,7 @@ fn decodeOwned(
         const index = try allocator.alloc(ChunkIndexEntry, view.scratchCount());
         defer allocator.free(index);
         var chunks = try view.iterator(index);
-        break :blk try inspectDataChunks(&chunks);
+        break :blk try inspectDataChunks(&chunks, null);
     };
     const owner = try memory.allocateSamples(allocator, requirements.samples);
     errdefer allocator.free(owner.storage);
@@ -296,7 +307,17 @@ fn decodeOwned(
     };
 }
 
-fn inspectDataChunks(chunks: *ChunkIterator) DecodeError!DecodeRequirements {
+// Retains one caller-buffer RIFF data span until its format and geometry are admitted.
+const SingleData = struct {
+    bytes: ?[]const u8 = null,
+    multiple: bool = false,
+    admitted: bool = false,
+};
+
+fn inspectDataChunks(
+    chunks: *ChunkIterator,
+    single_data: ?*SingleData,
+) DecodeError!DecodeRequirements {
     const view = chunks.view;
     var format_bytes: ?[]const u8 = null;
     var fact_frames: ?u32 = null;
@@ -306,6 +327,13 @@ fn inspectDataChunks(chunks: *ChunkIterator) DecodeError!DecodeRequirements {
             if (format_bytes != null) return error.UnsupportedWave;
             format_bytes = chunk.data;
         } else if (std.mem.eql(u8, chunk.id, "data")) {
+            if (single_data) |single| {
+                if (saw_data) {
+                    single.multiple = true;
+                } else {
+                    single.bytes = chunk.data;
+                }
+            }
             saw_data = true;
         } else if (std.mem.eql(u8, chunk.id, "fact")) {
             if (fact_frames != null or chunk.data.len < 4) return error.InvalidWave;
@@ -314,8 +342,25 @@ fn inspectDataChunks(chunks: *ChunkIterator) DecodeError!DecodeRequirements {
     }
     const info = try parseFormat(format_bytes orelse return error.InvalidWave);
     if (!saw_data) return error.InvalidWave;
-    container.restart(chunks);
-    const complete = try countDataSamples(chunks, info);
+    const complete = complete: {
+        if (single_data) |single| {
+            if (!single.multiple and (info.encoding == .g711_alaw or info.encoding ==
+                .g711_mulaw))
+            {
+                const data = single.bytes.?;
+                const frames = try frameCount(info, data.len);
+                const samples = std.math.mul(
+                    usize,
+                    frames,
+                    @backingInt(info.channels),
+                ) catch return error.SizeOverflow;
+                single.admitted = true;
+                break :complete samples;
+            }
+        }
+        container.restart(chunks);
+        break :complete try countDataSamples(chunks, info);
+    };
     const count: usize = blk: {
         if (info.encoding != .ima_adpcm and info.encoding != .ms_adpcm) break :blk complete;
         const fact = fact_frames orelse break :blk complete;
@@ -754,6 +799,139 @@ test "decoder accepts G.711 mu-law and A-law WAV tags" {
         error.UnsupportedWave,
         decodeAlloc(std.testing.allocator, &invalid_bits),
     );
+}
+
+test "caller G.711 decode preserves admission and data ordering" {
+    const cases = .{ .{ fixtures.mulaw_mono, [_]f32{
+        0, 0, -0.9803466796875, 0.9803466796875,
+    } }, .{ fixtures.alaw_mono, [_]f32{
+        0.000244140625, -0.000244140625, -0.16796875, 0.16796875,
+    } } };
+    inline for (cases) |case| {
+        const source = case[0];
+        const expected = case[1];
+        var reordered: [48]u8 = undefined;
+        @memcpy(reordered[0..12], source[0..12]);
+        @memcpy(reordered[12..24], source[36..48]);
+        @memcpy(reordered[24..48], source[12..36]);
+        var empty_second: [56]u8 = undefined;
+        @memcpy(empty_second[0..48], source);
+        @memcpy(empty_second[48..56], "data\x00\x00\x00\x00");
+        std.mem.writeInt(u32, empty_second[4..8], 48, .little);
+        for ([_][]const u8{ source, &reordered, &empty_second }) |input| {
+            var output: [6]f32 = @splat(123);
+            try testing.expectError(
+                error.DestinationTooSmall,
+                decodeInto(input, output[1..4], &.{}),
+            );
+            try testing.expect(std.mem.allEqual(f32, &output, 123));
+            const audio = try decodeInto(input, output[1..5], &.{});
+            try testing.expectEqual(8000, audio.sample_rate);
+            try testing.expectEqual(Channels.mono, audio.channels);
+            try testing.expectEqualSlices(f32, &expected, audio.samples);
+            try testing.expectEqual(123, output[0]);
+            try testing.expectEqual(123, output[5]);
+        }
+        var empty: [44]u8 = undefined;
+        @memcpy(&empty, source[0..44]);
+        std.mem.writeInt(u32, empty[4..8], 36, .little);
+        std.mem.writeInt(u32, empty[40..44], 0, .little);
+        var output: [1]f32 = .{123};
+        const audio = try decodeInto(&empty, &output, &.{});
+        try testing.expectEqual(0, audio.samples.len);
+        try testing.expectEqual(123, output[0]);
+    }
+}
+
+test "caller G.711 decode validates stereo geometry and extensible subformats" {
+    var stereo = fixtures.mulaw_mono.*;
+    std.mem.writeInt(u16, stereo[22..24], 2, .little);
+    std.mem.writeInt(u32, stereo[28..32], 16000, .little);
+    std.mem.writeInt(u16, stereo[32..34], 2, .little);
+    var output: [6]f32 = @splat(123);
+    const audio = try decodeInto(&stereo, output[1..5], &.{});
+    try testing.expectEqual(Channels.stereo, audio.channels);
+    try testing.expectEqualSlices(f32, &.{
+        0, 0, -0.9803466796875, 0.9803466796875,
+    }, audio.samples);
+    try testing.expectEqual(123, output[0]);
+    try testing.expectEqual(123, output[5]);
+    std.mem.writeInt(u32, stereo[40..44], 3, .little);
+    @memset(&output, 123);
+    try testing.expectError(error.InvalidWave, decodeInto(&stereo, output[0..0], &.{}));
+    try testing.expect(std.mem.allEqual(f32, &output, 123));
+    const inputs = [_][]const u8{ fixtures.extensible_mulaw_mono, fixtures.extensible_alaw_mono };
+    const expected = [_][4]f32{ .{
+        0, 0, -0.9803466796875, 0.9803466796875,
+    }, .{
+        0.000244140625, -0.000244140625, -0.16796875, 0.16796875,
+    } };
+    for (inputs, expected) |input, samples| {
+        @memset(&output, 123);
+        const decoded = try decodeInto(input, output[1..5], &.{});
+        try testing.expectEqualSlices(f32, &samples, decoded.samples);
+        try testing.expectEqual(123, output[0]);
+        try testing.expectEqual(123, output[5]);
+    }
+}
+
+test "caller extensible G.711 retains multichannel layout and frame alignment" {
+    const inputs = [_][]const u8{ fixtures.extensible_mulaw_mono, fixtures.extensible_alaw_mono };
+    const expected = [_][3]f32{ .{
+        0, 0, -0.9803466796875,
+    }, .{
+        0.000244140625, -0.000244140625, -0.16796875,
+    } };
+    for (inputs, expected) |input, samples| {
+        var source: [72]u8 = undefined;
+        @memcpy(&source, input);
+        std.mem.writeInt(u16, source[22..24], 3, .little);
+        std.mem.writeInt(u32, source[28..32], 24000, .little);
+        std.mem.writeInt(u16, source[32..34], 3, .little);
+        std.mem.writeInt(u32, source[40..44], 7, .little);
+        std.mem.writeInt(u32, source[64..68], 3, .little);
+        var reordered: [72]u8 = undefined;
+        @memcpy(reordered[0..12], source[0..12]);
+        @memcpy(reordered[12..24], source[60..72]);
+        @memcpy(reordered[24..72], source[12..60]);
+        for ([_][]const u8{ &source, &reordered }) |wave| {
+            var output: [5]f32 = @splat(123);
+            const decoded = try decodeInto(wave, output[1..4], &.{});
+            try testing.expectEqual(3, @backingInt(decoded.channels));
+            try testing.expectEqual(@as(?u32, 7), decoded.channel_mask);
+            try testing.expectEqualSlices(f32, &samples, decoded.samples);
+            try testing.expectEqual(123, output[0]);
+            try testing.expectEqual(123, output[4]);
+        }
+        std.mem.writeInt(u16, source[22..24], 4, .little);
+        std.mem.writeInt(u32, source[28..32], 32000, .little);
+        std.mem.writeInt(u16, source[32..34], 4, .little);
+        std.mem.writeInt(u32, source[40..44], 15, .little);
+        var output: [5]f32 = @splat(123);
+        try testing.expectError(error.InvalidWave, decodeInto(&source, output[0..0], &.{}));
+        try testing.expect(std.mem.allEqual(f32, &output, 123));
+    }
+}
+
+test "caller G.711 decode scans malformed tails before capacity or output" {
+    const source = fixtures.mulaw_mono;
+    var duplicate: [72]u8 = undefined;
+    @memcpy(duplicate[0..48], source);
+    @memcpy(duplicate[48..72], source[12..36]);
+    std.mem.writeInt(u32, duplicate[4..8], 64, .little);
+    var truncated: [55]u8 = undefined;
+    @memcpy(truncated[0..48], source);
+    @memcpy(truncated[48..55], "JUNK\x04\x00\x00");
+    std.mem.writeInt(u32, truncated[4..8], 47, .little);
+    var output: [4]f32 = @splat(123);
+    try testing.expectError(error.UnsupportedWave, decodeInto(&duplicate, output[0..0], &.{}));
+    try testing.expect(std.mem.allEqual(f32, &output, 123));
+    try testing.expectError(error.InvalidWave, decodeInto(&truncated, output[0..0], &.{}));
+    try testing.expect(std.mem.allEqual(f32, &output, 123));
+    var aliased: [48]u8 align(8) = source.*;
+    const alias = std.mem.bytesAsSlice(f32, aliased[44..48]);
+    try testing.expectError(error.Aliasing, decodeInto(&aliased, alias, &.{}));
+    try testing.expectEqualSlices(u8, source, &aliased);
 }
 
 test "decoder accepts extensible G.711 subformat GUIDs" {
