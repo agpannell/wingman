@@ -45,7 +45,8 @@ pub fn encode(
     const layout = try preflight(image, options);
     const output = try allocator.alloc(u8, layout.size);
     errdefer allocator.free(output);
-    return try encodeInto(image, output, options);
+    try writeValidated(image, output, layout);
+    return output;
 }
 
 /// Writes and returns the used destination prefix. All validation, capacity and overlap checks
@@ -59,8 +60,15 @@ pub fn encodeInto(
     const layout = try preflight(image, options);
     if (layout.size > output.len) return error.DestinationTooSmall;
     const result = output[0..layout.size];
+    try writeValidated(image, result, layout);
+    return result;
+}
+
+fn writeValidated(image: *const EncodeTexture, result: []u8, layout: Layout) EncodeError!void {
     try rejectOverlap(image, result);
-    @memset(result, 0);
+    // The header contains optional fields. Level records and payloads are written in full below, so
+    // only the header and the actual padding need clearing.
+    @memset(result[0..80], 0);
     @memcpy(result[0..12], &validate.identifier);
     const header = image.header;
     const fields = [_]u32{
@@ -88,12 +96,16 @@ pub fn encodeInto(
             put(u32, result, position, @intCast(size));
             position += 4;
             append(result, &position, entry.key);
-            position += 1; // NUL and all padding were cleared with the destination.
+            result[position] = 0;
+            position += 1;
             append(result, &position, entry.value);
-            position += (4 - size % 4) % 4;
+            const padding = (4 - size % 4) % 4;
+            if (padding != 0) @memset(result[position..][0..padding], 0);
+            position += padding;
         }
     }
     if (image.global_data.len != 0) {
+        if (position != layout.global_offset) @memset(result[position..layout.global_offset], 0);
         position = layout.global_offset;
         put(u64, result, 64, position);
         put(u64, result, 72, image.global_data.len);
@@ -103,7 +115,9 @@ pub fn encodeInto(
     while (index != 0) {
         index -= 1;
         const item = image.levels[index];
-        position = validate.alignForward(position, layout.alignment) catch unreachable;
+        const aligned = validate.alignForward(position, layout.alignment) catch unreachable;
+        if (position != aligned) @memset(result[position..aligned], 0);
+        position = aligned;
         const record = result[80 + index * 24 ..][0..24];
         put(u64, record, 0, position);
         put(u64, record, 8, item.data.len);
@@ -111,7 +125,6 @@ pub fn encodeInto(
         append(result, &position, item.data);
     }
     std.debug.assert(position == result.len);
-    return result;
 }
 
 test encodeInto {
@@ -126,6 +139,165 @@ test encodeInto {
     const file = try encodeInto(&image, &output, .{});
     try testing.expectEqualSlices(u8, &fixture.r8_mips, file);
     try testing.expectEqual(@as(u8, 0xa5), output[file.len]);
+}
+
+test "KTX2 allocating writer rejects and releases overlapping output" {
+    const OverlappingAllocator = struct {
+        buffer: []u8,
+        allocated: bool = false,
+        freed: bool = false,
+        allocated_len: usize = 0,
+
+        fn alloc(context: *anyopaque, length: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.allocated or length > self.buffer.len) return null;
+            self.allocated = true;
+            self.allocated_len = length;
+            return self.buffer.ptr;
+        }
+
+        fn free(context: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.freed = true;
+        }
+    };
+    const source = try Source.open(&fixture.r8_mips, .{});
+    var buffer: [256]u8 = @splat(0xa5);
+    @memcpy(buffer[0..2], source.level(0).?.data);
+    const before = buffer;
+    const levels = [_]types.Level{
+        .{ .data = buffer[0..2], .uncompressed_size = 2 },
+        source.level(1).?,
+    };
+    const image: EncodeTexture = .{
+        .header = source.header,
+        .descriptor = source.descriptor.data,
+        .levels = &levels,
+    };
+    var backing: OverlappingAllocator = .{ .buffer = &buffer };
+    const allocator: std.mem.Allocator = .{
+        .ptr = &backing,
+        .vtable = &.{
+            .alloc = OverlappingAllocator.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = OverlappingAllocator.free,
+        },
+    };
+    try testing.expectError(error.OverlappingStorage, encode(allocator, &image, .{}));
+    try testing.expect(backing.allocated and backing.freed);
+    // Allocator.free may poison the returned allocation; bytes beyond it remain untouched.
+    try testing.expectEqualSlices(
+        u8,
+        before[backing.allocated_len..],
+        buffer[backing.allocated_len..],
+    );
+}
+
+test "KTX2 writing initializes every byte and preserves spare output" {
+    const files = [_][]const u8{
+        &fixture.r8_mips,
+        &fixture.etc1s,
+        &fixture.astc_levels_none,
+        &fixture.astc_levels_zstandard,
+        &fixture.astc_levels_zlib,
+    };
+    for (files) |expected| {
+        const source = try Source.open(expected, .{});
+        var levels: [32]types.Level = undefined;
+        for (levels[0..source.header.levelCount()], 0..) |*level, index| {
+            level.* = source.level(@intCast(index)).?;
+        }
+        var entries: [16]types.KeyValue = undefined;
+        var count: usize = 0;
+        var iterator = source.keyValues();
+        while (iterator.next()) |entry| {
+            entries[count] = entry;
+            count += 1;
+        }
+        const image: EncodeTexture = .{
+            .header = source.header,
+            .descriptor = source.descriptor.data,
+            .levels = levels[0..source.header.levelCount()],
+            .metadata = entries[0..count],
+            .global_data = source.global_data,
+        };
+        for ([_]u8{ 0xa5, 0x5a }) |poison| {
+            var output: [512]u8 = @splat(poison);
+            const written = try encodeInto(&image, &output, .{});
+            try testing.expectEqualSlices(u8, expected, written);
+            try testing.expect(std.mem.allEqual(u8, output[written.len..], poison));
+        }
+    }
+}
+
+test "KTX2 allocating writer initializes the allocated bytes" {
+    const PoisonedAllocator = struct {
+        storage: [512]u8 align(16),
+        poison: u8,
+        allocated: bool = false,
+        freed: bool = false,
+
+        fn alloc(context: *anyopaque, length: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.allocated or length > self.storage.len) return null;
+            self.allocated = true;
+            @memset(self.storage[0..length], self.poison);
+            return &self.storage;
+        }
+
+        fn free(context: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.freed = true;
+        }
+    };
+
+    const files = [_][]const u8{
+        &fixture.r8_mips,
+        &fixture.etc1s,
+        &fixture.astc_levels_none,
+        &fixture.astc_levels_zstandard,
+        &fixture.astc_levels_zlib,
+    };
+    for (files) |expected| {
+        const source = try Source.open(expected, .{});
+        var levels: [32]types.Level = undefined;
+        for (levels[0..source.header.levelCount()], 0..) |*level, index| {
+            level.* = source.level(@intCast(index)).?;
+        }
+        var entries: [16]types.KeyValue = undefined;
+        var count: usize = 0;
+        var iterator = source.keyValues();
+        while (iterator.next()) |entry| {
+            entries[count] = entry;
+            count += 1;
+        }
+        const image: EncodeTexture = .{
+            .header = source.header,
+            .descriptor = source.descriptor.data,
+            .levels = levels[0..source.header.levelCount()],
+            .metadata = entries[0..count],
+            .global_data = source.global_data,
+        };
+        for ([_]u8{ 0xa5, 0x5a }) |poison| {
+            var backing: PoisonedAllocator = .{ .storage = @splat(poison), .poison = poison };
+            const allocator: std.mem.Allocator = .{
+                .ptr = &backing,
+                .vtable = &.{
+                    .alloc = PoisonedAllocator.alloc,
+                    .resize = std.mem.Allocator.noResize,
+                    .remap = std.mem.Allocator.noRemap,
+                    .free = PoisonedAllocator.free,
+                },
+            };
+            const written = try encode(allocator, &image, .{});
+            try testing.expect(backing.allocated);
+            try testing.expectEqualSlices(u8, expected, written);
+            try testing.expect(std.mem.allEqual(u8, backing.storage[written.len..], poison));
+            allocator.free(written);
+            try testing.expect(backing.freed);
+        }
+    }
 }
 
 test "KTX2 writing preserves binary metadata and refuses unsorted or overlapping input" {

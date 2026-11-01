@@ -51,7 +51,8 @@ encoding: writing does not compress or convert them.
 capacity and rejects overlaps between the used output prefix and every admitted input span before
 writing. It returns the used prefix and leaves spare capacity, and the entire destination on failure,
 unchanged. `encode` allocates a complete result using its per-call allocator; free the result with
-the same allocator. Inputs remain immutable through either call.
+the same allocator. It validates before requesting the exact output size. Both writers initialize
+required wire padding to zero, and inputs remain immutable through either call.
 
 | Error | Meaning |
 | --- | --- |
