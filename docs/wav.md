@@ -23,7 +23,7 @@ allocating, caller-buffer and `std.Io` decoding.
 | `decodeRequirements` | Inspect complete file geometry and the decoded sample count; sample contents remain unchecked |
 | `decodeInto` | Use caller sample and directory storage; return an `AudioView` borrowing the used sample prefix |
 | `decodeAlloc` | Allocate an independent `Audio`; release it with the original allocator |
-| `decodeParallelInto`, `decodeParallelAlloc` | The same results with explicit `std.Io`, bounded workers and `ParallelOptions` |
+| `decodeParallelInto`, `decodeParallelAlloc` | Decode with explicit `std.Io`, bounded workers and `ParallelOptions` |
 | `encodePcm16Requirements`, `encodePcm16Into`, `writePcm16` | Size, fill caller bytes or write a complete PCM16 RIFF file |
 
 Serial calls need no scheduler. Allocating calls take a per-call allocator and retain none. An
@@ -165,6 +165,11 @@ may execute inline and controls its own scheduling allocations; Wingman creates 
 Defaults use serial conversion below256KiB and target at least64KiB of encoded data per job.
 Whole frames or ADPCM blocks form disjoint partitions. Thresholds or too few workers can select
 serial conversion. Worker capacity bounds participants, including the calling thread.
+
+Integer PCM with more than 25 meaningful bits can round during `f32` conversion, depending on the
+executing thread's floating-point environment and the target. A provider's workers can have
+different modes from the caller or each other, so parallel and serial results can differ for these
+samples.
 
 ```zig
 const std = @import("std");

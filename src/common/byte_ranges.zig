@@ -18,8 +18,30 @@ test "byte-range overlap preserves empty, touching and wrapped-address behavior"
     try std.testing.expect(!overlaps(bytes[0..3], bytes[3..8]));
     try std.testing.expect(overlaps(bytes[0..4], bytes[3..8]));
     try std.testing.expect(overlaps(bytes[3..8], bytes[0..4]));
+
+    // These address-only slices are never dereferenced; their ends would overflow a pointer-sized
+    // integer if overlap were checked by adding the span length to its start address.
     const high = @as([*]const u8, @ptrFromInt(std.math.maxInt(usize) - 3))[0..8];
     const within = @as([*]const u8, @ptrFromInt(std.math.maxInt(usize) - 1))[0..1];
     try std.testing.expect(overlaps(high, within));
     try std.testing.expect(overlaps(within, high));
+}
+
+test "byte spans distinguish empty touching and overlapping storage" {
+    var storage: [16]u8 = undefined;
+    try std.testing.expect(!overlaps(storage[0..0], &storage));
+    try std.testing.expect(!overlaps(&storage, storage[16..16]));
+    try std.testing.expect(!overlaps(storage[0..4], storage[4..8]));
+    try std.testing.expect(!overlaps(storage[4..8], storage[0..4]));
+    try std.testing.expect(overlaps(storage[0..4], storage[3..8]));
+    try std.testing.expect(overlaps(storage[3..8], storage[0..4]));
+    try std.testing.expect(overlaps(storage[0..8], storage[2..6]));
+    try std.testing.expect(overlaps(storage[2..6], storage[0..8]));
+}
+
+test "separate live byte objects never overlap" {
+    var first: [16]u8 = undefined;
+    var second: [16]u8 = undefined;
+    try std.testing.expect(!overlaps(&first, &second));
+    try std.testing.expect(!overlaps(&second, &first));
 }

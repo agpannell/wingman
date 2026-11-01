@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         var storage: [9]f32 = undefined;
         const samples = try adpcm.decodeInto(case.bytes, &storage, case.format);
         var pcm16: [18]u8 = undefined;
-        const encoded = try pcm.encodePcm16Into(samples, &pcm16);
+        const encoded = try pcm.encodeInto(samples, &pcm16, .{ .encoding = .signed16 });
         for (case.expected, samples, 0..) |value, sample, i| {
             if (sample != @as(f32, @floatFromInt(value)) / 32768) return error.SampleMismatch;
             if (std.mem.readInt(

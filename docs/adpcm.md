@@ -95,7 +95,7 @@ test "decode a raw Microsoft block" {
 }
 ```
 
-The [PCM library](pcm.md#encode-normalized-pcm16) can write these samples as little-endian PCM16.
+The [PCM library](pcm.md#encode-and-write-normalized-samples) can write these samples as little-endian PCM16.
 They already lie on its exact PCM16 grid, so that composition adds no quantization change.
 
 ## Prefix output validates the complete input

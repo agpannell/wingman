@@ -4,7 +4,10 @@
 //! ADPCM and IMA/DVI WAVE blocks normalize to f32; finite binary32 samples retain their values,
 //! including values outside [-1, 1]. Data chunks must be top-level and individually frame/block
 //! aligned; LIST/wavl and slnt are not decoded. RIFX, Wave64 and BW64 containers are unsupported.
-//! Microsoft ADPCM blocks whose adaptive delta exceeds signed 32-bit range are rejected.
+//! Integer PCM with more than 25 meaningful bits can round during f32 conversion, depending on the
+//! target and executing thread's floating-point environment. Parallel workers may use different
+//! modes from the caller or one another. Microsoft ADPCM blocks whose adaptive delta exceeds signed
+//! 32-bit range are rejected.
 //!
 //! Use decodeAlloc for an independent sample owner, or decodeRequirements and decodeInto with
 //! explicit sample/directory storage. ADPCM fact counts select a frame prefix while every encoded
@@ -54,7 +57,14 @@ pub const ParallelDecodeError = DecodeError || std.Io.Cancelable;
 pub const ParallelDecodeAllocError = DecodeAllocError || std.Io.Cancelable;
 
 /// Invalid rate/layout/samples, unrepresentable PCM16 RIFF output or caller storage refusal.
-pub const EncodeError = pcm.EncodeError || error{ InvalidRate, UnsupportedWave };
+pub const EncodeError = error{
+    InvalidSamples,
+    SizeOverflow,
+    DestinationTooSmall,
+    Aliasing,
+    InvalidRate,
+    UnsupportedWave,
+};
 
 /// Borrowed interleaved audio. Samples remain owned by their source reservation; metadata is
 /// copied. Null speaker mask means ordinary WAVE metadata; a zero mask means unspecified
@@ -119,6 +129,7 @@ pub fn decodeRequirements(
 /// Decodes a complete file into independent samples. All temporary scratch and partial ownership
 /// retire on failure. Zero frames allocate no sample storage. Metadata/data ordering, multiple data
 /// chunks and unknown padded chunks are supported; trailing bytes and duplicate fmt are refused.
+/// Wide integer PCM conversion may depend on the calling thread's floating-point environment.
 pub fn decodeAlloc(allocator: std.mem.Allocator, source: []const u8) DecodeAllocError!Audio {
     return decodeOwned(false, allocator, undefined, source, &.{}, .{});
 }
@@ -138,7 +149,8 @@ test decodeAlloc {
 /// Decodes into a used caller sample prefix without allocating. Directory scratch comes from
 /// parse(source).scratchCount(). Source, destination and used scratch must be disjoint. Capacity
 /// and alias refusals precede output writes; content errors can leave partial unpublished samples.
-/// The returned view survives scratch retirement and borrows only destination storage.
+/// The returned view survives scratch retirement and borrows only destination storage. Wide integer
+/// PCM conversion may depend on the calling thread's floating-point environment.
 pub fn decodeInto(
     source: []const u8,
     destination: []f32,
@@ -183,6 +195,7 @@ test decodeInto {
 /// Allocating complete-file decode using explicit std.Io and bounded workers, including the caller.
 /// The provider may run jobs inline and controls its own scheduling allocations. Every submitted
 /// job finishes before success, error or cancellation returns. Source/worker borrows do not escape.
+/// Wide integer PCM conversion may depend on each executing thread's floating-point environment.
 pub fn decodeParallelAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -213,6 +226,7 @@ test decodeParallelAlloc {
 /// Parallel decode into caller samples without library allocation. Worker, sample and used index
 /// reservations must be pairwise disjoint and disjoint from source. All submitted work retires on
 /// every exit, including Canceled. Failed output remains unpublished, even if some jobs completed.
+/// Wide integer PCM conversion may depend on each executing thread's floating-point environment.
 pub fn decodeParallelInto(
     io: std.Io,
     source: []const u8,
@@ -449,7 +463,10 @@ pub fn encodePcm16Requirements(source: AudioView) EncodeError!usize {
     if (source.samples.len % channels != 0) return error.InvalidSamples;
     if (source.samples.len > (std.math.maxInt(u32) - 36) / 2) return error.SizeOverflow;
     _ = std.math.mul(u32, source.sample_rate, channels * 2) catch return error.InvalidRate;
-    try pcm.validatePcm16(source.samples);
+    pcm.validate(source.samples, .{ .encoding = .signed16 }) catch |err| switch (err) {
+        error.InvalidFormat => unreachable,
+        error.InvalidSamples, error.SizeOverflow => |e| return e,
+    };
     return std.math.add(usize, 44, source.samples.len * 2) catch error.SizeOverflow;
 }
 
@@ -510,7 +527,7 @@ fn writePcm16Admitted(
     try writer.writeInt(u16, @intCast(channels * 2), .little);
     try writer.writeInt(u16, 16, .little);
     try riff.writeChunkHeader("data".*, source.samples.len * 2, writer);
-    pcm.writePcm16(source.samples, writer) catch |err| switch (err) {
+    pcm.writeAll(source.samples, writer, .{ .encoding = .signed16 }) catch |err| switch (err) {
         error.WriteFailed => return error.WriteFailed,
         else => unreachable,
     };

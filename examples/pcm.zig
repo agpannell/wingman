@@ -1,11 +1,11 @@
-//! Encode normalized channel samples as PCM16 and inspect the recovered values.
+//! Encode normalized PCM16 samples and rewrite exact PCM24 samples in another byte order.
 const std = @import("std");
 const pcm = @import("wingman").pcm;
 
 pub fn main(init: std.process.Init) !void {
     const input = [_]f32{ -1, -0.5, 0, 0.5, 1 };
     var bytes: [input.len * 2]u8 = undefined;
-    const encoded = try pcm.encodePcm16Into(&input, &bytes);
+    const encoded = try pcm.encodeInto(&input, &bytes, .{ .encoding = .signed16 });
     const expected = [_]u8{ 0, 128, 0, 192, 0, 0, 0, 64, 255, 127 };
     if (!std.mem.eql(u8, &expected, encoded)) return error.EncodedSampleMismatch;
     var decoded: [input.len]f32 = undefined;
@@ -13,8 +13,26 @@ pub fn main(init: std.process.Init) !void {
 
     var writer_bytes: [bytes.len]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_bytes);
-    try pcm.writePcm16(&input, &writer);
+    try pcm.writeAll(&input, &writer, .{ .encoding = .signed16 });
     if (!std.mem.eql(u8, encoded, writer.buffered())) return error.WriterMismatch;
+
+    // Exact integer samples can also carry all meaningful bits through a byte-order change.
+    const input24 = [_]u8{ 0x80, 0, 0, 0x7f, 0xff, 0xff };
+    var exact: [2]i32 = undefined;
+    const values = try pcm.int32.decodeInto(
+        &input24,
+        &exact,
+        .{ .encoding = .signed24, .endian = .big },
+    );
+    var little24: [6]u8 = undefined;
+    const rewritten = try pcm.int32.encodeInto(
+        values,
+        &little24,
+        .{ .format = .{ .encoding = .signed24 } },
+    );
+    if (!std.mem.eql(u8, rewritten, &.{ 0, 0, 0x80, 0xff, 0xff, 0x7f })) {
+        return error.EncodedSampleMismatch;
+    }
 
     var buffer: [512]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
@@ -24,6 +42,9 @@ pub fn main(init: std.process.Init) !void {
     }
     try output.interface.writeAll("little-endian bytes:");
     for (encoded) |byte| try output.interface.print(" {x:0>2}", .{byte});
+    try output.interface.writeByte('\n');
+    try output.interface.writeAll("exact PCM24 rewritten little-endian:");
+    for (rewritten) |byte| try output.interface.print(" {x:0>2}", .{byte});
     try output.interface.writeByte('\n');
     try output.interface.flush();
 }

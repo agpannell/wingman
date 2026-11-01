@@ -59,7 +59,7 @@ loader composes them with file metadata; they can also serve other containers or
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
-| [`pcm`](docs/pcm.md) | Little-endian integer/float sample conversion and PCM16 writing | `pcm-example` |
+| [`pcm`](docs/pcm.md) | Integer and float PCM conversion with explicit precision and byte order | `pcm-example` |
 | [`g711`](docs/g711.md) | A-law and mu-law decoding to exact PCM16 or normalized floats | `g711-example` |
 | [`adpcm`](docs/adpcm.md) | Microsoft and IMA/DVI WAVE block decoding, including validated frame prefixes | `adpcm-example` |
 

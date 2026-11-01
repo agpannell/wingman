@@ -1,153 +1,165 @@
 # PCM sample conversion
 
-Pulse-code modulation (PCM) stores each audio sample as an integer or floating-point value.
-`wingman.pcm` converts those bytes to caller-owned `f32` samples and writes normalized samples as
-little-endian PCM16. Use it between a container reader and audio processing, or to prepare sample
-bytes for a writer.
+Pulse-code modulation (PCM) stores audio as integer or floating-point channel samples.
+`wingman.pcm` converts between encoded bytes and caller-owned samples without parsing a container,
+assigning a sample rate or allocating memory. Use it when a file reader or protocol has already
+identified the sample representation. For a WAVE or RF64 file, [`wingman.wav`](wav.md) handles
+container framing and chooses the appropriate codec.
 
-A sample is one channel value. A stereo frame contains two samples; rate, channel layout and
-interleaving belong to the caller. Conversion preserves input order, allocates nothing and retains
-no buffer, allocator or scheduler. Container inspection is a separate operation, such as
-[`wingman.riff`](riff.md).
+A sample is one channel value. A stereo frame contains two samples. Conversion preserves their
+order; the caller supplies the channel layout and controls any resampling, gain, dither or playback.
 
-## Decode into caller storage
+## Choose the representation
 
-Choose an `Encoding` in `Format`, count complete samples with `sampleCount`, then provide enough
-`f32` storage. `decodeInto` returns its used prefix and leaves spare elements untouched. Encoded
-bytes can be unaligned and need no padding; typed `f32` storage has its normal Zig alignment.
+`Format` chooses an `Encoding`, an optional `valid_bits` count and an `endian` byte order. The
+default byte order is little-endian. Byte order has no effect on one-byte samples.
 
-```zig
-const std = @import("std");
-const pcm = @import("wingman").pcm;
-
-test "decode packed signed PCM24" {
-    const bytes = [_]u8{
-        0, 0, 128, 255, 255, 255, 0, 0, 0, 255, 255, 127,
-    };
-    const format: pcm.Format = .{ .encoding = .signed24 };
-    try std.testing.expectEqual(4, try pcm.sampleCount(bytes.len, format));
-    var storage: [6]f32 = @splat(123);
-    const samples = try pcm.decodeInto(&bytes, &storage, format);
-    try std.testing.expectEqualSlices(
-        f32,
-        &.{ -1, -1.0 / 8388608.0, 0, 8388607.0 / 8388608.0 },
-        samples,
-    );
-    try std.testing.expectEqualSlices(f32, &.{ 123, 123 }, storage[4..]);
-}
-```
-
-The returned slice borrows the destination, not the encoded input. Input can retire when the call
-returns. Keep destination storage live while using the result; free an allocated buffer through
-its original full allocation, rather than through the shortened returned slice.
-
-## Representations and numerical policy
-
-| Encoding | Bytes per sample | Interpretation |
+| Encoding | Container | Interpretation |
 | --- | --- | --- |
-| `.unsigned8` | 1 | Unsigned integer with a midpoint bias |
-| `.signed16` | 2 | Signed two's-complement integer |
-| `.signed24` | 3 | Packed signed two's-complement integer |
-| `.signed32` | 4 | Signed two's-complement integer |
-| `.float32` | 4 | Finite IEEE binary32 word |
+| `.unsigned8`, `.unsigned16`, `.unsigned24`, `.unsigned32` | 1, 2, 3 or 4 bytes | Unsigned integer with a midpoint bias |
+| `.signed8`, `.signed16`, `.signed24`, `.signed32` | 1, 2, 3 or 4 bytes | Signed two's-complement integer |
+| `.float32`, `.float64` | 4 or 8 bytes | Finite IEEE binary32 or binary64 |
 
-All encoded words are little-endian, independently of the host. `Format.valid_bits = null` selects
-the whole container width. Integers permit 1 through that width; `.float32` permits only 32.
-When precision is smaller than the container, meaningful bits occupy the high end. The converter
-ignores low padding bits. A container format that requires zero padding must check that policy.
+`valid_bits = null` selects the full container width. Integer formats accept one through the
+container width; floating-point formats require their full width. Integer significant bits occupy
+the high end of the numerical container. Decoding ignores low padding bits; encoding writes zero
+padding. A format that requires zero padding in its input must check that separately.
+
+## Decode normalized samples
+
+`sampleCount` validates format and complete-sample geometry; it does not inspect sample values.
+Provide that many `f32` elements to `decodeInto`. Its result borrows the used destination prefix;
+the source can retire after the call and spare destination elements remain untouched. Encoded bytes
+can be unaligned. Integer samples are normalized by their precision's power-of-two midpoint. The
+negative endpoint becomes -1. A full-scale signed32 value can round to +1 because not every 32-bit
+integer is representable in `f32`.
+
+Integer samples with more than 25 meaningful bits can round to `f32`; the result can depend on the
+executing thread's floating-point environment and the target. In parallel WAVE decoding, a job uses
+its executing worker's environment, which can differ from the calling thread's.
 
 ```zig
 const std = @import("std");
 const pcm = @import("wingman").pcm;
 
-test "read twelve meaningful bits from sixteen-bit containers" {
-    const bytes = [_]u8{ 255, 127, 15, 128 };
-    var output: [2]f32 = undefined;
-    const samples = try pcm.decodeInto(
-        &bytes,
-        &output,
-        .{ .encoding = .signed16, .valid_bits = 12 },
-    );
-    try std.testing.expectEqualSlices(f32, &.{ 2047.0 / 2048.0, -1 }, samples);
+test "decode big-endian signed PCM24" {
+    const format: pcm.Format = .{ .encoding = .signed24, .endian = .big };
+    const bytes = [_]u8{ 0x80, 0, 0, 0, 0, 0, 0x7f, 0xff, 0xff };
+    try std.testing.expectEqual(3, try pcm.sampleCount(bytes.len, format));
+    var storage: [4]f32 = @splat(42);
+    const samples = try pcm.decodeInto(&bytes, &storage, format);
+    try std.testing.expectEqualSlices(f32, &.{ -1, 0, 8388607.0 / 8388608.0 }, samples);
+    try std.testing.expectEqual(42, storage[3]);
 }
 ```
 
-For an integer with `b` meaningful bits, decoding subtracts the unsigned midpoint where needed,
-then divides by `2^(b-1)`. The negative endpoint becomes -1. The mathematical positive endpoint
-is below 1, but a full-scale 32-bit integer can round to +1 in `f32`. Conversion to `f32` cannot
-preserve every 32-bit integer; retain source bytes when exact integer recovery is needed.
+Finite binary32 input retains its bits, including negative zero, subnormals and values outside
+[-1, 1]. Binary64 input narrows to binary32 with nearest-even rounding, including signed underflow.
+Nonfinite input or a narrowed nonfinite result produces `InvalidSamples`. Float conversion can
+write earlier samples before a content error; discard the unpublished result on error.
 
-Finite `.float32` words preserve their bits, including negative zero, subnormals and values outside
-[-1,1]. NaN and infinity produce `InvalidSamples`. This finite-only admission is the codec's
-policy. A float failure can modify the used destination region; discard that unpublished result.
+## Encode and write normalized samples
 
-Full-precision PCM8 and PCM16 use target-selected SIMD bodies and exact scalar tails. Other
-precisions use scalar conversion. These paths share the same numerical contract and do not read
-beyond the complete supplied samples. No runtime CPU dispatcher or padding reservation is needed.
-
-## Encode normalized PCM16
-
-`encodePcm16Into` returns a borrowed byte prefix; `writePcm16` accepts a concrete `*std.Io.Writer`.
-Both validate every input sample before writing. Samples must be finite and in [-1,1].
-Quantization multiplies by 32768, rounds halfway away from zero and clamps the positive endpoint
-to 32767. The negative endpoint is -32768. There is no dithering or automatic gain adjustment.
+`encodeInto` writes a chosen representation to caller storage; `writeAll` uses `*std.Io.Writer`.
+Both validate the format, encoded extent and every sample before writing. For integer output,
+inputs must be finite and in [-1, 1]. They are scaled by the precision midpoint, rounded halfway
+away from zero and clamped to the signed range before any unsigned bias is applied. There is no
+implicit dither or gain. Float output accepts finite values outside that range; binary32 preserves
+`f32` bits and widening to binary64 is exact.
 
 ```zig
 const std = @import("std");
 const pcm = @import("wingman").pcm;
 
-test "encode the same PCM16 through storage and a writer" {
+test "write normalized PCM16" {
+    const format: pcm.Format = .{ .encoding = .signed16 };
     const samples = [_]f32{ -1, 0.5, 1 };
     var bytes: [8]u8 = @splat(0xa7);
-    const encoded = try pcm.encodePcm16Into(&samples, &bytes);
+    const encoded = try pcm.encodeInto(&samples, &bytes, format);
     try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 64, 255, 127 }, encoded);
     try std.testing.expectEqualSlices(u8, &.{ 0xa7, 0xa7 }, bytes[6..]);
     var writer_bytes: [6]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_bytes);
-    try pcm.writePcm16(&samples, &writer);
+    try pcm.writeAll(&samples, &writer, format);
     try std.testing.expectEqualSlices(u8, encoded, writer.buffered());
 }
 ```
 
-The caller owns Writer storage, allocation and flushing. A file writer supplies its `interface`
-and uses the caller-selected `std.Io`. A backend failure can leave a prefix already buffered or
-sent. Input must be disjoint from Writer backing storage; that is a caller precondition.
+## Exact integer and binary64 samples
 
-## Admission, overlap and lifetime
+`pcm.int32` converts integer wire formats to and from left-aligned signed `i32` samples. A sample
+represents its integer value divided by 2^31; unsigned midpoint bias is removed. Encoding rejects
+`PrecisionLoss` if the requested representation would discard nonzero low sample bits. It does not
+accept float wire formats. Decoding ignores low wire padding, so original nonzero padding cannot be
+recovered from the sample values alone.
 
-Decoder format, whole-sample length, capacity and overlap failures occur before writes. Finite-float
-admission happens during conversion, so it can leave partial output. Decoding never modifies source.
-Integer and float input outside the selected representation are not inferred from a file header.
+`pcm.float64` converts through `f64` samples. All supported integer and finite binary32 inputs are
+represented exactly; finite binary64 input retains its bits. Encoding to integer uses the same
+half-away rule as `f32` conversion. Binary32 output narrows nearest-even and rejects a result that
+would be nonfinite. Both namespaces offer `decodeInto`, `validate`, `encodeInto` and `writeAll`;
+their encoding operations take `.{ .format = format }` options.
 
-Caller-buffer encoding checks normalized input before capacity and overlap, preserving the whole
-destination on any admission failure. Both conversion directions reject source overlap with the
-**used** destination. Touching spans are disjoint; source overlap confined to unused destination
-capacity is allowed. Byte-range checks compare address differences instead of forming overflowing
-end pointers. No view or authority is retained after the call beyond the returned destination slice.
+```zig
+const std = @import("std");
+const pcm = @import("wingman").pcm;
 
-## API and supported scope
+test "rewrite unsigned PCM24 with exact integer samples" {
+    const source_format: pcm.Format = .{
+        .encoding = .unsigned24,
+        .valid_bits = 20,
+        .endian = .big,
+    };
+    const source = [_]u8{ 0x80, 0, 0x0f, 0xff, 0xff, 0xff };
+    var samples: [2]i32 = undefined;
+    const decoded = try pcm.int32.decodeInto(&source, &samples, source_format);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0x7fff_f000 }, decoded);
 
-| Operation or type | Contract |
-| --- | --- |
-| `Encoding.byteCount`, `Format` | Container width and optional high-aligned precision |
-| `sampleCount` | Validates format and complete encoded-sample geometry |
-| `decodeInto` | Converts all source into a used `f32` destination prefix |
-| `validatePcm16` | Validates all normalized input without writing |
-| `encodePcm16Into` | Encodes into caller bytes, preserving spare output |
-| `writePcm16` | Writes through `std.Io.Writer`; caller owns flushing |
+    var storage: [6]u8 = undefined;
+    const canonical = try pcm.int32.encodeInto(decoded, &storage, .{ .format = source_format });
+    try std.testing.expectEqualSlices(u8, &.{ 0x80, 0, 0, 0xff, 0xff, 0xf0 }, canonical);
+}
+```
 
-`DecodeError` distinguishes invalid format, incomplete data, insufficient output, overlap and
-nonfinite samples. Caller-buffer encoding returns `EncodeError` for invalid normalized samples,
-byte-count overflow, insufficient output or overlap. Validation returns only `InvalidSamples` or
-`SizeOverflow`; Writer calls add `WriteFailed`. Writer aliasing remains a caller precondition.
+For binary64 samples, select binary32 wire output when its precision is sufficient:
 
-This profile decodes little-endian PCM8/16/24/32 and finite binary32, and encodes PCM16. Callers
-handle fragmented samples, container parsing, byte-order adaptation, channel policy, resampling
-and playback. Generate the API reference with `zig build docs`; run `zig build pcm-example` to see
-the exact PCM16 bytes and the quantized positive endpoint. No throughput claim is made.
+```zig
+const std = @import("std");
+const pcm = @import("wingman").pcm;
 
-Representation background: Microsoft's [PCM data types] and [valid-bit containers]. Numerical
-normalization, finite-only float admission and output rounding are the explicit policies above.
+test "encode binary64 samples as binary32" {
+    const samples = [_]f64{ 1.5, -0.0 };
+    var bytes: [8]u8 = undefined;
+    const encoded = try pcm.float64.encodeInto(
+        &samples,
+        &bytes,
+        .{ .format = .{ .encoding = .float32 } },
+    );
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0xc0, 0x3f, 0, 0, 0, 0x80 }, encoded);
+}
+```
 
-[PCM data types]: https://learn.microsoft.com/en-us/windows/win32/multimedia/devices-and-data-types
-[valid-bit containers]: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ksmedia/ns-ksmedia-waveformatextensible
+## Storage and failure
+
+Decoding validates format and complete sample extent, then capacity and overlap with the used
+output before writing. Encoding validates format, checked extent and all samples before checking
+capacity and overlap. Buffer admission failures preserve the complete destination, and spare
+capacity is left untouched on success. Touching spans are disjoint; source overlap confined to
+unused destination capacity is permitted.
+
+`sampleCount` reports `InvalidFormat` for an unsupported format or precision and `InvalidData`
+for an incomplete sample. Decoders also report `DestinationTooSmall` or `Aliasing` before
+writing; the `f32` and `f64` decoders report `InvalidSamples` for invalid float content.
+`pcm.int32` rejects float wire formats as `InvalidFormat`.
+
+Encoding validation reports `InvalidFormat` or `SizeOverflow`; it also reports `InvalidSamples`
+for rejected `f32` or `f64` samples, or `PrecisionLoss` for an inexact `i32` sample. Buffer
+encoding adds `DestinationTooSmall` and `Aliasing`. Writer operations report validation and
+`std.Io.Writer` errors; they do not perform the buffer overlap check.
+
+Writer storage must be disjoint from input. A backend failure can leave a byte prefix buffered or
+sent, and the caller owns flushing. Returned slices borrow their destination; release an allocation
+using its original full slice. No operation retains the source, destination, writer or allocator.
+
+`pcm` does not parse containers, retain fragmented samples between calls, change channel layout,
+resample, dither or play audio. Generate the API reference with `zig build docs` and run
+`zig build pcm-example` for a complete PCM conversion.

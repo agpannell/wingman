@@ -528,20 +528,39 @@ test "PCM packed precision and finite float words from outside the module" {
 test "PCM16 caller storage and Writer validate before output" {
     const samples = [_]f32{ -1, -0.5, 0, 0.5, 1 };
     var bytes: [12]u8 = @splat(0xa7);
-    const encoded = try pcm.encodePcm16Into(&samples, &bytes);
+    const encoded = try pcm.encodeInto(&samples, &bytes, .{ .encoding = .signed16 });
     try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 192, 0, 0, 0, 64, 255, 127 }, encoded);
     try std.testing.expectEqualSlices(u8, &.{ 0xa7, 0xa7 }, bytes[10..]);
     var writer_bytes: [10]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_bytes);
-    try pcm.writePcm16(&samples, &writer);
+    try pcm.writeAll(&samples, &writer, .{ .encoding = .signed16 });
     try std.testing.expectEqualSlices(u8, encoded, writer.buffered());
-    try std.testing.expectError(error.InvalidSamples, pcm.validatePcm16(&.{1.5}));
+    try std.testing.expectError(
+        error.InvalidSamples,
+        pcm.validate(&.{1.5}, .{ .encoding = .signed16 }),
+    );
     const before = bytes;
     try std.testing.expectError(
         error.InvalidSamples,
-        pcm.encodePcm16Into(&.{std.math.nan(f32)}, &bytes),
+        pcm.encodeInto(&.{std.math.nan(f32)}, &bytes, .{ .encoding = .signed16 }),
     );
     try std.testing.expectEqualSlices(u8, &before, &bytes);
+}
+
+test "PCM unsigned wide exact samples and binary64 round trip" {
+    const pcm_format: pcm.Format = .{ .encoding = .unsigned24, .valid_bits = 20, .endian = .big };
+    const source = [_]u8{ 0, 0, 15, 0x80, 0, 15, 0xff, 0xff, 0xff };
+    var values: [3]i32 = undefined;
+    const result = try pcm.int32.decodeInto(&source, &values, pcm_format);
+    try std.testing.expectEqualSlices(i32, &.{ std.math.minInt(i32), 0, 0x7ffff000 }, result);
+    var canonical: [9]u8 = undefined;
+    const bytes = try pcm.int32.encodeInto(result, &canonical, .{ .format = pcm_format });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0x80, 0, 0, 0xff, 0xff, 0xf0 }, bytes);
+    var wide: [3]f64 = undefined;
+    _ = try pcm.float64.decodeInto(bytes, &wide, pcm_format);
+    try std.testing.expectEqual(-1, wide[0]);
+    try std.testing.expectEqual(0, wide[1]);
+    try std.testing.expectEqual(524287.0 / 524288.0, wide[2]);
 }
 
 test "G.711 scalar facts normalized output and PCM16 composition" {
@@ -561,7 +580,7 @@ test "G.711 scalar facts normalized output and PCM16 composition" {
     var bytes: [8]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &.{
         0x84, 0x82, 0x7c, 0x7d, 0, 0, 0, 0,
-    }, try pcm.encodePcm16Into(samples, &bytes));
+    }, try pcm.encodeInto(samples, &bytes, .{ .encoding = .signed16 }));
 }
 
 test "G.711 refusal ordering preserves caller storage" {
@@ -598,7 +617,7 @@ test "ADPCM Microsoft literal samples from caller-owned coefficients" {
     var bytes: [8]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &.{
         0x9c, 0xff, 100, 0, 116, 0, 148, 0,
-    }, try pcm.encodePcm16Into(decoded, &bytes));
+    }, try pcm.encodeInto(decoded, &bytes, .{ .encoding = .signed16 }));
 }
 
 test "ADPCM prefix still rejects omitted invalid IMA blocks" {

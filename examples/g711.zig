@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
     for ([_]g711.Law{ .alaw, .mulaw }) |law| {
         const decoded = try g711.decodeInto(&codes, &samples, law);
-        const bytes = try pcm.encodePcm16Into(decoded, &pcm16);
+        const bytes = try pcm.encodeInto(decoded, &pcm16, .{ .encoding = .signed16 });
         try output.interface.print(
             "{s}: {d} bytes -> {d} samples\n",
             .{ @tagName(law), codes.len, decoded.len },

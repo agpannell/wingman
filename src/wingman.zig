@@ -97,5 +97,6 @@ test {
 
     _ = bvh;
     _ = acclaim;
+    _ = @import("common/byte_ranges.zig");
     _ = @import("common/rigid_transform.zig");
 }
