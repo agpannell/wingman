@@ -3,6 +3,7 @@ const std = @import("std");
 const wingman = @import("wingman");
 
 pub fn main(init: std.process.Init) !void {
+    // Keep the whole source alive while the selected font and its table are in use.
     const source = sampleContainer();
     const container = try wingman.dfont.Container.open(&source);
     const font_bytes = try container.faceBytes(0);
@@ -12,7 +13,12 @@ pub fn main(init: std.process.Init) !void {
     if (!table.checksumMatches() or !std.mem.eql(u8, table.data, &.{ 1, 2, 3, 4 })) {
         return error.WrongTable;
     }
-    if (@intFromPtr(table.data.ptr) != @intFromPtr(&source) + 48) return error.WrongBorrow;
+    // Unlike a collection, SFNT offsets here start at the selected resource payload. This fixture
+    // puts that payload at byte 20 and its table at byte 28 of the payload.
+    const font_offset_in_source: usize = 20;
+    const table_offset_in_font: usize = table.offset;
+    if (font_bytes.ptr != source[font_offset_in_source..].ptr) return error.WrongBorrow;
+    if (table.data.ptr != font_bytes[table_offset_in_font..].ptr) return error.WrongBorrow;
 
     var buffer: [512]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);

@@ -65,8 +65,9 @@ checks the selected directory and its tables, returning `InvalidFace` outside th
 Failure on one member leaves the collection available for selecting another.
 
 **Table offsets remain absolute in the complete collection.** Keep the whole collection as the
-source when opening a directory at a nonzero position. Passing only a suffix beginning at that
-directory would change the meaning of its encoded offsets. Different face records may name the
+source when opening a directory at a nonzero position. In the example, both directories point to
+byte 96 of the complete collection. Passing only a suffix beginning at a directory would change
+the meaning of its encoded offsets. Different face records may name the
 same directory, and different tables may borrow the same bytes.
 
 ## Verify checksums explicitly

@@ -37,6 +37,11 @@ to that payload. An out-of-range index returns `InvalidFace`; compressed resourc
 but selection returns `UnsupportedFormat`. A container without SFNT resources also returns
 `UnsupportedFormat`. Malformed framing or ranges return `InvalidFont`.
 
+In the example, the selected SFNT resource begins at byte 20 of the container. Its table offset
+is 28 relative to that resource, so the table starts at byte 48 of the container. Pass the selected
+payload to `sfnt.Directory.open`; passing the whole DFONT would use the wrong offset base. This
+differs from an SFNT collection, whose table offsets refer to the complete collection.
+
 `hasHeader(bytes)` checks only the fixed framing and the two disjoint ranges. A successful result
 is a preliminary check, not proof that the resource map is valid or that the file contains a font.
 A header's leading word is a data offset and may equal a font signature, so this function does not

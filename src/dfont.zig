@@ -76,7 +76,9 @@ pub const Container = struct {
                 }
 
                 const payload = try resource(data, reference);
-                if (reference[4] & 1 != 0) continue; // Compressed resources need separate decoding.
+                // Compressed resources count as faces, but their opaque bytes are not an SFNT
+                // directory until a separate decompressor has interpreted them.
+                if (reference[4] & 1 != 0) continue;
                 if (payload.len < 12) return error.InvalidFont;
                 const tables = try binary.read(u16, payload, 4);
                 const directory_end = try binary.arrayOffset(12, tables, 16);
@@ -131,54 +133,6 @@ pub const Container = struct {
     }
 };
 
-/// Checks the fixed header and disjoint data/map extents without visiting resources. A successful
-/// result does not admit type/reference lists or identify the payload format; call Container.open
-/// afterward. A failed check does not prove that the same bytes are a different font format.
-pub fn hasHeader(bytes: []const u8) bool {
-    _ = readHeader(bytes) catch return false;
-    return true;
-}
-
-const Header = struct { data: []const u8, map: []const u8 };
-
-fn readHeader(bytes: []const u8) Error!Header {
-    const data_offset = try binary.read(u32, bytes, 0);
-    const map_offset = try binary.read(u32, bytes, 4);
-    const data_length = try binary.read(u32, bytes, 8);
-    const map_length = try binary.read(u32, bytes, 12);
-    if (data_offset < 16 or map_offset < 16 or map_length < 30) return error.InvalidFont;
-    const data = try slice(bytes, data_offset, data_length);
-    const map = try slice(bytes, map_offset, map_length);
-    binary.admitDisjoint(data, map) catch return error.InvalidFont;
-    const zero_header = std.mem.allEqual(u8, map[0..16], 0);
-    const copied_header = std.mem.eql(u8, map[0..16], bytes[0..16]);
-    if (!zero_header and !copied_header) return error.InvalidFont;
-    return .{ .data = data, .map = map };
-}
-
-fn slice(bytes: []const u8, offset: u32, length: u32) Error![]const u8 {
-    const start = std.math.cast(usize, offset) orelse return error.InvalidFont;
-    const size = std.math.cast(usize, length) orelse return error.InvalidFont;
-    const end = try binary.arrayOffset(start, size, 1);
-    if (end > bytes.len) return error.InvalidFont;
-    return bytes[start..end];
-}
-
-fn count(minus_one: u16) usize {
-    return if (minus_one == 0xffff) 0 else @as(usize, minus_one) + 1;
-}
-
-fn resource(data: []const u8, reference: []const u8) Error![]const u8 {
-    const offset = (try binary.read(u32, reference, 4)) & 0x00ffffff;
-    const length = try binary.read(u32, data, offset);
-    const start = std.math.add(u32, offset, 4) catch return error.InvalidFont;
-    return slice(data, start, length);
-}
-
-test {
-    _ = Container;
-}
-
 test "DFONT selects resource order and admits sibling directories independently of font contents" {
     var bytes = testing_dfont.container();
     var container = try Container.open(&bytes);
@@ -189,7 +143,8 @@ test "DFONT selects resource order and admits sibling directories independently 
     try std.testing.expectError(error.InvalidFace, container.faceBytes(2));
 
     const second = try sfnt.Directory.open(try container.faceBytes(1));
-    try std.testing.expectEqual(2048, try binary.read(u16, (try second.find("head".*)).?.data, 18));
+    const second_head = (try second.find("head".*)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(2048, try binary.read(u16, second_head.data, 18));
 
     // A copied map header is valid. A sibling's table-content error stays deferred.
     @memcpy(bytes[624..640], bytes[0..16]);
@@ -197,8 +152,67 @@ test "DFONT selects resource order and admits sibling directories independently 
     container = try Container.open(&bytes);
     try std.testing.expectError(error.InvalidFont, sfnt.Directory.open(try container.faceBytes(1)));
     const first = try sfnt.Directory.open(try container.faceBytes(0));
-    try std.testing.expectEqual(1000, try binary.read(u16, (try first.find("head".*)).?.data, 18));
-    try std.testing.expectEqual(500, try binary.read(u16, (try first.find("hmtx".*)).?.data, 0));
+    const first_head = (try first.find("head".*)) orelse return error.TestUnexpectedResult;
+    const first_metrics = (try first.find("hmtx".*)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(1000, try binary.read(u16, first_head.data, 18));
+    try std.testing.expectEqual(500, try binary.read(u16, first_metrics.data, 0));
+}
+
+test "DFONT rejects truncated aliased compressed and invalid resource records" {
+    const fixture = testing_dfont.container();
+    for ([_]usize{ 0, 15, 16, 63, 64, 623, 624, 653, 719 }) |end| {
+        try std.testing.expectError(error.InvalidFont, Container.open(fixture[0..end]));
+    }
+    for ([_]struct { offset: usize, value: u32 }{
+        .{ .offset = 0, .value = 0xffffffff }, // Data starts outside the source.
+        .{ .offset = 4, .value = 65 }, // Map overlaps resource data.
+        .{ .offset = 8, .value = 0xffffffff }, // Data extent exceeds the source.
+        .{ .offset = 12, .value = 29 }, // Map cannot contain its type list.
+        .{ .offset = 624, .value = 1 }, // Map header is neither zero nor copied.
+        .{ .offset = 64, .value = 0xffffffff }, // Payload length exceeds the data region.
+        .{ .offset = 624 + 38 + 4, .value = 0x00ffffff },
+    }) |case| {
+        var bytes = fixture;
+        testing_dfont.write(u32, &bytes, case.offset, case.value);
+        try std.testing.expectError(error.InvalidFont, Container.open(&bytes));
+    }
+    for (
+        [_]struct {
+            offset: usize,
+            value: u16,
+        }{
+            .{ .offset = 624 + 24, .value = 27 },
+            .{ .offset = 624 + 26, .value = 97 },
+            .{ .offset = 624 + 36, .value = 0 },
+            .{ .offset = 624 + 36, .value = 90 },
+            .{ .offset = 624 + 40, .value = 96 },
+            .{ .offset = 348 + 4, .value = 0xffff },
+        },
+    ) |case| {
+        var bytes = fixture;
+        testing_dfont.write(u16, &bytes, case.offset, case.value);
+        try std.testing.expectError(error.InvalidFont, Container.open(&bytes));
+    }
+
+    var bytes = fixture;
+    bytes[624 + 42] = 1;
+    const compressed = try Container.open(&bytes);
+    try std.testing.expectError(error.UnsupportedFormat, compressed.faceBytes(0));
+    try std.testing.expectEqualSlices(u8, bytes[348..624], try compressed.faceBytes(1));
+    bytes = fixture;
+    bytes[624 + 62] = 255;
+    try std.testing.expectError(error.InvalidFont, Container.open(&bytes));
+    bytes = fixture;
+    testing_dfont.write(u32, &bytes, 624 + 30, 0x4e464e54); // NFNT without SFNT faces.
+    try std.testing.expectError(error.UnsupportedFormat, Container.open(&bytes));
+}
+
+/// Checks the fixed header and disjoint data/map extents without visiting resources. A successful
+/// result does not admit type/reference lists or identify the payload format; call Container.open
+/// afterward. A failed check does not prove that the same bytes are a different font format.
+pub fn hasHeader(bytes: []const u8) bool {
+    _ = readHeader(bytes) catch return false;
+    return true;
 }
 
 test "DFONT header preflight leaves reference admission to open" {
@@ -234,55 +248,46 @@ test "DFONT admits relocated data whose offset equals a SFNT signature" {
     }
 }
 
-test "DFONT rejects truncated aliased compressed and invalid resource records" {
-    const fixture = testing_dfont.container();
-    for ([_]usize{ 0, 15, 16, 63, 64, 623, 624, 653, 719 }) |end| {
-        try std.testing.expectError(error.InvalidFont, Container.open(fixture[0..end]));
-    }
-    for ([_]struct { offset: usize, value: u32 }{
-        // Map aliases resource data.
-        .{ .offset = 0, .value = 0xffffffff },            .{ .offset = 4, .value = 65 },
-        // Neither zero nor copied map header. Resource payload length.
-        .{ .offset = 8, .value = 0xffffffff },            .{ .offset = 12, .value = 29 },
-        .{ .offset = 624, .value = 1 },                   .{ .offset = 64, .value = 0xffffffff },
-        .{ .offset = 624 + 38 + 4, .value = 0x00ffffff },
-    }) |case| {
-        var bytes = fixture;
-        testing_dfont.write(u32, &bytes, case.offset, case.value);
-        try std.testing.expectError(error.InvalidFont, Container.open(&bytes));
-    }
-    for ([_]struct { offset: usize, value: u16 }{
-        // References alias type entries.
-        .{
-            .offset = 624 + 24,
-            .value = 27,
-        },
-        .{ .offset = 624 + 26, .value = 97 },
-        .{ .offset = 624 + 36, .value = 0 },
-        // Named resource beyond map. Unselected directory is truncated.
-        .{
-            .offset = 624 + 36,
-            .value = 90,
-        },
-        .{ .offset = 624 + 40, .value = 96 },
-        .{ .offset = 348 + 4, .value = 0xffff },
-    }) |case| {
-        var bytes = fixture;
-        testing_dfont.write(u16, &bytes, case.offset, case.value);
-        try std.testing.expectError(error.InvalidFont, Container.open(&bytes));
-    }
+const Header = struct { data: []const u8, map: []const u8 };
 
-    var bytes = fixture;
-    bytes[624 + 42] = 1;
-    const compressed = try Container.open(&bytes);
-    try std.testing.expectError(error.UnsupportedFormat, compressed.faceBytes(0));
-    try std.testing.expectEqualSlices(u8, bytes[348..624], try compressed.faceBytes(1));
-    bytes = fixture;
-    bytes[624 + 62] = 255;
-    try std.testing.expectError(error.InvalidFont, Container.open(&bytes));
-    bytes = fixture;
-    testing_dfont.write(u32, &bytes, 624 + 30, 0x4e464e54); // NFNT without SFNT faces.
-    try std.testing.expectError(error.UnsupportedFormat, Container.open(&bytes));
+fn readHeader(bytes: []const u8) Error!Header {
+    const data_offset = try binary.read(u32, bytes, 0);
+    const map_offset = try binary.read(u32, bytes, 4);
+    const data_length = try binary.read(u32, bytes, 8);
+    const map_length = try binary.read(u32, bytes, 12);
+    if (data_offset < 16 or map_offset < 16 or map_length < 30) return error.InvalidFont;
+    const data = try slice(bytes, data_offset, data_length);
+    const map = try slice(bytes, map_offset, map_length);
+    binary.admitDisjoint(data, map) catch return error.InvalidFont;
+    const zero_header = std.mem.allEqual(u8, map[0..16], 0);
+    const copied_header = std.mem.eql(u8, map[0..16], bytes[0..16]);
+    if (!zero_header and !copied_header) return error.InvalidFont;
+    return .{ .data = data, .map = map };
+}
+
+fn slice(bytes: []const u8, offset: u32, length: u32) Error![]const u8 {
+    const start = std.math.cast(usize, offset) orelse return error.InvalidFont;
+    const size = std.math.cast(usize, length) orelse return error.InvalidFont;
+    const end = try binary.arrayOffset(start, size, 1);
+    if (end > bytes.len) return error.InvalidFont;
+    return bytes[start..end];
+}
+
+fn count(minus_one: u16) usize {
+    // Resource lists store count minus one; all ones is the sentinel for an empty list.
+    return if (minus_one == 0xffff) 0 else @as(usize, minus_one) + 1;
+}
+
+fn resource(data: []const u8, reference: []const u8) Error![]const u8 {
+    // The high byte contains resource attributes; only the low 24 bits locate the data record.
+    const offset = (try binary.read(u32, reference, 4)) & 0x00ffffff;
+    const length = try binary.read(u32, data, offset);
+    const start = std.math.add(u32, offset, 4) catch return error.InvalidFont;
+    return slice(data, start, length);
+}
+
+test {
+    _ = Container;
 }
 
 // Independent fixed SFNT/resource-map fields. These fixtures do not use the reader to frame bytes.

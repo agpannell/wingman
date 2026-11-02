@@ -3,6 +3,7 @@ const std = @import("std");
 const sfnt = @import("wingman").sfnt;
 
 pub fn main(init: std.process.Init) !void {
+    // The collection, directories and tables all borrow this immutable storage.
     const bytes = sampleCollection();
     const collection = try sfnt.Collection.open(&bytes);
     const first = try collection.face(0);
@@ -14,8 +15,11 @@ pub fn main(init: std.process.Init) !void {
     if (!first_table.checksumMatches() or !second_table.checksumMatches())
         return error.WrongChecksum;
     if (try first.find("name".*) != null or first.table(1) != null) return error.UnexpectedTable;
+    // A collection table offset is measured from the complete collection, even when opening a
+    // directory directly at a nonzero offset.
     const direct = try sfnt.Directory.openAt(&bytes, second.offset);
-    if (direct.table(0).?.offset != 96) return error.RebasedTable;
+    const direct_table = direct.table(0) orelse return error.MissingTable;
+    if (direct_table.offset != 96) return error.RebasedTable;
 
     var buffer: [1024]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);

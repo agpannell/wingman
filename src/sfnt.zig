@@ -59,6 +59,8 @@ pub const Table = struct {
     /// Contents remain opaque; a short head payload is not admitted as a usable font header.
     pub fn computedChecksum(self: Table) u32 {
         if (!std.mem.eql(u8, &self.tag, "head")) return checksumWords(self.data);
+        // The adjustment is the four-byte checksum word at logical offset 8. Excluding it leaves
+        // the borrowed bytes intact; a short opaque head may end inside that word.
         const adjustment_start = @min(8, self.data.len);
         const adjustment_end = @min(12, self.data.len);
         const prefix = self.data[0..adjustment_start];
@@ -72,6 +74,29 @@ pub const Table = struct {
         return self.checksum == self.computedChecksum();
     }
 };
+
+test "SFNT checksums use big-endian padded words and exclude only head adjustment" {
+    const bytes = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+    try std.testing.expectEqual(0x1c121518, checksum(&bytes));
+    const head: Table = .{ .tag = "head".*, .checksum = 0x13080a0c, .offset = 0, .data = &bytes };
+    try std.testing.expectEqual(0x13080a0c, head.computedChecksum());
+    try std.testing.expect(head.checksumMatches());
+    try std.testing.expectEqual(0, checksum(&.{}));
+    try std.testing.expectEqual(0x01020300, checksum(&.{ 1, 2, 3 }));
+    try std.testing.expectEqual(0xfffffffe, checksum(&.{ 255, 255, 255, 255, 255, 255, 255, 255 }));
+    // Include payloads that end within the adjustment word, not just complete head tables.
+    for (0..bytes.len) |length| {
+        const short: Table = .{
+            .tag = "head".*,
+            .checksum = 0,
+            .offset = 0,
+            .data = bytes[0..length],
+        };
+        var cleared = bytes;
+        @memset(cleared[8..12], 0);
+        try std.testing.expectEqual(checksum(cleared[0..length]), short.computedChecksum());
+    }
+}
 
 /// Range-admitted directory borrowing complete source bytes. Construct with open/openAt and retain
 /// the returned fields unchanged. Table interpretation, tag syntax, padding/alignment requirements
@@ -134,6 +159,8 @@ pub const Directory = struct {
         var ordered_records = true;
         var previous_tag: u32 = 0;
 
+        // Inspect the actual tag order because the stored search accelerators are not trusted.
+        // Admit every payload range here so indexed access can borrow it without rescanning.
         for (0..table_count) |index| {
             const record = records[index * record_size ..][0..record_size];
             const record_tag = std.mem.readInt(u32, record[0..4], .big);
@@ -188,6 +215,8 @@ pub const Directory = struct {
             }
 
             if (low == self.table_count or self.tagAt(low) != wanted) return null;
+            // Equal tags are adjacent in an ordered directory, so the next record settles
+            // ambiguity.
             const duplicate = low + 1 < self.table_count and self.tagAt(low + 1) == wanted;
             if (duplicate) return error.AmbiguousTag;
             return self.table(low);
@@ -206,6 +235,115 @@ pub const Directory = struct {
         return std.mem.readInt(u32, self.records[index * record_size ..][0..4], .big);
     }
 };
+
+test "SFNT directories borrow opaque unaligned tables without requiring font semantics" {
+    const source = testing_sfnt.twoTables();
+    const original = source;
+    const directory = try Directory.open(&source);
+    try std.testing.expect(directory.ordered);
+    // Both records borrow the same unaligned payload instead of copying it.
+    const first = directory.table(0).?;
+    try std.testing.expectEqualStrings("DATA", &first.tag);
+    try std.testing.expectEqual(49, first.offset);
+    try std.testing.expectEqual(@intFromPtr(&source) + 49, @intFromPtr(first.data.ptr));
+    try std.testing.expectEqual(null, directory.table(2));
+    try std.testing.expectEqual(null, directory.table(std.math.maxInt(usize)));
+    const shared = directory.table(1).?;
+    try std.testing.expectEqual(first.data.ptr, shared.data.ptr);
+    try std.testing.expectEqualSlices(u8, &original, &source);
+}
+
+test "SFNT signature and table range admission handles every truncation and zero tables" {
+    const source = testing_sfnt.twoTables();
+    for (0..52) |length| {
+        try std.testing.expectError(error.InvalidFont, Directory.open(source[0..length]));
+    }
+    for ([_]Flavor{ .truetype, .apple_truetype, .opentype_cff, .apple_type1 }) |flavor| {
+        var empty: [12]u8 = @splat(255);
+        testing_sfnt.write(u32, &empty, 0, @backingInt(flavor));
+        testing_sfnt.write(u16, &empty, 4, 0);
+        const directory = try Directory.open(&empty);
+        try std.testing.expectEqual(flavor, directory.flavor);
+        try std.testing.expectEqual(null, try directory.find("head".*));
+    }
+    var invalid = source;
+    testing_sfnt.write(u32, &invalid, 0, 0);
+    try std.testing.expectError(error.UnsupportedFormat, Directory.open(&invalid));
+    invalid = source;
+    testing_sfnt.write(u32, &invalid, 20, 0xffffffff);
+    try std.testing.expectError(error.InvalidFont, Directory.open(&invalid));
+    invalid = source;
+    testing_sfnt.write(u32, &invalid, 24, 0xffffffff);
+    try std.testing.expectError(error.InvalidFont, Directory.open(&invalid));
+    try std.testing.expectError(
+        error.InvalidFont,
+        Directory.openAt(&source, std.math.maxInt(usize)),
+    );
+}
+
+test "SFNT lookup detects duplicate tags in ordered and unordered directories" {
+    var source = testing_sfnt.twoTables();
+    @memcpy(source[28..32], "DATA");
+    const ordered = try Directory.open(&source);
+    try std.testing.expect(ordered.ordered);
+    try std.testing.expectError(error.AmbiguousTag, ordered.find("DATA".*));
+    try std.testing.expectEqual(2, ordered.table_count);
+
+    @memcpy(source[12..16], "ZZZZ");
+    @memcpy(source[28..32], "AAAA");
+    const unordered = try Directory.open(&source);
+    try std.testing.expect(!unordered.ordered);
+    try std.testing.expectEqualStrings("AAAA", &(try unordered.find("AAAA".*)).?.tag);
+    try std.testing.expectEqual(null, try unordered.find("ZZZY".*));
+
+    // Unordered duplicates can be separated by another tag and still make lookup ambiguous.
+    var three: [80]u8 = @splat(0);
+    testing_sfnt.write(u32, &three, 0, 0x00010000);
+    testing_sfnt.write(u16, &three, 4, 3);
+    inline for (.{ "DATA", "AAAA", "DATA" }, 0..) |tag, index| {
+        @memcpy(three[12 + index * 16 ..][0..4], tag);
+        testing_sfnt.write(u32, &three, 20 + index * 16, three.len);
+    }
+    const ambiguous = try Directory.open(&three);
+    try std.testing.expect(!ambiguous.ordered);
+    try std.testing.expectError(error.AmbiguousTag, ambiguous.find("DATA".*));
+    try std.testing.expectEqual(0, (try ambiguous.find("AAAA".*)).?.data.len);
+}
+
+test "SFNT raw tags and empty end extents remain enumerable" {
+    var source = testing_sfnt.twoTables();
+    @memset(source[12..16], 0);
+    testing_sfnt.write(u32, &source, 20, source.len);
+    testing_sfnt.write(u32, &source, 24, 0);
+    const directory = try Directory.open(&source);
+    const empty = (try directory.find(.{ 0, 0, 0, 0 })).?;
+    try std.testing.expectEqual(0, empty.data.len);
+    try std.testing.expectEqual(@intFromPtr(&source) + source.len, @intFromPtr(empty.data.ptr));
+}
+
+test "SFNT extracts opaque CFF table bytes without interpreting glyphs" {
+    // Independently framed single-glyph CFF1: move (0, 0), line (+10, 0), endchar.
+    const cff_bytes = [_]u8{
+        1, 0, 4,   1,   0,  1,   1,   1, 2,  'A', 0, 1, 1, 1, 5, 28, 0, 23, 17, 0, 0, 0, 0, 0, 1, 1,
+        1, 8, 139, 139, 21, 149, 139, 5, 14,
+    };
+    var source: [80]u8 = @splat(0);
+    testing_sfnt.write(u32, &source, 0, 0x4f54544f);
+    testing_sfnt.write(u16, &source, 4, 1);
+    @memcpy(source[12..16], "CFF ");
+    testing_sfnt.write(u32, &source, 20, 40);
+    testing_sfnt.write(u32, &source, 24, cff_bytes.len);
+    @memcpy(source[40..][0..cff_bytes.len], &cff_bytes);
+    const directory = try Directory.open(&source);
+    const table = (try directory.find("CFF ".*)).?;
+    try std.testing.expectEqual(.opentype_cff, directory.flavor);
+    try std.testing.expectEqualSlices(u8, &cff_bytes, table.data);
+    try std.testing.expectEqual(@intFromPtr(&source) + 40, @intFromPtr(table.data.ptr));
+    try std.testing.expectEqual(40, table.offset);
+    try std.testing.expectEqualSlices(u8, "CFF ", &table.tag);
+    try std.testing.expectEqual(0, table.checksum);
+    try std.testing.expectEqual(null, try directory.find("CFF2".*));
+}
 
 /// Borrowed TTC/OTC framing. Opening checks every directory extent and optional digital-signature
 /// range; selecting a member admits its table ranges. Unsupported or malformed selected payloads do
@@ -256,6 +394,8 @@ pub const Collection = struct {
             break :blk try tableSlice(source, signature_offset, signature_length);
         };
         const face_offsets = source[header_size..face_offsets_end];
+        // Check directory framing for every face now. An unsupported flavor or malformed table in a
+        // sibling is checked only if that face is selected.
         for (0..face_count_usize) |index| {
             const directory_offset = std.mem.readInt(u32, face_offsets[index * 4 ..][0..4], .big);
             const directory_position = std.math.cast(
@@ -322,183 +462,17 @@ pub const Collection = struct {
     }
 };
 
-/// Adds big-endian words with unsigned wrap, virtually padding a final partial word with zero. Use
-/// Table.computedChecksum for the head-table adjustment exception. This scans bytes without
-/// allocation, mutation, alignment assumptions or validation of their contents.
-pub fn checksum(source: []const u8) u32 {
-    return checksumWords(source);
-}
-
-test checksum {
-    try std.testing.expectEqual(0x06020304, checksum(&.{ 1, 2, 3, 4, 5 }));
-    try std.testing.expectEqual(0, checksum(&.{}));
-}
-
-fn checksumWords(source: []const u8) u32 {
-    var word_sum: u32 = 0;
-    var word_offset: usize = 0;
-    while (source.len - word_offset >= 4) : (word_offset += 4) {
-        const word = std.mem.readInt(u32, source[word_offset..][0..4], .big);
-        word_sum +%= word;
-    }
-
-    var partial_word: u32 = 0;
-    for (source[word_offset..]) |byte| partial_word = (partial_word << 8) | byte;
-    if (word_offset != source.len) {
-        const partial_bytes = source.len - word_offset;
-        const zero_padding_bytes = 4 - partial_bytes;
-        const padding_bits: u5 = @intCast(zero_padding_bytes * 8);
-        word_sum +%= partial_word << padding_bits;
-    }
-    return word_sum;
-}
-
-fn directoryEnd(source: []const u8, offset: usize) Error!usize {
-    const header_end = try binary.arrayOffset(offset, 1, header_size);
-    if (header_end > source.len) return error.InvalidFont;
-    const table_count = try binary.read(u16, source, offset + 4);
-    const records_end = try binary.arrayOffset(header_end, table_count, record_size);
-    if (records_end > source.len) return error.InvalidFont;
-    return records_end;
-}
-
-fn tableSlice(source: []const u8, offset: u32, length: u32) Error![]const u8 {
-    const table_start = std.math.cast(usize, offset) orelse return error.InvalidFont;
-    const table_bytes = std.math.cast(usize, length) orelse return error.InvalidFont;
-    const table_end = try binary.arrayOffset(table_start, table_bytes, 1);
-    if (table_end > source.len) return error.InvalidFont;
-    return source[table_start..table_end];
-}
-
-test "SFNT checksums use big-endian padded words and exclude only head adjustment" {
-    const bytes = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
-    try std.testing.expectEqual(0x1c121518, checksum(&bytes));
-    const head: Table = .{ .tag = "head".*, .checksum = 0x13080a0c, .offset = 0, .data = &bytes };
-    try std.testing.expectEqual(0x13080a0c, head.computedChecksum());
-    try std.testing.expect(head.checksumMatches());
-    try std.testing.expectEqual(0, checksum(&.{}));
-    try std.testing.expectEqual(0x01020300, checksum(&.{ 1, 2, 3 }));
-    try std.testing.expectEqual(0xfffffffe, checksum(&.{ 255, 255, 255, 255, 255, 255, 255, 255 }));
-    for (0..bytes.len) |length| {
-        const short: Table = .{
-            .tag = "head".*,
-            .checksum = 0,
-            .offset = 0,
-            .data = bytes[0..length],
-        };
-        var cleared = bytes;
-        @memset(cleared[8..12], 0);
-        try std.testing.expectEqual(checksum(cleared[0..length]), short.computedChecksum());
-    }
-}
-
-test "face directories and absolute ranges admit empty extents and reject truncation" {
-    var bytes: [28]u8 = @splat(0);
-    try std.testing.expectEqual(12, try directoryEnd(&bytes, 0));
-    testing_sfnt.write(u16, &bytes, 4, 1);
-    try std.testing.expectEqual(28, try directoryEnd(&bytes, 0));
-    try std.testing.expectError(error.InvalidFont, directoryEnd(bytes[0..27], 0));
-    try std.testing.expectError(error.InvalidFont, directoryEnd(&bytes, 17));
-    try std.testing.expectError(error.InvalidFont, directoryEnd(&bytes, std.math.maxInt(usize)));
-    try std.testing.expectEqualSlices(u8, bytes[8..12], try tableSlice(&bytes, 8, 4));
-    try std.testing.expectEqual(0, (try tableSlice(&bytes, 28, 0)).len);
-    try std.testing.expectError(error.InvalidFont, tableSlice(&bytes, 28, 1));
-    try std.testing.expectError(error.InvalidFont, tableSlice(&bytes, 0xffffffff, 1));
-}
-
-test "SFNT directories borrow opaque unaligned tables without requiring font semantics" {
-    const source = testing_sfnt.twoTables();
-    const original = source;
-    const directory = try Directory.open(&source);
-    try std.testing.expect(directory.ordered);
-    const first = directory.table(0).?;
-    try std.testing.expectEqualStrings("DATA", &first.tag);
-    try std.testing.expectEqual(49, first.offset);
-    try std.testing.expectEqual(@intFromPtr(&source) + 49, @intFromPtr(first.data.ptr));
-    try std.testing.expectEqual(null, directory.table(2));
-    try std.testing.expectEqual(null, directory.table(std.math.maxInt(usize)));
-    const shared = directory.table(1).?;
-    try std.testing.expectEqual(first.data.ptr, shared.data.ptr);
-    try std.testing.expectEqualSlices(u8, &original, &source);
-}
-
-test "SFNT signature and table range admission handles every truncation and zero tables" {
-    const source = testing_sfnt.twoTables();
-    for (0..52) |length| {
-        try std.testing.expectError(error.InvalidFont, Directory.open(source[0..length]));
-    }
-    for ([_]Flavor{ .truetype, .apple_truetype, .opentype_cff, .apple_type1 }) |flavor| {
-        var empty: [12]u8 = @splat(255);
-        testing_sfnt.write(u32, &empty, 0, @backingInt(flavor));
-        testing_sfnt.write(u16, &empty, 4, 0);
-        const directory = try Directory.open(&empty);
-        try std.testing.expectEqual(flavor, directory.flavor);
-        try std.testing.expectEqual(null, try directory.find("head".*));
-    }
-    var invalid = source;
-    testing_sfnt.write(u32, &invalid, 0, 0);
-    try std.testing.expectError(error.UnsupportedFormat, Directory.open(&invalid));
-    invalid = source;
-    testing_sfnt.write(u32, &invalid, 20, 0xffffffff);
-    try std.testing.expectError(error.InvalidFont, Directory.open(&invalid));
-    invalid = source;
-    testing_sfnt.write(u32, &invalid, 24, 0xffffffff);
-    try std.testing.expectError(error.InvalidFont, Directory.open(&invalid));
-    try std.testing.expectError(
-        error.InvalidFont,
-        Directory.openAt(&source, std.math.maxInt(usize)),
-    );
-}
-
-test "SFNT lookup detects duplicate tags in ordered and unordered directories" {
-    var source = testing_sfnt.twoTables();
-    @memcpy(source[28..32], "DATA");
-    const ordered = try Directory.open(&source);
-    try std.testing.expect(ordered.ordered);
-    try std.testing.expectError(error.AmbiguousTag, ordered.find("DATA".*));
-    try std.testing.expectEqual(2, ordered.table_count);
-
-    @memcpy(source[12..16], "ZZZZ");
-    @memcpy(source[28..32], "AAAA");
-    const unordered = try Directory.open(&source);
-    try std.testing.expect(!unordered.ordered);
-    try std.testing.expectEqualStrings("AAAA", &(try unordered.find("AAAA".*)).?.tag);
-    try std.testing.expectEqual(null, try unordered.find("ZZZY".*));
-
-    var three: [80]u8 = @splat(0);
-    testing_sfnt.write(u32, &three, 0, 0x00010000);
-    testing_sfnt.write(u16, &three, 4, 3);
-    inline for (.{ "DATA", "AAAA", "DATA" }, 0..) |tag, index| {
-        @memcpy(three[12 + index * 16 ..][0..4], tag);
-        testing_sfnt.write(u32, &three, 20 + index * 16, three.len);
-    }
-    const ambiguous = try Directory.open(&three);
-    try std.testing.expect(!ambiguous.ordered);
-    try std.testing.expectError(error.AmbiguousTag, ambiguous.find("DATA".*));
-    try std.testing.expectEqual(0, (try ambiguous.find("AAAA".*)).?.data.len);
-}
-
-test "SFNT raw tags and empty end extents remain enumerable" {
-    var source = testing_sfnt.twoTables();
-    @memset(source[12..16], 0);
-    testing_sfnt.write(u32, &source, 20, source.len);
-    testing_sfnt.write(u32, &source, 24, 0);
-    const directory = try Directory.open(&source);
-    const empty = (try directory.find(.{ 0, 0, 0, 0 })).?;
-    try std.testing.expectEqual(0, empty.data.len);
-    try std.testing.expectEqual(@intFromPtr(&source) + source.len, @intFromPtr(empty.data.ptr));
-}
-
 test "SFNT collections select absolute shared table ranges and retain unsupported siblings" {
     var source = testing_sfnt.collection();
     const collection = try Collection.open(&source);
     try std.testing.expectEqual(.v2, collection.version);
     try std.testing.expectEqual(null, collection.signature);
-    try std.testing.expectEqual(36, (try collection.face(0)).offset);
-    try std.testing.expectEqual(64, (try collection.face(1)).offset);
-    try std.testing.expectEqualSlices(u8, &.{
-        1, 2, 3,
-    }, (try (try collection.face(0)).find("DATA".*)).?.data);
+    const first_face = try collection.face(0);
+    const second_face = try collection.face(1);
+    try std.testing.expectEqual(36, first_face.offset);
+    try std.testing.expectEqual(64, second_face.offset);
+    const data = (try first_face.find("DATA".*)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, data.data);
     try std.testing.expectError(error.InvalidFace, collection.face(2));
     try std.testing.expectError(error.InvalidFace, collection.face(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnsupportedFormat, Directory.open(&source));
@@ -507,6 +481,7 @@ test "SFNT collections select absolute shared table ranges and retain unsupporte
         Collection.open(&testing_sfnt.twoTables()),
     );
 
+    // Valid framing admits both directories before either sibling's flavor or tables are selected.
     testing_sfnt.write(u32, &source, 64, 0xabcdef01);
     const mixed = try Collection.open(&source);
     try std.testing.expectEqual(.truetype, (try mixed.face(0)).flavor);
@@ -557,28 +532,66 @@ test "SFNT collection framing checks offsets versions signatures and every trunc
     try std.testing.expectEqual(.v1, (try Collection.open(&version_one)).version);
 }
 
-test "SFNT extracts opaque CFF table bytes without interpreting glyphs" {
-    // Independently framed single-glyph CFF1: move (0, 0), line (+10, 0), endchar.
-    const cff_bytes = [_]u8{
-        1, 0, 4,   1,   0,  1,   1,   1, 2,  'A', 0, 1, 1, 1, 5, 28, 0, 23, 17, 0, 0, 0, 0, 0, 1, 1,
-        1, 8, 139, 139, 21, 149, 139, 5, 14,
-    };
-    var source: [80]u8 = @splat(0);
-    testing_sfnt.write(u32, &source, 0, 0x4f54544f);
-    testing_sfnt.write(u16, &source, 4, 1);
-    @memcpy(source[12..16], "CFF ");
-    testing_sfnt.write(u32, &source, 20, 40);
-    testing_sfnt.write(u32, &source, 24, cff_bytes.len);
-    @memcpy(source[40..][0..cff_bytes.len], &cff_bytes);
-    const directory = try Directory.open(&source);
-    const table = (try directory.find("CFF ".*)).?;
-    try std.testing.expectEqual(.opentype_cff, directory.flavor);
-    try std.testing.expectEqualSlices(u8, &cff_bytes, table.data);
-    try std.testing.expectEqual(@intFromPtr(&source) + 40, @intFromPtr(table.data.ptr));
-    try std.testing.expectEqual(40, table.offset);
-    try std.testing.expectEqualSlices(u8, "CFF ", &table.tag);
-    try std.testing.expectEqual(0, table.checksum);
-    try std.testing.expectEqual(null, try directory.find("CFF2".*));
+/// Adds big-endian words with unsigned wrap, virtually padding a final partial word with zero. Use
+/// Table.computedChecksum for the head-table adjustment exception. This scans bytes without
+/// allocation, mutation, alignment assumptions or validation of their contents.
+pub fn checksum(source: []const u8) u32 {
+    return checksumWords(source);
+}
+
+test checksum {
+    try std.testing.expectEqual(0x06020304, checksum(&.{ 1, 2, 3, 4, 5 }));
+    try std.testing.expectEqual(0, checksum(&.{}));
+}
+
+fn checksumWords(source: []const u8) u32 {
+    var word_sum: u32 = 0;
+    var word_offset: usize = 0;
+    while (source.len - word_offset >= 4) : (word_offset += 4) {
+        const word = std.mem.readInt(u32, source[word_offset..][0..4], .big);
+        word_sum +%= word;
+    }
+
+    var partial_word: u32 = 0;
+    for (source[word_offset..]) |byte| partial_word = (partial_word << 8) | byte;
+    if (word_offset != source.len) {
+        const partial_bytes = source.len - word_offset;
+        const zero_padding_bytes = 4 - partial_bytes;
+        const padding_bits: u5 = @intCast(zero_padding_bytes * 8);
+        word_sum +%= partial_word << padding_bits;
+    }
+    return word_sum;
+}
+
+fn directoryEnd(source: []const u8, offset: usize) Error!usize {
+    const header_end = try binary.arrayOffset(offset, 1, header_size);
+    if (header_end > source.len) return error.InvalidFont;
+    const table_count = try binary.read(u16, source, offset + 4);
+    const records_end = try binary.arrayOffset(header_end, table_count, record_size);
+    if (records_end > source.len) return error.InvalidFont;
+    return records_end;
+}
+
+fn tableSlice(source: []const u8, offset: u32, length: u32) Error![]const u8 {
+    const table_start = std.math.cast(usize, offset) orelse return error.InvalidFont;
+    const table_bytes = std.math.cast(usize, length) orelse return error.InvalidFont;
+    const table_end = try binary.arrayOffset(table_start, table_bytes, 1);
+    if (table_end > source.len) return error.InvalidFont;
+    return source[table_start..table_end];
+}
+
+test "face directories and absolute ranges admit empty extents and reject truncation" {
+    var bytes: [28]u8 = @splat(0);
+    try std.testing.expectEqual(12, try directoryEnd(&bytes, 0));
+    testing_sfnt.write(u16, &bytes, 4, 1);
+    try std.testing.expectEqual(28, try directoryEnd(&bytes, 0));
+    try std.testing.expectError(error.InvalidFont, directoryEnd(bytes[0..27], 0));
+    try std.testing.expectError(error.InvalidFont, directoryEnd(&bytes, 17));
+    try std.testing.expectError(error.InvalidFont, directoryEnd(&bytes, std.math.maxInt(usize)));
+    try std.testing.expectEqualSlices(u8, bytes[8..12], try tableSlice(&bytes, 8, 4));
+    try std.testing.expectEqual(0, (try tableSlice(&bytes, 28, 0)).len);
+    try std.testing.expectError(error.InvalidFont, tableSlice(&bytes, 28, 1));
+    try std.testing.expectError(error.InvalidFont, tableSlice(&bytes, 0xffffffff, 1));
 }
 
 const testing_sfnt = struct {
