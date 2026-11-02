@@ -84,9 +84,9 @@ pub fn build(b: *std.Build) void {
             .description = "Write and inspect a RIFF container with nested typed chunks",
         },
         .{
-            .step = "pcm-example",
-            .source = "examples/pcm.zig",
-            .executable = "pcm-convert",
+            .step = "lpcm-example",
+            .source = "examples/lpcm.zig",
+            .executable = "lpcm-convert",
             .description = "Encode PCM16 and inspect normalized sample quantization",
         },
         .{

@@ -12,7 +12,7 @@ samples are interleaved in frame order.
 
 Use [Zig 0.17.0 and the package setup](../README.md#use-it-in-a-project). From a checkout, run
 `zig build adpcm-example` to decode both layouts, validate prefix output and encode a partial block.
-[The complete example](../examples/adpcm.zig) also composes with the PCM library.
+[The complete example](../examples/adpcm.zig) also composes with the LPCM library.
 
 ## Describe the blocks
 
@@ -95,7 +95,7 @@ test "decode a raw Microsoft block" {
 }
 ```
 
-The [PCM library](pcm.md#encode-and-write-normalized-samples) can write these samples as little-endian PCM16.
+The [LPCM library](lpcm.md#encode-and-write-normalized-samples) can write these samples as little-endian PCM16.
 They already lie on its exact PCM16 grid, so that composition adds no quantization change.
 
 ## Prefix output validates the complete input

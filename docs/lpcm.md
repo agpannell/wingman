@@ -1,10 +1,11 @@
-# PCM sample conversion
+# LPCM sample conversion
 
-Pulse-code modulation (PCM) stores audio as integer or floating-point channel samples.
-`wingman.pcm` converts between encoded bytes and caller-owned samples without parsing a container,
-assigning a sample rate or allocating memory. Use it when a file reader or protocol has already
-identified the sample representation. For a WAVE or RF64 file, [`wingman.wav`](wav.md) handles
-container framing and chooses the appropriate codec.
+Uncompressed audio stores each channel's amplitude as a numeric sample. `wingman.lpcm` converts
+integer PCM and finite IEEE floating-point sample representations between encoded bytes and
+caller-owned samples, without parsing a container, assigning a sample rate or allocating memory.
+Use it when a file reader or protocol has already identified the representation. In WAVE, integer
+PCM and IEEE float use distinct format tags. For a WAVE or RF64 file, [`wingman.wav`](wav.md)
+handles container framing and chooses the appropriate codec.
 
 A sample is one channel value. A stereo frame contains two samples. Conversion preserves their
 order; the caller supplies the channel layout and controls any resampling, gain, dither or playback.
@@ -40,14 +41,14 @@ its executing worker's environment, which can differ from the calling thread's.
 
 ```zig
 const std = @import("std");
-const pcm = @import("wingman").pcm;
+const lpcm = @import("wingman").lpcm;
 
 test "decode big-endian signed PCM24" {
-    const format: pcm.Format = .{ .encoding = .signed24, .endian = .big };
+    const format: lpcm.Format = .{ .encoding = .signed24, .endian = .big };
     const bytes = [_]u8{ 0x80, 0, 0, 0, 0, 0, 0x7f, 0xff, 0xff };
-    try std.testing.expectEqual(3, try pcm.sampleCount(bytes.len, format));
+    try std.testing.expectEqual(3, try lpcm.sampleCount(bytes.len, format));
     var storage: [4]f32 = @splat(42);
-    const samples = try pcm.decodeInto(&bytes, &storage, format);
+    const samples = try lpcm.decodeInto(&bytes, &storage, format);
     try std.testing.expectEqualSlices(f32, &.{ -1, 0, 8388607.0 / 8388608.0 }, samples);
     try std.testing.expectEqual(42, storage[3]);
 }
@@ -69,31 +70,31 @@ implicit dither or gain. Float output accepts finite values outside that range; 
 
 ```zig
 const std = @import("std");
-const pcm = @import("wingman").pcm;
+const lpcm = @import("wingman").lpcm;
 
 test "write normalized PCM16" {
-    const format: pcm.Format = .{ .encoding = .signed16 };
+    const format: lpcm.Format = .{ .encoding = .signed16 };
     const samples = [_]f32{ -1, 0.5, 1 };
     var bytes: [8]u8 = @splat(0xa7);
-    const encoded = try pcm.encodeInto(&samples, &bytes, format);
+    const encoded = try lpcm.encodeInto(&samples, &bytes, format);
     try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 64, 255, 127 }, encoded);
     try std.testing.expectEqualSlices(u8, &.{ 0xa7, 0xa7 }, bytes[6..]);
     var writer_bytes: [6]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_bytes);
-    try pcm.writeAll(&samples, &writer, format);
+    try lpcm.writeAll(&samples, &writer, format);
     try std.testing.expectEqualSlices(u8, encoded, writer.buffered());
 }
 ```
 
 ## Exact integer and binary64 samples
 
-`pcm.int32` converts integer wire formats to and from left-aligned signed `i32` samples. A sample
+`lpcm.int32` converts integer wire formats to and from left-aligned signed `i32` samples. A sample
 represents its integer value divided by 2^31; unsigned midpoint bias is removed. Encoding rejects
 `PrecisionLoss` if the requested representation would discard nonzero low sample bits. It does not
 accept float wire formats. Decoding ignores low wire padding, so original nonzero padding cannot be
 recovered from the sample values alone.
 
-`pcm.float64` converts through `f64` samples. All supported integer and finite binary32 inputs are
+`lpcm.float64` converts through `f64` samples. All supported integer and finite binary32 inputs are
 represented exactly; finite binary64 input retains its bits. Encoding to integer uses the same
 half-away rule as `f32` conversion. Binary32 output narrows nearest-even and rejects a result that
 would be nonfinite. Both namespaces offer `decodeInto`, `validate`, `encodeInto` and `writeAll`;
@@ -101,21 +102,21 @@ their encoding operations take `.{ .format = format }` options.
 
 ```zig
 const std = @import("std");
-const pcm = @import("wingman").pcm;
+const lpcm = @import("wingman").lpcm;
 
 test "rewrite unsigned PCM24 with exact integer samples" {
-    const source_format: pcm.Format = .{
+    const source_format: lpcm.Format = .{
         .encoding = .unsigned24,
         .valid_bits = 20,
         .endian = .big,
     };
     const source = [_]u8{ 0x80, 0, 0x0f, 0xff, 0xff, 0xff };
     var samples: [2]i32 = undefined;
-    const decoded = try pcm.int32.decodeInto(&source, &samples, source_format);
+    const decoded = try lpcm.int32.decodeInto(&source, &samples, source_format);
     try std.testing.expectEqualSlices(i32, &.{ 0, 0x7fff_f000 }, decoded);
 
     var storage: [6]u8 = undefined;
-    const canonical = try pcm.int32.encodeInto(decoded, &storage, .{ .format = source_format });
+    const canonical = try lpcm.int32.encodeInto(decoded, &storage, .{ .format = source_format });
     try std.testing.expectEqualSlices(u8, &.{ 0x80, 0, 0, 0xff, 0xff, 0xf0 }, canonical);
 }
 ```
@@ -124,12 +125,12 @@ For binary64 samples, select binary32 wire output when its precision is sufficie
 
 ```zig
 const std = @import("std");
-const pcm = @import("wingman").pcm;
+const lpcm = @import("wingman").lpcm;
 
 test "encode binary64 samples as binary32" {
     const samples = [_]f64{ 1.5, -0.0 };
     var bytes: [8]u8 = undefined;
-    const encoded = try pcm.float64.encodeInto(
+    const encoded = try lpcm.float64.encodeInto(
         &samples,
         &bytes,
         .{ .format = .{ .encoding = .float32 } },
@@ -149,7 +150,7 @@ unused destination capacity is permitted.
 `sampleCount` reports `InvalidFormat` for an unsupported format or precision and `InvalidData`
 for an incomplete sample. Decoders also report `DestinationTooSmall` or `Aliasing` before
 writing; the `f32` and `f64` decoders report `InvalidSamples` for invalid float content.
-`pcm.int32` rejects float wire formats as `InvalidFormat`.
+`lpcm.int32` rejects float wire formats as `InvalidFormat`.
 
 Encoding validation reports `InvalidFormat` or `SizeOverflow`; it also reports `InvalidSamples`
 for rejected `f32` or `f64` samples, or `PrecisionLoss` for an inexact `i32` sample. Buffer
@@ -160,6 +161,6 @@ Writer storage must be disjoint from input. A backend failure can leave a byte p
 sent, and the caller owns flushing. Returned slices borrow their destination; release an allocation
 using its original full slice. No operation retains the source, destination, writer or allocator.
 
-`pcm` does not parse containers, retain fragmented samples between calls, change channel layout,
+`lpcm` does not parse containers, retain fragmented samples between calls, change channel layout,
 resample, dither or play audio. Generate the API reference with `zig build docs` and run
-`zig build pcm-example` for a complete PCM conversion.
+`zig build lpcm-example` for a complete PCM conversion.

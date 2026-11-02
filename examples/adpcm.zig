@@ -9,7 +9,7 @@
 //! mono, so each frame contains one sample. Both codecs write into caller-owned storage.
 const std = @import("std");
 const adpcm = @import("wingman").adpcm;
-const pcm = @import("wingman").pcm;
+const lpcm = @import("wingman").lpcm;
 
 pub fn main(init: std.process.Init) !void {
     // Microsoft blocks use a coefficient pair selected by each block header. This pair is (256, 0)
@@ -66,8 +66,8 @@ pub fn main(init: std.process.Init) !void {
         // Decoding yields normalized f32 samples on the exact PCM16 grid. This optional conversion
         // demonstrates writing those samples as two little-endian bytes each.
         var pcm_storage: [18]u8 = undefined;
-        const pcm_format: pcm.Format = .{ .encoding = .signed16 };
-        const pcm_bytes = try pcm.encodeInto(decoded_samples, &pcm_storage, pcm_format);
+        const pcm_format: lpcm.Format = .{ .encoding = .signed16 };
+        const pcm_bytes = try lpcm.encodeInto(decoded_samples, &pcm_storage, pcm_format);
 
         for (case.expected, decoded_samples, 0..) |expected, sample, sample_index| {
             const normalized_expected = @as(f32, @floatFromInt(expected)) / 32768;

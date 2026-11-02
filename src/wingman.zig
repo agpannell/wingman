@@ -12,7 +12,7 @@
 //! 1952 members with CRC-32, optional metadata and concatenation.
 //!
 //! wav connects WAVE/RF64 containers to sample decoding and PCM16 RIFF writing. riff provides
-//! generic chunk framing. pcm, g711 and adpcm convert raw sample representations or complete codec
+//! generic chunk framing. lpcm, g711 and adpcm convert raw sample representations or complete codec
 //! blocks when the layout is already known; playback and resampling stay with callers.
 //!
 //! exif borrows classic TIFF attributes and thumbnail storage, including supported RGB/YCbCr
@@ -50,7 +50,7 @@ pub const gzip = @import("gzip.zig");
 pub const wav = @import("wav.zig");
 pub const riff = @import("riff.zig");
 
-pub const pcm = @import("pcm.zig");
+pub const lpcm = @import("lpcm.zig");
 pub const g711 = @import("g711.zig");
 pub const adpcm = @import("adpcm.zig");
 
@@ -82,7 +82,7 @@ test {
     _ = wav;
     _ = riff;
 
-    _ = pcm;
+    _ = lpcm;
     _ = g711;
     _ = adpcm;
 

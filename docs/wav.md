@@ -3,7 +3,7 @@
 WAVE stores audio samples and their rate, channel count and representation in a RIFF container.
 RF64 extends its size fields for larger files. `wingman.wav` connects these containers to Wingman's
 PCM, G.711 and ADPCM decoders, returning interleaved `f32` samples. It also writes complete
-mono/stereo PCM16 RIFF files. Use the raw [sample codecs](pcm.md) when another format or protocol
+mono/stereo PCM16 RIFF files. Use the raw [sample codecs](lpcm.md) when another format or protocol
 already provides the sample layout; use [RIFF](riff.md) for generic chunk framing.
 
 The API accepts a complete immutable byte slice. Reading that slice from a file or network, audio
@@ -90,7 +90,7 @@ before requesting a padded replacement.
 
 All normalized integer/companded/ADPCM samples use the raw codecs' PCM16 or precision-specific
 power-of-two scaling. Writing a decoded positive endpoint back to PCM16 does not stretch it to
-one. See [PCM](pcm.md), [G.711](g711.md) and [ADPCM](adpcm.md) for their numerical contracts.
+one. See [LPCM](lpcm.md), [G.711](g711.md) and [ADPCM](adpcm.md) for their numerical contracts.
 
 `Channels` is a non-exhaustive enum: use `@backingInt(channels)` for its count. `channel_mask` is
 copied metadata: null for ordinary formats, zero for unspecified assignments. Masks do not cause

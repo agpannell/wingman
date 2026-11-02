@@ -6,10 +6,10 @@
 //! storage.
 
 const std = @import("std");
-const pcm = @import("../pcm.zig");
+const lpcm = @import("../lpcm.zig");
 const memory = @import("../common/byte_ranges.zig");
 const testing = std.testing;
-const Format = pcm.Format;
+const Format = lpcm.Format;
 
 /// Invalid representation or extent, insufficient output, or overlapping used storage.
 pub const DecodeError = error{ InvalidFormat, InvalidData, DestinationTooSmall, Aliasing };
@@ -26,6 +26,7 @@ pub const EncodeOptions = struct { format: Format };
 /// Decodes complete integer containers into a borrowed i32 prefix. Low padding bits are ignored.
 /// Format, extent, capacity and used-prefix overlap failures occur before any output is written.
 pub fn decodeInto(source: []const u8, destination: []i32, format: Format) DecodeError![]i32 {
+    // All geometry and overlap checks precede writes; integer conversion has no later value error.
     const bits = try integerPrecision(format);
     const width = format.encoding.byteCount();
     if (source.len % width != 0) return error.InvalidData;
@@ -121,6 +122,7 @@ fn decodeWords(
 /// Checks format, output extent and every sample before writing. A sample is refused if the
 /// selected precision would discard any nonzero low bit. No input or allocator is retained.
 pub fn validate(source: []const i32, options: EncodeOptions) ValidateError!void {
+    // Exact conversion refuses any discarded meaningful bit rather than silently quantizing it.
     const bits = try integerPrecision(options.format);
     const width = options.format.encoding.byteCount();
     if (source.len > std.math.maxInt(usize) / width) return error.SizeOverflow;
@@ -139,7 +141,8 @@ test validate {
 }
 
 test "unsigned precision refusal precedes output and writer mutation" {
-    for ([_]pcm.Encoding{ .unsigned16, .unsigned24, .unsigned32 }) |encoding| {
+    // The pre-existing byte and untouched suffix show refusal before publishing more bytes.
+    for ([_]lpcm.Encoding{ .unsigned16, .unsigned24, .unsigned32 }) |encoding| {
         const options: EncodeOptions = .{ .format = .{ .encoding = encoding, .valid_bits = 7 } };
         var bytes: [4]u8 = @splat(0xa5);
         try testing.expectError(error.PrecisionLoss, encodeInto(&.{1}, &.{}, options));
@@ -211,6 +214,7 @@ test writeAll {
 }
 
 test "Writer exhaustion publishes only the encoded byte prefix" {
+    // A writer may stop between bytes of a sample; its prefix must still match the wire encoding.
     const source = [_]i32{ std.math.minInt(i32), 0, 0x7fff_ff00 };
     const expected = [_]u8{ 0, 0, 0x80, 0, 0, 0, 0xff, 0xff, 0x7f };
     for (0..expected.len + 1) |capacity| {
@@ -263,6 +267,7 @@ fn encodeSamples(source: []const i32, output: []u8, format: Format) void {
 }
 
 test "dirty padding is ignored on decode and cleared on encode" {
+    // Dirty wire padding must not enter the left-aligned sample or survive re-encoding.
     const format: Format = .{ .encoding = .signed24, .valid_bits = 20, .endian = .big };
     const source = [_]u8{ 0x80, 0, 0x0f, 0x7f, 0xff, 0xff };
     var samples: [2]i32 = undefined;

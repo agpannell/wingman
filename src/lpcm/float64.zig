@@ -6,22 +6,22 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const pcm = @import("../pcm.zig");
+const lpcm = @import("../lpcm.zig");
 const rounding = @import("round.zig");
 const sample_rounding = @import("../common/round.zig");
 const float = @import("../common/float.zig");
 const memory = @import("../common/byte_ranges.zig");
 const testing = std.testing;
-const Format = pcm.Format;
+const Format = lpcm.Format;
 
 /// Invalid representation or extent, insufficient or overlapping output, or invalid float input.
-pub const DecodeError = pcm.DecodeError;
+pub const DecodeError = lpcm.DecodeError;
 
 /// Invalid representation, unrepresentable extent, or invalid or unrepresentable samples.
-pub const ValidateError = pcm.ValidateError;
+pub const ValidateError = lpcm.ValidateError;
 
 /// Encoding also rejects insufficient or aliased output.
-pub const EncodeError = pcm.EncodeError;
+pub const EncodeError = lpcm.EncodeError;
 
 /// The wire representation used for encoding.
 pub const EncodeOptions = struct { format: Format };
@@ -31,6 +31,7 @@ pub const EncodeOptions = struct { format: Format };
 /// overlap failures precede writes. A nonfinite wire sample leaves the failing slot unchanged;
 /// preceding samples may have been written.
 pub fn decodeInto(source: []const u8, destination: []f64, format: Format) DecodeError![]f64 {
+    // Reject shape and used-prefix overlap first; finite-value checks can stop after a prefix.
     const bits = try precision(format);
     const width = format.encoding.byteCount();
     if (source.len % width != 0) return error.InvalidData;
@@ -158,6 +159,7 @@ fn decodeFloat32(
 }
 
 test "float32 widening preserves the prefix and failing slot for every lane" {
+    // An invalid lane must not overwrite its slot or later lanes, even within a vector batch.
     for ([_]std.lang.Endian{ .little, .big }) |endian| {
         for (0..37) |bad| {
             var bytes: [37 * 4 + 1]u8 = @splat(0);
@@ -177,6 +179,7 @@ test "float32 widening preserves the prefix and failing slot for every lane" {
 }
 
 test "signed32 widening covers unaligned input, vector batches and tails" {
+    // Offsets and lengths cross vector boundaries while guarding the untouched output suffix.
     const words = [_]i32{ std.math.minInt(i32), -1, 0, std.math.maxInt(i32) };
     const expected = [_]f64{ -1, -1.0 / 2_147_483_648.0, 0, 2_147_483_647.0 / 2_147_483_648.0 };
     for ([_]std.lang.Endian{ .little, .big }) |endian| {
@@ -276,6 +279,7 @@ test "binary64 vector validation rejects every invalid position before output" {
 /// capacity and used-prefix overlap are checked in that order. Admission failure leaves the whole
 /// destination unchanged. Binary32 output uses nearest-even rounding, including signed underflow.
 pub fn encodeInto(source: []const f64, destination: []u8, options: EncodeOptions) EncodeError![]u8 {
+    // Check every input before writing, including values that would narrow to infinity.
     try validate(source, options);
     const bytes = source.len * options.format.encoding.byteCount();
     if (destination.len < bytes) return error.DestinationTooSmall;
@@ -481,6 +485,7 @@ test "finite binary64 bits round trip and nonfinite input leaves its slot" {
 }
 
 test "binary64 writing handles unaligned storage, overlap and Writer prefixes" {
+    // Offset guards and every writer capacity expose both alias admission and partial publication.
     const source = [_]f64{
         @bitCast(@as(u64, 0x8000_0000_0000_0000)),
         @bitCast(@as(u64, 0x0000_0000_0000_0001)),
@@ -566,6 +571,7 @@ test "signed 8-bit samples round trip through f64" {
 }
 
 test "binary32 narrowing validates the complete source before output" {
+    // The overflow midpoint is rejected before either the byte buffer or writer is changed.
     const below: f64 = @bitCast(@as(u64, 0x47ef_ffff_efff_ffff));
     const midpoint: f64 = @bitCast(@as(u64, 0x47ef_ffff_f000_0000));
     const tiny_negative: f64 = -0x1p-150;
@@ -586,6 +592,7 @@ test "binary32 narrowing validates the complete source before output" {
 }
 
 test "signed32 f64 encoding preserves endpoints and half-away rounding" {
+    // Neighbors around each half tie distinguish direction; +1 clamps to the signed maximum.
     const half: f64 = 0.5 / 2_147_483_648.0;
     const half_bits: u64 = @bitCast(half);
     const below: f64 = @bitCast(half_bits - 1);

@@ -1,7 +1,7 @@
 //! Convert G.711 amplitudes and use the PCM writer to produce little-endian PCM16.
 const std = @import("std");
 const g711 = @import("wingman").g711;
-const pcm = @import("wingman").pcm;
+const lpcm = @import("wingman").lpcm;
 
 pub fn main(init: std.process.Init) !void {
     const codes = [_]u8{ 0, 128, 85, 213, 127, 255 };
@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
     for ([_]g711.Law{ .alaw, .mulaw }) |law| {
         const decoded = try g711.decodeInto(&codes, &samples, law);
-        const bytes = try pcm.encodeInto(decoded, &pcm16, .{ .encoding = .signed16 });
+        const bytes = try lpcm.encodeInto(decoded, &pcm16, .{ .encoding = .signed16 });
         try output.interface.print(
             "{s}: {d} bytes -> {d} samples\n",
             .{ @tagName(law), codes.len, decoded.len },

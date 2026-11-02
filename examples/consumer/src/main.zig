@@ -10,7 +10,7 @@ const deflate = @import("wingman").deflate;
 const zlib = @import("wingman").zlib;
 const gzip = @import("wingman").gzip;
 const riff = @import("wingman").riff;
-const pcm = @import("wingman").pcm;
+const lpcm = @import("wingman").lpcm;
 const g711 = @import("wingman").g711;
 const adpcm = @import("wingman").adpcm;
 const exif = @import("wingman").exif;
@@ -510,17 +510,17 @@ test "RIFF writer literal bytes and lazy nested lists" {
 test "PCM packed precision and finite float words from outside the module" {
     const bytes = [_]u8{ 0, 0, 128, 255, 255, 255, 0, 0, 0, 255, 255, 127 };
     var destination: [6]f32 = @splat(123);
-    const result = try pcm.decodeInto(&bytes, &destination, .{ .encoding = .signed24 });
+    const result = try lpcm.decodeInto(&bytes, &destination, .{ .encoding = .signed24 });
     try std.testing.expectEqualSlices(
         f32,
         &.{ -1, -1.0 / 8388608.0, 0, 8388607.0 / 8388608.0 },
         result,
     );
     try std.testing.expectEqualSlices(f32, &.{ 123, 123 }, destination[4..]);
-    try std.testing.expectEqual(3, pcm.Encoding.signed24.byteCount());
-    try std.testing.expectError(error.InvalidData, pcm.sampleCount(5, .{ .encoding = .signed24 }));
+    try std.testing.expectEqual(3, lpcm.Encoding.signed24.byteCount());
+    try std.testing.expectError(error.InvalidData, lpcm.sampleCount(5, .{ .encoding = .signed24 }));
     const float_bytes = [_]u8{ 0, 0, 0, 128, 0, 0, 0, 64 };
-    const floats = try pcm.decodeInto(&float_bytes, &destination, .{ .encoding = .float32 });
+    const floats = try lpcm.decodeInto(&float_bytes, &destination, .{ .encoding = .float32 });
     try std.testing.expectEqual(0x80000000, @as(u32, @bitCast(floats[0])));
     try std.testing.expectEqual(2, floats[1]);
 }
@@ -528,36 +528,36 @@ test "PCM packed precision and finite float words from outside the module" {
 test "PCM16 caller storage and Writer validate before output" {
     const samples = [_]f32{ -1, -0.5, 0, 0.5, 1 };
     var bytes: [12]u8 = @splat(0xa7);
-    const encoded = try pcm.encodeInto(&samples, &bytes, .{ .encoding = .signed16 });
+    const encoded = try lpcm.encodeInto(&samples, &bytes, .{ .encoding = .signed16 });
     try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 192, 0, 0, 0, 64, 255, 127 }, encoded);
     try std.testing.expectEqualSlices(u8, &.{ 0xa7, 0xa7 }, bytes[10..]);
     var writer_bytes: [10]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_bytes);
-    try pcm.writeAll(&samples, &writer, .{ .encoding = .signed16 });
+    try lpcm.writeAll(&samples, &writer, .{ .encoding = .signed16 });
     try std.testing.expectEqualSlices(u8, encoded, writer.buffered());
     try std.testing.expectError(
         error.InvalidSamples,
-        pcm.validate(&.{1.5}, .{ .encoding = .signed16 }),
+        lpcm.validate(&.{1.5}, .{ .encoding = .signed16 }),
     );
     const before = bytes;
     try std.testing.expectError(
         error.InvalidSamples,
-        pcm.encodeInto(&.{std.math.nan(f32)}, &bytes, .{ .encoding = .signed16 }),
+        lpcm.encodeInto(&.{std.math.nan(f32)}, &bytes, .{ .encoding = .signed16 }),
     );
     try std.testing.expectEqualSlices(u8, &before, &bytes);
 }
 
 test "PCM unsigned wide exact samples and binary64 round trip" {
-    const pcm_format: pcm.Format = .{ .encoding = .unsigned24, .valid_bits = 20, .endian = .big };
+    const pcm_format: lpcm.Format = .{ .encoding = .unsigned24, .valid_bits = 20, .endian = .big };
     const source = [_]u8{ 0, 0, 15, 0x80, 0, 15, 0xff, 0xff, 0xff };
     var values: [3]i32 = undefined;
-    const result = try pcm.int32.decodeInto(&source, &values, pcm_format);
+    const result = try lpcm.int32.decodeInto(&source, &values, pcm_format);
     try std.testing.expectEqualSlices(i32, &.{ std.math.minInt(i32), 0, 0x7ffff000 }, result);
     var canonical: [9]u8 = undefined;
-    const bytes = try pcm.int32.encodeInto(result, &canonical, .{ .format = pcm_format });
+    const bytes = try lpcm.int32.encodeInto(result, &canonical, .{ .format = pcm_format });
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0x80, 0, 0, 0xff, 0xff, 0xf0 }, bytes);
     var wide: [3]f64 = undefined;
-    _ = try pcm.float64.decodeInto(bytes, &wide, pcm_format);
+    _ = try lpcm.float64.decodeInto(bytes, &wide, pcm_format);
     try std.testing.expectEqual(-1, wide[0]);
     try std.testing.expectEqual(0, wide[1]);
     try std.testing.expectEqual(524287.0 / 524288.0, wide[2]);
@@ -580,7 +580,7 @@ test "G.711 scalar facts normalized output and PCM16 composition" {
     var bytes: [8]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &.{
         0x84, 0x82, 0x7c, 0x7d, 0, 0, 0, 0,
-    }, try pcm.encodeInto(samples, &bytes, .{ .encoding = .signed16 }));
+    }, try lpcm.encodeInto(samples, &bytes, .{ .encoding = .signed16 }));
 }
 
 test "G.711 refusal ordering preserves caller storage" {
@@ -637,7 +637,7 @@ test "ADPCM Microsoft literal samples from caller-owned coefficients" {
     var bytes: [8]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &.{
         0x9c, 0xff, 100, 0, 116, 0, 148, 0,
-    }, try pcm.encodeInto(decoded, &bytes, .{ .encoding = .signed16 }));
+    }, try lpcm.encodeInto(decoded, &bytes, .{ .encoding = .signed16 }));
 }
 
 test "ADPCM encoder reports padded capacity and trims supplied frames" {

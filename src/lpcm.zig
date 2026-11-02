@@ -1,15 +1,16 @@
-//! Integer and finite IEEE binary32/binary64 PCM conversion with caller-owned storage. A sample is
-//! one channel value. These operations do not assign a rate or channel layout. Reduced integer
-//! precision occupies the high bits of its byte container; low padding is ignored on decoding and
-//! cleared on encoding. The default operations use normalized f32 samples, including finite float
-//! values outside [-1, 1]. Decoding wide integers or binary64 to f32 can round. The int32 namespace
-//! decodes integer representations exactly; the float64 namespace preserves finite binary64 wire
-//! values. Conversion allocates nothing and retains no borrowed storage.
+//! Convert integer PCM and finite IEEE binary32/binary64 samples using caller-owned storage. The
+//! lpcm namespace covers both representations. A sample is one channel value. These operations do
+//! not assign a rate or channel layout. Reduced integer precision occupies the high bits of its
+//! byte container; low padding is ignored on decoding and cleared on encoding. The default
+//! operations use normalized f32 samples, including finite float values outside [-1, 1]. Decoding
+//! wide integers or binary64 to f32 can round. The int32 namespace decodes integer representations
+//! exactly; the float64 namespace preserves finite binary64 wire values. Conversion allocates
+//! nothing and retains no borrowed storage.
 
 const std = @import("std");
 const memory = @import("common/byte_ranges.zig");
 const binary_float = @import("common/float.zig");
-const rounding = @import("pcm/round.zig");
+const rounding = @import("lpcm/round.zig");
 const sample_rounding = @import("common/round.zig");
 const testing = std.testing;
 
@@ -76,10 +77,10 @@ pub const ValidateError = error{ InvalidFormat, InvalidSamples, SizeOverflow };
 pub const EncodeError = ValidateError || error{ DestinationTooSmall, Aliasing };
 
 /// Exact integer PCM conversion with signed, left-aligned i32 samples.
-pub const int32 = @import("pcm/int32.zig");
+pub const int32 = @import("lpcm/int32.zig");
 
 /// PCM conversion with binary64 samples, including exact finite binary64 wire values.
-pub const float64 = @import("pcm/float64.zig");
+pub const float64 = @import("lpcm/float64.zig");
 
 test {
     _ = int32;
@@ -125,6 +126,7 @@ test sampleCount {
 /// narrow to f32 using nearest-even rounding; very small values can become signed zero. A nonfinite
 /// binary64 source or narrowed result fails before writing its destination slot.
 pub fn decodeInto(source: []const u8, destination: []f32, format: Format) DecodeError![]f32 {
+    // Establish shape and disjoint storage before decoding; a later bad float can leave writes.
     const count = try sampleCount(source.len, format);
     if (destination.len < count) return error.DestinationTooSmall;
 
@@ -143,6 +145,7 @@ test decodeInto {
 }
 
 test "PCM admission preserves storage and finite float bits" {
+    // Sentinels show that admission errors leave the output unchanged.
     var output: [2]f32 = .{ 123, 456 };
     try testing.expectError(
         error.InvalidData,
@@ -172,6 +175,7 @@ test "PCM admission preserves storage and finite float bits" {
 }
 
 test "binary64 narrowing checks the rounded value and preserves the failing slot" {
+    // The overflow midpoint fails only after the preceding finite values have been decoded.
     const inputs = [_]u64{
         0x8000_0000_0000_0000, // negative zero
         0x3690_0000_0000_0001, // just above half the smallest f32 subnormal
@@ -283,6 +287,8 @@ test "full-width signed 8-bit vector batches preserve endpoints and tails" {
 }
 
 test "PCM vector bodies and exact unaligned tails agree with independent dyadic values" {
+    // Lengths straddle typical vector boundaries and offsets exercise unaligned source. Dyadic
+    // reference values are independent of the decoder; destination sentinels guard both ends.
     for ([_]Encoding{ .unsigned8, .signed16 }) |encoding| {
         const width = encoding.byteCount();
         for ([_]usize{ 0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 65 }) |count| {
@@ -320,6 +326,9 @@ test "PCM vector bodies and exact unaligned tails agree with independent dyadic 
 }
 
 test "PCM finite binary32 words survive exactly and failed output remains unpublished" {
+    // Literal bits include signed zeros, subnormals and finite values outside the integer range.
+    // The separate nonfinite cases also show that an earlier decoded sample can be written on
+    // error.
     const words = [_]u32{ 0, 0x80000000, 1, 0x80000001, 0x7f7fffff, 0xff7fffff, 0x40000000 };
     var bytes: [words.len * 4]u8 = undefined;
     for (words, 0..) |word, i| std.mem.writeInt(u32, bytes[i * 4 ..][0..4], word, .little);
@@ -377,6 +386,7 @@ test validate {
 }
 
 test "PCM16 encoding validates every sample before changing caller bytes" {
+    // A late NaN or short destination must leave every sentinel byte untouched.
     var bytes: [12]u8 = @splat(0xa5);
     try testing.expectError(
         error.InvalidSamples,
@@ -394,6 +404,7 @@ test "PCM16 encoding validates every sample before changing caller bytes" {
 }
 
 test "vector validation rejects every invalid lane and preserves caller output" {
+    // Place each invalid value in every lane and tail position to exercise whole-input admission.
     const count = pcm_vector_lanes * 2 + 3;
     var input: [count]f32 = @splat(0.5);
     var output: [count * 4]u8 = undefined;
@@ -447,6 +458,7 @@ test encodeInto {
 }
 
 test "integer encoding rounds half ties away from zero at every precision" {
+    // Both signs expose tie direction; at one bit, the positive endpoint cannot represent +1.
     const count = pcm_vector_lanes * 2 + 3;
     for ([_]Encoding{ .unsigned8, .signed8, .signed16, .signed24, .signed32 }) |encoding| {
         const width = encoding.byteCount();
@@ -491,6 +503,7 @@ test "integer encoding rounds half ties away from zero at every precision" {
 }
 
 test "full-width output preserves endpoints across vector boundaries and tails" {
+    // Counts around vector boundaries and trailing sentinels detect partial-lane overwrites.
     const count = pcm_vector_lanes * 2 + 3;
     var samples: [count]f32 = undefined;
     for (&samples, 0..) |*sample, i| sample.* = ([_]f32{ -1, 0, 1 })[i % 3];
@@ -595,6 +608,7 @@ test writeAll {
 }
 
 test "PCM16 writer preserves complete and partial output at every fixed capacity" {
+    // A fixed writer can publish a byte prefix before it reports exhaustion, even mid-sample.
     const samples = [_]f32{ -1, -0.5, 0, 0.25, 0.5, 1 };
     const expected = [_]u8{ 0, 128, 0, 192, 0, 0, 0, 32, 0, 64, 255, 127 };
     for (0..expected.len + 1) |capacity| {
@@ -658,6 +672,7 @@ test "PCM admission checks only the used destination and preserves alias refusal
 }
 
 fn encodeSamples(source: []const f32, output: []u8, format: Format, bits: u16) void {
+    // The fast path has the same admitted format and wire bytes as the general typed path.
     if (format.encoding == .signed16 and bits == 16 and format.endian == .little) {
         encodePcm16Samples(source, output);
         return;
@@ -768,6 +783,7 @@ fn encodeIntegerSamples(
     const midpoint: i64 = @as(i64, 1) << @intCast(bits - 1);
     const scale: f64 = @floatFromInt(midpoint);
     const mask = (@as(u64, 1) << @intCast(bits)) - 1;
+    // Clamp the asymmetric signed range before biasing; shifting leaves low wire padding zero.
     for (source, 0..) |sample, index| {
         const rounded = sample_rounding.halfAwayScaled(sample, scale);
         const clamped = std.math.clamp(rounded, -midpoint, midpoint - 1);
@@ -882,6 +898,7 @@ fn encodePcm32Samples(source: []const f32, output: []u8, comptime endian: std.la
 }
 
 fn encodePcm16Samples(source: []const f32, output: []u8) void {
+    // Scaling maps -1 exactly to -32768; +1 must be clamped to the largest signed sample.
     const Floats = @Vector(pcm_vector_lanes, f32);
     const Integers = @Vector(pcm_vector_lanes, i32);
     const Samples = @Vector(pcm_vector_lanes, i16);
@@ -1205,6 +1222,7 @@ fn decodeSignedPcm(raw: i32, container_bits: u16, valid_bits_per_sample: u16) f3
 }
 
 test "full-width PCM24 and PCM32 preserve rounding at vector boundaries and unaligned tails" {
+    // Odd offsets exercise unaligned reads; the output sentinel detects writes past the prefix.
     const maximum_samples = pcm_vector_lanes * 2 + 3;
     const patterns = [_]u32{
         0,           1,           0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x7fff_ff80, 0x8000_0001,
@@ -1255,6 +1273,7 @@ test "full-width PCM24 and PCM32 preserve rounding at vector boundaries and unal
 }
 
 test "integer precision ignores low padding and normalizes both signed endpoints" {
+    // Valid precision changes the scale while discarded low container bits cannot affect samples.
     for ([_]Encoding{ .unsigned8, .signed16, .signed24, .signed32 }) |encoding| {
         const width = encoding.byteCount();
         const bits = width * 8;
@@ -1503,6 +1522,7 @@ fn verifyNarrow() !void {
 }
 
 test "binary32 narrowing preserves output and errors in every x86-64 rounding mode" {
+    // Changing caller rounding mode must not change nearest-even narrowing or failure placement.
     const Control = @import("common/float.zig").test_support.FloatControl;
     const original = try Control.read();
     defer Control.set(original);
@@ -1705,6 +1725,7 @@ fn checkExactFloat32Widening() !void {
 }
 
 test "binary32 widening preserves encoded values and failure prefixes in caller float modes" {
+    // DAZ and FTZ can flush subnormal inputs in hardware, so exercise both independently.
     try checkExactFloat32Widening();
     const Control = @import("common/float.zig").test_support.FloatControl;
     const original = Control.read() catch return;

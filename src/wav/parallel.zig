@@ -3,7 +3,7 @@
 //! joining; all source, destination and coefficient pointers retire before return.
 
 const std = @import("std");
-const pcm = @import("../pcm.zig");
+const lpcm = @import("../lpcm.zig");
 const g711 = @import("../g711.zig");
 const adpcm = @import("../adpcm.zig");
 const Format = @import("format.zig").Format;
@@ -73,7 +73,7 @@ pub fn convert(format: Format, source: []const u8, destination: []f32) Conversio
             };
         },
         else => {
-            const sample_format: pcm.Format = .{ .encoding = switch (format.encoding) {
+            const sample_format: lpcm.Format = .{ .encoding = switch (format.encoding) {
                 .pcm_u8 => .unsigned8,
                 .pcm_s16 => .signed16,
                 .pcm_s24 => .signed24,
@@ -81,7 +81,7 @@ pub fn convert(format: Format, source: []const u8, destination: []f32) Conversio
                 .ieee_f32 => .float32,
                 else => unreachable,
             }, .valid_bits = @intCast(format.valid_bits_per_sample) };
-            _ = pcm.decodeInto(source, destination, sample_format) catch |err| switch (err) {
+            _ = lpcm.decodeInto(source, destination, sample_format) catch |err| switch (err) {
                 error.InvalidSamples => return error.InvalidSamples,
                 error.InvalidFormat, error.InvalidData => return error.InvalidWave,
                 error.DestinationTooSmall, error.Aliasing => unreachable,

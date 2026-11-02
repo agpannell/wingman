@@ -19,7 +19,7 @@ const std = @import("std");
 const spans = @import("common/byte_ranges.zig");
 const builtin = @import("builtin");
 const riff = @import("riff.zig");
-const pcm = @import("pcm.zig");
+const lpcm = @import("lpcm.zig");
 const memory = @import("wav/storage.zig");
 const container = @import("wav/container.zig");
 const format = @import("wav/format.zig");
@@ -463,7 +463,7 @@ pub fn encodePcm16Requirements(source: AudioView) EncodeError!usize {
     if (source.samples.len % channels != 0) return error.InvalidSamples;
     if (source.samples.len > (std.math.maxInt(u32) - 36) / 2) return error.SizeOverflow;
     _ = std.math.mul(u32, source.sample_rate, channels * 2) catch return error.InvalidRate;
-    pcm.validate(source.samples, .{ .encoding = .signed16 }) catch |err| switch (err) {
+    lpcm.validate(source.samples, .{ .encoding = .signed16 }) catch |err| switch (err) {
         error.InvalidFormat => unreachable,
         error.InvalidSamples, error.SizeOverflow => |e| return e,
     };
@@ -527,7 +527,7 @@ fn writePcm16Admitted(
     try writer.writeInt(u16, @intCast(channels * 2), .little);
     try writer.writeInt(u16, 16, .little);
     try riff.writeChunkHeader("data".*, source.samples.len * 2, writer);
-    pcm.writeAll(source.samples, writer, .{ .encoding = .signed16 }) catch |err| switch (err) {
+    lpcm.writeAll(source.samples, writer, .{ .encoding = .signed16 }) catch |err| switch (err) {
         error.WriteFailed => return error.WriteFailed,
         else => unreachable,
     };

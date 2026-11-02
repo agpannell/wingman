@@ -59,7 +59,7 @@ loader composes them with file metadata; they can also serve other containers or
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
-| [`pcm`](docs/pcm.md) | Integer and float PCM conversion with explicit precision and byte order | `pcm-example` |
+| [`lpcm`](docs/lpcm.md) | Integer and float sample conversion with explicit precision and byte order | `lpcm-example` |
 | [`g711`](docs/g711.md) | PCM16 encoding/decoding, normalized floats and direct A-law/mu-law conversion | `g711-example` |
 | [`adpcm`](docs/adpcm.md) | Microsoft and IMA/DVI WAVE block encoding and decoding, including validated frame prefixes | `adpcm-example` |
 
@@ -188,7 +188,7 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
 
 Serial hashing and decoding need no scheduler. Parallel BLAKE3 updates and WAVE conversion take
 `std.Io`, caller-owned worker storage and explicit options; every submitted job finishes before
-success, error or cancellation returns. RIFF, PCM and WAVE writers use the caller's `std.Io.Writer`;
+success, error or cancellation returns. RIFF, LPCM and WAVE writers use the caller's `std.Io.Writer`;
 callers choose its storage, handle backend failures and flush it.
 
 The guides specify numeric encoding, admitted regions and partial-output behavior for each API.
