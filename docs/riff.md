@@ -4,14 +4,17 @@ RIFF groups bytes into named chunks. WAVE audio and WebP images use this envelop
 rules for the contents. `wingman.riff` reads and writes the envelope so an application can inspect
 metadata, skip unknown chunks or pass a bounded payload to its decoder.
 
+The same chunk geometry supports little-endian RIFF and big-endian RIFX. RIFX identifies its
+byte order in the form header; this library does not interpret the byte order of a media payload.
+
 Reading allocates nothing. A container, chunk or list borrows unchanged input; copied headers and
 form/list types do not. Writing accepts `*std.Io.Writer`, so the same functions work with fixed
 buffers, files or a caller's writer backend. The library retains no writer, allocator or scheduler.
 
 ## Inspect a container
 
-`parse` checks the outer RIFF header and its declared extent. The returned `source` contains that
-prefix, including its twelve-byte header. Trailing bytes are outside it. Iteration checks one child
+`parse` checks the outer RIFF or RIFX header and its declared extent. The returned `source` contains
+that prefix, including its twelve-byte header. Trailing bytes are outside it. Iteration checks one child
 at a time; successful outer parsing does not establish that every child or payload is valid.
 
 ```zig
@@ -44,15 +47,17 @@ preserves arbitrary IDs; it does not validate a format's registry or required ch
 
 | Part | Encoded extent | What its size field counts |
 | --- | --- | --- |
-| Chunk header | Four ID bytes and a little-endian `u32` size | Payload bytes only |
+| Chunk header | Four ID bytes and a `u32` size in the form’s byte order | Payload bytes only |
 | Chunk body | Payload followed by one pad byte when its length is odd | Padding is excluded |
 | RIFF or LIST payload | Four-byte form/list type, then encoded child chunks | Type, child headers, payloads and child padding |
 
 `chunkSize(n)` returns `8 + n + (n & 1)`, checking the 32-bit size field and the selected
-address space. `writeHeader(type, body_bytes, writer)` adds the four-byte form type itself;
+address space. `writeHeader(type, body_bytes, writer, options)` adds the four-byte form type itself;
 `body_bytes` is the sum of the encoded child extents.
 
-The writer emits zero padding. Reading exposes the actual byte as `Chunk.padding`, without rejecting
+Writing defaults to RIFF with `.{}` options; pass `.{ .byte_order = .big }` to the form and each
+chunk writer to produce RIFX. All size fields within an ordinary list use the enclosing form’s byte
+order. The writer emits zero padding. Reading exposes the actual byte as `Chunk.padding`, without rejecting
 a nonzero value. A form that requires zero padding must enforce it. This distinction also applies to
 outer trailing bytes, duplicate chunks, ID validity and payload contents: geometry admission is
 useful independently of complete-file conformance.
@@ -70,8 +75,8 @@ test "write a RIFF form into fixed storage" {
     const body_size = try riff.chunkSize(1);
     var bytes: [12 + 10]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&bytes);
-    try riff.writeHeader("DEMO".*, body_size, &writer);
-    try riff.writeChunk("note".*, "x", &writer);
+    try riff.writeHeader("DEMO".*, body_size, &writer, .{});
+    try riff.writeChunk("note".*, "x", &writer, .{});
     try std.testing.expectEqualStrings(
         "RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00",
         writer.buffered(),
@@ -86,9 +91,11 @@ transaction needed before publishing output. A file writer supplies its `interfa
 
 ## Nested lists and resolved sizes
 
-`Chunk.list` accepts `RIFF` or `LIST` with at least four payload bytes. It copies the type.
+`Chunk.list` accepts `RIFF`, `RIFX` or `LIST` with at least four payload bytes. It copies the type.
 The returned child region borrows the parent. Traversal stays explicit, letting the caller choose
-which lists to inspect and how much nesting or total work to admit.
+which lists to inspect and how much nesting or total work to admit. Nested views inherit their
+containing byte order. A manually initialized `ChunkIterator` defaults to little endian and can
+set `.byte_order = .big` explicitly. Mixed-byte-order nested forms are not inferred automatically.
 
 ```zig
 const std = @import("std");
@@ -117,8 +124,8 @@ or a truncated chunk returns an error.
 
 | Operation or type | Contract |
 | --- | --- |
-| `FourCc`, `ChunkHeader`, `readHeader` | Copied four-byte ID and unsigned size; header reading alone does not admit a payload |
-| `Container`, `parse`, `Container.iterator` | Declared RIFF prefix and independent child traversal |
+| `FourCc`, `ChunkHeader`, `readHeader` | Copied ID and size with explicit byte order; header reading alone does not admit a payload |
+| `Container`, `parse`, `Container.iterator` | Declared RIFF/RIFX prefix, byte order and independent child traversal |
 | `Chunk`, `List`, `Chunk.list`, `List.iterator` | Borrowed payloads and explicitly selected nested children |
 | `ChunkIterator.next`, `nextResolved` | Bounded progress; failure preserves the cursor |
 | `chunkSize` | Checked complete chunk extent, including padding |
@@ -126,13 +133,14 @@ or a truncated chunk returns an error.
 
 `ParseError` distinguishes invalid/truncated framing from an extent that overflows the address
 space. `WriteError` combines `SizeOverflow` with the writer's `WriteFailed`. No operation implicitly
-recurses, decodes media, validates every format rule or retains hidden allocation state. RIFX and
-RF64 outer headers are rejected. A complete immutable input span is required; fragmented input
-recovery is outside this API.
+recurses, decodes media, validates every format rule or retains hidden allocation state. RF64 outer
+headers are rejected. WAVE payload decoding remains the separate `wav` library and does not accept
+RIFX. A complete immutable input span is required; fragmented input recovery is outside this API.
 
-Run `zig build riff-example` to write and inspect nested `DEMO`/`INFO` chunks. An optional text
-argument changes the `note` payload: `zig build riff-example -- hello`. The example allocates its
-own storage; the framing calls do not. Generate the declaration reference with `zig build docs`.
+Run `zig build riff-example` to write and inspect nested big-endian RIFX `DEMO`/`INFO` chunks. An
+optional text argument changes the `note` payload: `zig build riff-example -- hello`. The example
+allocates its own storage; the framing calls do not. Generate the declaration reference with
+`zig build docs`.
 Tests cover fixed independent bytes, malformed extents, cursor behavior, exact IDs and padding,
 copied/borrowed lifetimes, writer capacity and size limits. No throughput claim is made.
 

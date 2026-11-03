@@ -1,4 +1,4 @@
-//! Write and inspect a small RIFF form without interpreting a media payload.
+//! Write and inspect a small big-endian RIFX form without interpreting a media payload.
 const std = @import("std");
 const riff = @import("wingman").riff;
 
@@ -11,12 +11,14 @@ pub fn main(init: std.process.Init) !void {
     const body_size = try riff.chunkSize(list_size);
     const bytes = try init.arena.allocator().alloc(u8, try std.math.add(usize, 12, body_size));
     var writer: std.Io.Writer = .fixed(bytes);
-    try riff.writeHeader("DEMO".*, body_size, &writer);
-    try riff.writeChunkHeader("LIST".*, list_size, &writer);
+    const framing: riff.WriteOptions = .{ .byte_order = .big };
+    try riff.writeHeader("DEMO".*, body_size, &writer, framing);
+    try riff.writeChunkHeader("LIST".*, list_size, &writer, framing);
     try writer.writeAll("INFO");
-    try riff.writeChunk("note".*, text, &writer);
+    try riff.writeChunk("note".*, text, &writer, framing);
 
     const container = try riff.parse(writer.buffered());
+    if (container.byte_order != .big) return error.WrongByteOrder;
     var chunks = container.iterator();
     const parent = (try chunks.next()).?;
     const list = try parent.list();
@@ -27,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
 
     var buffer: [256]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
-    try output.interface.print("RIFF {s}: {d} bytes\n", .{
+    try output.interface.print("RIFX {s}: {d} bytes\n", .{
         container.form_type, container.source.len,
     });
     try output.interface.print("LIST {s}: {d} payload bytes\n", .{

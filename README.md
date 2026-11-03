@@ -50,7 +50,7 @@ formats such as WAVE or WebP; inspecting that envelope alone does not validate i
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`wav`](docs/wav.md) | Supported WAVE/RF64 audio decoding and PCM16 RIFF writing | `wav-example` |
-| [`riff`](docs/riff.md) | Borrowed container/chunk traversal, nested lists and checked writing | `riff-example` |
+| [`riff`](docs/riff.md) | Borrowed RIFF/RIFX traversal, nested lists and checked writing | `riff-example` |
 
 ### Audio samples
 

@@ -518,15 +518,15 @@ fn writePcm16Admitted(
     writer: *std.Io.Writer,
 ) riff.WriteError!void {
     const channels: u32 = @backingInt(source.channels);
-    try riff.writeHeader("WAVE".*, bytes - 12, writer);
-    try riff.writeChunkHeader("fmt ".*, 16, writer);
+    try riff.writeHeader("WAVE".*, bytes - 12, writer, .{});
+    try riff.writeChunkHeader("fmt ".*, 16, writer, .{});
     try writer.writeInt(u16, 1, .little);
     try writer.writeInt(u16, @intCast(channels), .little);
     try writer.writeInt(u32, source.sample_rate, .little);
     try writer.writeInt(u32, source.sample_rate * channels * 2, .little);
     try writer.writeInt(u16, @intCast(channels * 2), .little);
     try writer.writeInt(u16, 16, .little);
-    try riff.writeChunkHeader("data".*, source.samples.len * 2, writer);
+    try riff.writeChunkHeader("data".*, source.samples.len * 2, writer, .{});
     lpcm.writeAll(source.samples, writer, .{ .encoding = .signed16 }) catch |err| switch (err) {
         error.WriteFailed => return error.WriteFailed,
         else => unreachable,

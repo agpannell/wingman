@@ -162,7 +162,7 @@ fn nextChunk(iterator: *ChunkIterator) ParseError!ChunkView {
     const source = iterator.view.source;
     const offset = iterator.offset;
     if (offset > source.len) return error.InvalidWave;
-    const header = riff.readHeader(source[offset..]) catch return error.InvalidWave;
+    const header = riff.readHeader(source[offset..], .little) catch return error.InvalidWave;
     const size = if (iterator.view.rf64_sizes) |sizes| try resolveRf64ChunkSize(
         sizes,
         &header.id,
@@ -600,4 +600,10 @@ test "container traversal rejects missing word padding and repeated data sentine
     try std.testing.expectEqualStrings("fmt ", (try repeated_chunks.next()).?.id);
     try std.testing.expectEqualStrings("data", (try repeated_chunks.next()).?.id);
     try std.testing.expectError(error.InvalidWave, repeated_chunks.next());
+}
+
+test "WAVE admission rejects RIFX until its payload formats are supported" {
+    const source = "RIFX\x00\x00\x00\x04WAVE";
+    try std.testing.expectEqual(.big, (try riff.parse(source)).byte_order);
+    try std.testing.expectError(error.InvalidWave, parse(source));
 }

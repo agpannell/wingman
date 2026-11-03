@@ -545,8 +545,8 @@ test "RIFF borrowed chunks and externally resolved geometry" {
 test "RIFF writer literal bytes and lazy nested lists" {
     var bytes: [22]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&bytes);
-    try riff.writeHeader("DEMO".*, try riff.chunkSize(1), &writer);
-    try riff.writeChunk("note".*, "x", &writer);
+    try riff.writeHeader("DEMO".*, try riff.chunkSize(1), &writer, .{});
+    try riff.writeChunk("note".*, "x", &writer, .{});
     try std.testing.expectEqualStrings("RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00", &bytes);
     var outer: riff.ChunkIterator = .{ .source = "LIST\x05\x00\x00\x00INFOx\x00" };
     const list = try (try outer.next()).?.list();
