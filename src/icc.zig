@@ -71,6 +71,7 @@ pub const Profile = struct {
         const rendering_intent = readU32(source, 64);
         if (rendering_intent > 3) return error.InvalidIcc;
         const tag_count = readU32(source, 128);
+        // Refuse an over-budget table before reading its records or calculating their extent.
         if (tag_count > maximum_tags) return error.MetadataLimitExceeded;
         const tag_table_bytes = std.math.mul(usize, tag_count, 12) catch return error.InvalidIcc;
         if (tag_table_bytes > source.len - 132) return error.InvalidIcc;
@@ -84,6 +85,7 @@ pub const Profile = struct {
             .rendering_intent = rendering_intent,
             .tag_count = tag_count,
         };
+        // Each record is admitted independently: different signatures may share body storage.
         for (0..tag_count) |index| {
             const record = profile.tagRecord(index);
             const body_offset = readU32(record, 4);
@@ -127,9 +129,9 @@ pub const Profile = struct {
         try std.testing.expectEqualStrings("XYZ ", &profile.connection_space);
         try std.testing.expectEqualStrings("mntr", &profile.device_class);
         try std.testing.expectEqual(4, profile.version[0]);
-        const description = (try profile.find("desc".*)).?;
+        const description = (try profile.find("desc".*)) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualSlices(u8, "text\x00\x00\x00\x00abc\x00", description.data);
-        try std.testing.expectEqual(@intFromPtr(&bytes) + 144, @intFromPtr(description.data.ptr));
+        try std.testing.expectEqual(bytes[144..].ptr, description.data.ptr);
         try std.testing.expectEqual(null, profile.tag(1));
         try std.testing.expectEqual(null, try profile.find("rXYZ".*));
     }
@@ -299,6 +301,7 @@ test "ICC duplicate selection fails even when both records share identical stora
 }
 
 test "ICC v4 declared length includes final padding while v2 retains unpadded bodies" {
+    // Try each possible padding width and each truncation between the body and its aligned end.
     for (8..13) |body_bytes| {
         var bytes = testing_icc.minimalProfile();
         const body_end = 144 + body_bytes;

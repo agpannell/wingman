@@ -12,7 +12,7 @@ are supported; no alignment or input padding is required.
 
 Use [Zig 0.17.0 and the package setup](../README.md#use-it-in-a-project). The complete
 [Exif example](../examples/exif.zig) constructs a small TIFF payload, reads its stored orientation,
-checks thumbnail strip storage and samples two RGB pixels.
+checks thumbnail strip storage and samples two RGB pixels. Run it with `zig build exif-example`.
 
 The [public entry](../src/exif.zig) presents the API. Under `src/exif/`, `tiff.zig` owns borrowed
 directories, fields and metadata selection; `raster.zig` owns thumbnail admission, sampling and
@@ -52,8 +52,10 @@ test "read stored orientation and its raw record" {
         0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
     };
     const view = try exif.View.open(&bytes, .{});
-    try std.testing.expectEqual(exif.Orientation.right_top, (try view.orientation()).?);
-    const entry = (try (try view.primary()).find(0x0112)).?;
+    const orientation = (try view.orientation()) orelse return error.MissingOrientation;
+    try std.testing.expectEqual(exif.Orientation.right_top, orientation);
+    const primary = try view.primary();
+    const entry = (try primary.find(0x0112)) orelse return error.MissingOrientation;
     try std.testing.expectEqual(6, try entry.unsignedScalar());
     try std.testing.expectEqualSlices(u8, &.{ 6, 0 }, try entry.data());
     try std.testing.expectEqual(null, try view.thumbnail());

@@ -106,6 +106,7 @@ pub const ThumbnailRaster = struct {
         ) catch return error.MetadataLimitExceeded;
         if (records > maximum_records) return error.MetadataLimitExceeded;
         const strips = try directory.strips();
+        // Chunky storage has one strip sequence; planar RGB repeats it for each channel.
         const per_plane = (@as(usize, height) - 1) / rows + 1;
         const count = std.math.mul(
             usize,

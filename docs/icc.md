@@ -55,6 +55,10 @@ Tag records need not be sorted. Distinct records may share the same body bytes. 
 identifies the record's purpose; the body's first four bytes encode its separate type. The reader
 requires at least the eight-byte type/reserved prefix but leaves those bytes and all body semantics
 opaque. `Tag.data` excludes alignment padding and refers directly to the original source.
+In the example, `rTRC`, `gTRC` and `bTRC` are three record signatures. They refer to the same
+14-byte `curv` body; its two following alignment bytes belong to the 184-byte profile, not to
+any returned tag slice. The example's tag limit of three admits those records without setting a
+limit on the profile's backing allocation.
 
 ## Admission and compatibility
 

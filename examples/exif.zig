@@ -3,17 +3,24 @@ const std = @import("std");
 const exif = @import("wingman").exif;
 
 pub fn main(init: std.process.Init) !void {
+    // All metadata and thumbnail views below borrow this complete TIFF payload.
     const bytes = sampleExif();
     const view = try exif.View.open(&bytes, .{});
+    // Orientation is a stored instruction for the caller; sampling does not rotate pixels.
     const orientation = (try view.orientation()) orelse return error.MissingOrientation;
     if (orientation != .right_top) return error.WrongOrientation;
+    // IFD0 has one entry and IFD1 has nine: both directory headers also count as records.
     if (view.record_count != 12) return error.WrongRecordCount;
+    // IFD1 describes uncompressed data here, so it has no encoded JPEG slice.
     const thumbnail = (try view.thumbnail()) orelse return error.MissingThumbnail;
     if (thumbnail.jpeg != null) return error.UnexpectedCompression;
     const raster = try exif.ThumbnailRaster.open(thumbnail.directory, .{});
     if (raster.width != 2 or raster.height != 1) return error.WrongExtent;
-    if (!std.mem.eql(u8, &.{ 255, 0, 0 }, &raster.rgb(0, 0))) return error.WrongRedPixel;
-    if (!std.mem.eql(u8, &.{ 0, 255, 0 }, &raster.rgb(1, 0))) return error.WrongGreenPixel;
+    const first_pixel = raster.rgb(0, 0);
+    const second_pixel = raster.rgb(1, 0);
+    if (!std.mem.eql(u8, &.{ 255, 0, 0 }, &first_pixel)) return error.WrongRedPixel;
+    if (!std.mem.eql(u8, &.{ 0, 255, 0 }, &second_pixel)) return error.WrongGreenPixel;
+    // Strip iteration exposes the encoded source bytes; the raster interprets those bytes as RGB.
     var strips = try thumbnail.directory.strips();
     const strip = (try strips.next()) orelse return error.MissingStrip;
     if (!std.mem.eql(u8, strip, bytes[146..])) return error.WrongStrip;

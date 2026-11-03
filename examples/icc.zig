@@ -3,13 +3,17 @@ const std = @import("std");
 const icc = @import("wingman").icc;
 
 pub fn main(init: std.process.Init) !void {
+    // Profile and tag views borrow the complete declared profile; keep these bytes unchanged.
     const bytes = sampleProfile();
-    const profile = try icc.Profile.open(&bytes, .{ .limits = .{ .tags = 3 } });
+    const maximum_tags = 3;
+    const profile = try icc.Profile.open(&bytes, .{ .limits = .{ .tags = maximum_tags } });
+    // These distinct record signatures identify channels, while their common body has type curv.
     const red = (try profile.find("rTRC".*)) orelse return error.MissingTag;
     const green = (try profile.find("gTRC".*)) orelse return error.MissingTag;
     const blue = (try profile.find("bTRC".*)) orelse return error.MissingTag;
     if (red.data.ptr != green.data.ptr or red.data.ptr != blue.data.ptr)
         return error.LostSharedStorage;
+    // The fourteen-byte body excludes the two zero padding bytes included in the profile length.
     if (red.data.len != 14 or profile.source.len != 184) return error.WrongExtent;
     if (profile.tag(3) != null or try profile.find("wtpt".*) != null) return error.UnexpectedTag;
 
@@ -26,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
     );
     for (0..profile.tag_count) |index| {
         const tag = profile.tag(index) orelse return error.MissingTag;
+        // Opening checked that the body is inside source, so this offset is within the profile.
         const offset = @intFromPtr(tag.data.ptr) - @intFromPtr(profile.source.ptr);
         try output.interface.print(
             "  {s}: type bytes {s}, {d} body bytes at {d}\n",

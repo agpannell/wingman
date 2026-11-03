@@ -114,8 +114,12 @@ pub const View = struct {
         };
         for ([_][]const u8{ little[0..], big[0..] }) |bytes| {
             const view = try View.open(bytes, .{});
-            try std.testing.expectEqual(.right_top, (try view.orientation()).?);
-            try std.testing.expectEqual(0x0112, (try view.primary()).entry(0).?.tag);
+            const stored_orientation = (try view.orientation()) orelse
+                return error.TestUnexpectedResult;
+            const primary_directory = try view.primary();
+            const entry = primary_directory.entry(0) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(.right_top, stored_orientation);
+            try std.testing.expectEqual(0x0112, entry.tag);
             try std.testing.expectEqual(null, try view.thumbnail());
         }
         var invalid = little[0..].*;
@@ -181,6 +185,7 @@ pub const View = struct {
         const count_bytes = try self.range(offset, 2);
         const count = std.mem.readInt(u16, count_bytes[0..2], self.endian);
         if (count > maximum_entries) return error.MetadataLimitExceeded;
+        // Check the whole entry array and next-IFD field before either is sliced or read.
         const extent = try directoryExtent(usize, count);
         const body_offset = std.math.add(u32, offset, 2) catch return error.InvalidExif;
         const body = try self.range(body_offset, extent.total);
@@ -277,6 +282,7 @@ test "Exif full directory extents preserve valid high counts and limit precedenc
 }
 
 test "Exif child selection checks its own complete high-count extent" {
+    // The child's budget is independent of the already admitted main-chain records.
     for ([_]std.builtin.Endian{ .little, .big }) |endian| {
         const count = 5461;
         const bytes = try std.testing.allocator.alloc(u8, 32 + count * 12);
@@ -400,6 +406,8 @@ pub const Entry = struct {
             else => return error.UnsupportedExif,
         };
         const size = std.math.mul(usize, self.count, width) catch return error.InvalidExif;
+        // TIFF stores values of up to four bytes in the record itself; larger values use an offset
+        // from the beginning of the complete TIFF payload.
         if (size <= 4) return self.value_field[0..size];
         const offset = std.mem.readInt(u32, self.value_field, self.view.endian);
         return self.view.range(offset, size);
