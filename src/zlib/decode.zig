@@ -73,7 +73,7 @@ pub const DecodeProgress = struct {
 
 /// Streaming failures require reset. WrongDictionary compares DICTID with the Adler-32 of the
 /// complete supplied dictionary, before admitting any matches.
-pub const DecodeError = deflate.DecodeError || error{WrongDictionary};
+pub const DecodeError = deflate.StreamDecodeError || error{WrongDictionary};
 
 /// Validates exactly the two-byte header without changing caller storage. Requires DEFLATE method
 /// 8, CINFO 0..7, valid FCHECK and no preset dictionary. This checks only framing admission; decode
@@ -173,7 +173,7 @@ fn decodeBuffer(
     if (source.len < 2) return error.InvalidStream;
     try validateHeader(source[0..2]);
     const window = @as(usize, 1) << @intCast(8 + (source[0] >> 4));
-    const raw = try deflate.decode(
+    const raw = deflate.decode(
         source[2..],
         output,
         .{ .workspace = workspace },
@@ -185,7 +185,11 @@ fn decodeBuffer(
                 .work_units = options.limits.work_units,
             },
         },
-    );
+    ) catch |err| switch (err) {
+        // A short raw extent has not verified the zlib checksum or trailer.
+        error.OutputSizeMismatch => return error.InvalidStream,
+        else => |other| return other,
+    };
     const footer = 2 + raw.consumed;
     if (source.len - footer < 4) return error.InvalidStream;
     const expected = std.mem.readInt(u32, source[footer..][0..4], .big);
@@ -2243,4 +2247,40 @@ test "zlib decoder transfers exclusive state between calls" {
         const restored = output[i * expected.len ..][0..expected.len];
         try std.testing.expectEqualSlices(u8, expected, restored);
     }
+}
+
+test "exact short extent does not claim an unverified zlib trailer" {
+    const workspace = try DecoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    // Independent zlib stored-block framing for "A", including Adler-32 0x00420042.
+    const wire = [_]u8{ 0x78, 0x01, 0x01, 0x01, 0x00, 0xfe, 0xff, 'A', 0x00, 0x42, 0x00, 0x42 };
+    var bad = wire;
+    bad[bad.len - 1] ^= 1;
+    var output: [4]u8 = @splat(0xa5);
+    const options: DecodeOptions = .{ .output_size = .exact };
+    // A short raw end does not validate any trailer; keep the wrapper's general error.
+    for ([_][]const u8{ &wire, &bad, wire[0 .. wire.len - 1] }) |source| {
+        try std.testing.expectError(
+            error.InvalidStream,
+            decode(source, output[1..3], .{ .workspace = workspace }, options),
+        );
+    }
+    const result = try decode(&wire, output[1..2], .{ .workspace = workspace }, options);
+    try std.testing.expectEqual(@as(usize, 1), result.produced);
+    try std.testing.expectEqual(@as(u8, 'A'), output[1]);
+    try std.testing.expectError(
+        error.InvalidStream,
+        decode(&bad, output[1..2], .{ .workspace = workspace }, options),
+    );
+    try std.testing.expectError(
+        error.LimitExceeded,
+        decode(
+            &wire,
+            output[1..2],
+            .{ .workspace = workspace },
+            .{ .output_size = .exact, .limits = .{ .input_bytes = wire.len - 1 } },
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0xa5), output[0]);
+    try std.testing.expectEqual(@as(u8, 0xa5), output[3]);
 }

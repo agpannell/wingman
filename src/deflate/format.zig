@@ -55,7 +55,8 @@ pub const DecodeOptions = struct {
     window_bytes: usize = 32768,
     /// Preset history selected by the enclosing format; raw streams carry no dictionary identity.
     dictionary: ?[]const u8 = null,
-    /// Bounded preserves the unused output suffix; exact requires the complete destination length.
+    /// Bounded preserves the unused output suffix. Exact requires the entire destination and
+    /// reserves that extent against output and work limits even if the stream ends short.
     output_size: OutputSize = .bounded,
     /// Allow preserves following application bytes; reject requires complete source consumption.
     trailing_data: TrailingData = .allow,

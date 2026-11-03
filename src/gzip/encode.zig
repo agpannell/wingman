@@ -20,7 +20,7 @@ const decode = decoding.decode;
 const parseHeader = decoding.parseHeader;
 
 pub const EncoderWorkspace = deflate.EncoderWorkspace;
-pub const EncodeProfile = deflate.EncodeProfile;
+pub const Compression = deflate.Compression;
 pub const EncodeAction = deflate.EncodeAction;
 pub const EncodeStatus = deflate.EncodeStatus;
 pub const EncodeProgress = deflate.EncodeProgress;
@@ -150,11 +150,11 @@ pub const Encoder = struct {
         bytes[0..3].* = signature;
         bytes[3] = flags;
         std.mem.writeInt(u32, bytes[4..8], options.modification_time, .little);
-        bytes[8] = switch (options.deflate.profile) {
-            .offline => 2,
-            .greedy => 4,
-            else => 0,
-        };
+        const compression = options.deflate.compression;
+        // XFL is an informational hint; level zero and literal-only coding have no speed hint.
+        bytes[8] = if (compression.level == 0 or compression.strategy == .huffman_only)
+            0
+        else if (compression.level == 1) 4 else if (compression.level == 9) 2 else 0;
         bytes[9] = options.operating_system;
         var position: usize = 10;
         if (options.extra) |extra| {
@@ -449,4 +449,200 @@ test "gzip encoding refuses complete-buffer overlap before writing metadata" {
     );
     for (encode_workspace.wire[0..32]) |byte| try std.testing.expectEqual(0xa5, byte);
     for (output) |byte| try std.testing.expectEqual(0xa5, byte);
+}
+
+test "failed gzip encoding retains last successfully published counts" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    var output: [128]u8 = undefined;
+    for (
+        [_]Compression{
+            .{ .level = 3 },
+            .{ .level = 9 },
+            .{ .level = 9, .offline_pricing = .maximum_lengths },
+            .{ .level = 9, .offline_refinement = .early },
+        },
+    ) |compression| {
+        try encoder.reset(
+            workspace,
+            .{ .deflate = .{ .compression = compression, .limits = .{ .work_units = 1 } } },
+        );
+        _ = try encoder.step("x", &output, .process);
+        const published = encoder.counts();
+        try std.testing.expectEqual(1, published.input_bytes);
+        try std.testing.expectEqual(10, published.output_bytes);
+        try std.testing.expectError(
+            error.LimitExceeded,
+            encoder.step("aaaaaaaaaaaa", &output, .finish),
+        );
+        try std.testing.expectEqual(published, encoder.counts());
+        try std.testing.expectError(error.NeedReset, encoder.step("", &output, .finish));
+    }
+}
+
+test "compression levels write gzip hints and verified trailers" {
+    const allocator = std.testing.allocator;
+    const encoder_workspace = try EncoderWorkspace.create(allocator);
+    defer encoder_workspace.destroy(allocator);
+    const decoder_workspace = try DecoderWorkspace.create(allocator);
+    defer decoder_workspace.destroy(allocator);
+    const source = "a small payload with a repeated small payload";
+    var wire: [512]u8 = undefined;
+    var restored: [source.len]u8 = undefined;
+    for (0..10) |level| {
+        const encoded = try encode(
+            source,
+            &wire,
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = @intCast(level) } } },
+        );
+        // RFC 1952 reserves these hints for the slowest and fastest compressor choices. The trailer
+        // still covers the decoded payload, independently of that informational byte.
+        const hint: u8 = if (level == 1) 4 else if (level == 9) 2 else 0;
+        try std.testing.expectEqual(hint, encoded[8]);
+        try std.testing.expectEqual(
+            crc32.hash(source),
+            std.mem.readInt(u32, encoded[encoded.len - 8 ..][0..4], .little),
+        );
+        try std.testing.expectEqual(
+            @as(u32, source.len),
+            std.mem.readInt(u32, encoded[encoded.len - 4 ..][0..4], .little),
+        );
+        const result = try decode(
+            encoded,
+            &restored,
+            .{ .workspace = decoder_workspace },
+            .{ .output_size = .exact, .trailing_data = .reject },
+        );
+        try std.testing.expectEqual(source.len, result.produced);
+        try std.testing.expectEqualSlices(u8, source, &restored);
+    }
+    const literal_only = try encode(
+        source,
+        &wire,
+        encoder_workspace,
+        .{ .deflate = .{ .compression = .{ .strategy = .huffman_only } } },
+    );
+    try std.testing.expectEqual(@as(u8, 0), literal_only[8]);
+    for ([_]u8{ 4, 5, 6 }) |level| {
+        const encoded = try encode(
+            source,
+            &wire,
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = level, .lazy_lookahead = .reduced } } },
+        );
+        try std.testing.expectEqual(@as(u8, 0), encoded[8]);
+        const result = try decode(
+            encoded,
+            &restored,
+            .{ .workspace = decoder_workspace },
+            .{ .output_size = .exact, .trailing_data = .reject },
+        );
+        try std.testing.expectEqual(source.len, result.produced);
+        try std.testing.expectEqualSlices(u8, source, &restored);
+    }
+    for ([_]u8{ 7, 8, 9 }) |level| {
+        inline for (.{ .reduced, .maximum_lengths }) |pricing| {
+            const encoded = try encode(
+                source,
+                &wire,
+                encoder_workspace,
+                .{ .deflate = .{ .compression = .{ .level = level, .offline_pricing = pricing } } },
+            );
+            try std.testing.expectEqual(@as(u8, if (level == 9) 2 else 0), encoded[8]);
+            const result = try decode(
+                encoded,
+                &restored,
+                .{ .workspace = decoder_workspace },
+                .{ .output_size = .exact, .trailing_data = .reject },
+            );
+            try std.testing.expectEqual(source.len, result.produced);
+            try std.testing.expectEqualSlices(u8, source, &restored);
+        }
+    }
+    const early = try encode(
+        source,
+        &wire,
+        encoder_workspace,
+        .{ .deflate = .{ .compression = .{ .level = 9, .offline_refinement = .early } } },
+    );
+    const early_result = try decode(
+        early,
+        &restored,
+        .{ .workspace = decoder_workspace },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(source.len, early_result.produced);
+    try std.testing.expectEqualSlices(u8, source, &restored);
+    var encoder: Encoder = undefined;
+    try encoder.reset(encoder_workspace, .{});
+    const original_header = encoder_workspace.wire[0..10].*;
+    const original_counts = encoder.counts();
+    try std.testing.expectError(
+        error.InvalidOptions,
+        encoder.reset(
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = 9, .lazy_lookahead = .reduced } } },
+        ),
+    );
+    try std.testing.expectEqualSlices(u8, &original_header, encoder_workspace.wire[0..10]);
+    try std.testing.expectEqualDeep(original_counts, encoder.counts());
+    try std.testing.expectError(
+        error.InvalidOptions,
+        encoder.reset(
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = 6, .offline_pricing = .reduced } } },
+        ),
+    );
+    try std.testing.expectEqualSlices(u8, &original_header, encoder_workspace.wire[0..10]);
+    try std.testing.expectEqualDeep(original_counts, encoder.counts());
+    try std.testing.expectError(
+        error.InvalidOptions,
+        encoder.reset(
+            encoder_workspace,
+            .{
+                .deflate = .{ .compression = .{ .level = 6, .offline_pricing = .maximum_lengths } },
+            },
+        ),
+    );
+    try std.testing.expectEqualSlices(u8, &original_header, encoder_workspace.wire[0..10]);
+    try std.testing.expectEqualDeep(original_counts, encoder.counts());
+    @memset(&wire, 0xa5);
+    try std.testing.expectError(
+        error.InvalidOptions,
+        encode(
+            source,
+            &wire,
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = 10 } } },
+        ),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &wire, 0xa5));
+    // Header/trailer admission occurs before the raw encoder validates the requested level.
+    try std.testing.expectError(
+        error.LimitExceeded,
+        encode(
+            source,
+            &wire,
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = 10 }, .limits = .{ .output_bytes = 0 } } },
+        ),
+    );
+    inline for (.{ .reduced, .maximum_lengths }) |pricing| {
+        try std.testing.expectError(
+            error.LimitExceeded,
+            encode(
+                source,
+                &wire,
+                encoder_workspace,
+                .{
+                    .deflate = .{
+                        .compression = .{ .level = 6, .offline_pricing = pricing },
+                        .limits = .{ .output_bytes = 0 },
+                    },
+                },
+            ),
+        );
+    }
 }

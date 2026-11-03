@@ -568,11 +568,23 @@ pub const CommonTables = extern struct {
         const root_bits = if (shrink) @min(root_max, maximum) else root_max;
         const root_size = @as(usize, 1) << @as(IndexShift, @intCast(root_bits));
         if (root_size > table.len) return null;
+        // Skip the zero bucket when at least three quarters of the alphabet has no code. Denser
+        // books keep a branchless scan; both spans preserve canonical order among active symbols.
+        const sparse = lengths.len - counts[0] <= lengths.len / 4;
         self.offsets[0] = 0;
-        for (1..16) |i| self.offsets[i] = self.offsets[i - 1] + counts[i - 1];
-        for (lengths, 0..) |width, symbol| {
-            self.sorted[self.offsets[width]] = @intCast(symbol);
-            self.offsets[width] += 1;
+        self.offsets[1] = if (sparse) 0 else counts[0];
+        for (2..16) |i| self.offsets[i] = self.offsets[i - 1] + counts[i - 1];
+        if (sparse) {
+            for (lengths, 0..) |width, symbol| {
+                if (width == 0) continue;
+                self.sorted[self.offsets[width]] = @intCast(symbol);
+                self.offsets[width] += 1;
+            }
+        } else {
+            for (lengths, 0..) |width, symbol| {
+                self.sorted[self.offsets[width]] = @intCast(symbol);
+                self.offsets[width] += 1;
+            }
         }
         var sorted: usize = self.offsets[0];
         var width: u8 = 1;
@@ -1377,6 +1389,22 @@ test "common packed tables preserve canonical symbols payloads and storage bound
         try std.testing.expect(try tables.build(&lengths, &distances));
         try std.testing.expect(tables.literal_used <= tables.literal.len);
         try std.testing.expect(tables.distance_used <= tables.distance.len);
+        try checkCommonTable(
+            tables.literal[0..tables.literal_used],
+            tables.literal_bits,
+            &lengths,
+            false,
+        );
+        try checkCommonTable(tables.distance[0..tables.distance_used], 8, &distances, true);
+    }
+    // Complete books on either side of the sparse-sort boundary retain independent canonical
+    // expectations while reusing scratch from the preceding dense books.
+    for ([_]usize{ 71, 72 }) |active| {
+        @memset(&lengths, 0);
+        completeCommonLengths(lengths[0..active], 0);
+        lengths[256] = lengths[active - 1];
+        lengths[active - 1] = 0;
+        try std.testing.expect(try tables.build(&lengths, &distances));
         try checkCommonTable(
             tables.literal[0..tables.literal_used],
             tables.literal_bits,

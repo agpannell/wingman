@@ -65,7 +65,7 @@ pub const DecodeError = decoding.DecodeError;
 pub const Decoder = decoding.Decoder;
 
 pub const EncoderWorkspace = encoding.EncoderWorkspace;
-pub const EncodeProfile = encoding.EncodeProfile;
+pub const Compression = encoding.Compression;
 pub const EncodeAction = encoding.EncodeAction;
 pub const EncodeStatus = encoding.EncodeStatus;
 pub const EncodeProgress = encoding.EncodeProgress;

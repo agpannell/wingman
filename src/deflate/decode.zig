@@ -120,16 +120,25 @@ pub const DecodeStorage = struct {
     history: ?*[32768]u8 = null,
 };
 
+/// Complete raw decoding errors. `OutputSizeMismatch` means the final raw block ended before an
+/// exact destination was filled; it does not assert that trailing input or any enclosing checksum
+/// was accepted. Other errors have the contracts of `StreamDecodeError`.
+pub const DecodeError = stream.StreamDecodeError || error{OutputSizeMismatch};
+
 /// Decodes one complete raw stream without allocating or retaining buffer pointers. Output extent,
 /// trailing input and cumulative admission are independent selections. Dictionary-free calls retain
 /// direct-buffer kernels and require no separate history. Missing dictionary history or an invalid
-/// window returns `InvalidOptions`; failure may change unpublished output and scratch.
+/// window returns `InvalidOptions`. Exact output reserves the entire destination against output and
+/// work limits even if the stream ends short. Work admission precedes `OutputSizeMismatch`, which
+/// precedes rejected trailing data. A short exact result is an error and may change any part of the
+/// unpublished output. If input ends before EOB, direct decoding can report `InvalidStream` and
+/// dictionary decoding can report `Truncated`; an earlier admission failure takes precedence.
 pub fn decode(
     source: []const u8,
     output: []u8,
     storage: DecodeStorage,
     options: DecodeOptions,
-) stream.DecodeError!DecodeResult {
+) DecodeError!DecodeResult {
     const limits = options.limits;
     if (options.window_bytes == 0 or options.window_bytes > 32768) return error.InvalidOptions;
     const result = if (options.dictionary) |dictionary| blk: {
@@ -143,6 +152,21 @@ pub fn decode(
         try disjoint(source, history);
         try disjoint(output, history);
         var decoder: stream.Decoder = undefined;
+        // Reset checks these incoming overlaps before it changes the owner or history. Preserve
+        // that priority before testing the exact extent, without rejecting dictionary/input
+        // aliases.
+        const owner = std.mem.asBytes(&decoder);
+        try disjoint(owner, state);
+        try disjoint(owner, history);
+        try disjoint(state, history);
+        try disjoint(dictionary, owner);
+        try disjoint(dictionary, state);
+        try disjoint(dictionary, history);
+        // Exact admits the requested extent without charging it as additional work.
+        if (options.output_size == .exact and output.len > @min(
+            limits.output_bytes,
+            limits.work_units,
+        )) return error.LimitExceeded;
         try decoder.reset(
             .{ .workspace = storage.workspace, .history = history },
             .{ .window_bytes = options.window_bytes, .dictionary = dictionary, .limits = limits },
@@ -193,7 +217,8 @@ pub fn decode(
         return error.LimitExceeded;
     if (result.consumed > limits.work_units or result.produced > limits.work_units - result
         .consumed) return error.LimitExceeded;
-    if (options.output_size == .exact and result.produced != output.len) return error.InvalidStream;
+    if (options.output_size == .exact and result.produced != output.len)
+        return error.OutputSizeMismatch;
     if (options.trailing_data == .reject and result.consumed != source.len)
         return error.InvalidStream;
     return result;
@@ -487,7 +512,6 @@ fn decodeRawSized(
             else => return error.InvalidStream,
         }
         if (final_block) {
-            if (exact and written != output.len) return error.InvalidStream;
             bits.alignByte();
             return .{ .consumed = bits.consumed(), .produced = written };
         }
@@ -2817,7 +2841,7 @@ test "exact-size decoding verifies full extent before raw success" {
                 );
             } else if (capacity > expected.len) {
                 try std.testing.expectError(
-                    error.InvalidStream,
+                    error.OutputSizeMismatch,
                     decode(input, output, .{ .workspace = workspace }, .{ .output_size = .exact }),
                 );
             } else {
@@ -2859,7 +2883,7 @@ test "exact-size decoding verifies full extent before raw success" {
         )).produced,
     );
     try std.testing.expectError(
-        error.InvalidStream,
+        error.OutputSizeMismatch,
         decode(&empty, backing[0..1], .{ .workspace = workspace }, .{ .output_size = .exact }),
     );
 }
@@ -2930,7 +2954,7 @@ test "exact-size batched payloads preserve independent bytes framing and outside
                     );
                 } else if (capacity > fixture.size) {
                     try std.testing.expectError(
-                        error.InvalidStream,
+                        error.OutputSizeMismatch,
                         decode(
                             input,
                             output,
@@ -4731,7 +4755,7 @@ test "packed general recovery preserves large spare output and trailing input" {
         for (backing[0..31]) |byte| try std.testing.expectEqual(0xa5, byte);
         for (backing[31 + result.produced ..]) |byte| try std.testing.expectEqual(0xa5, byte);
         try std.testing.expectError(
-            error.InvalidStream,
+            error.OutputSizeMismatch,
             decode(
                 input[0..length],
                 output,
@@ -4820,4 +4844,171 @@ test "fixed independent five literal lookups preserve uniform widths and atomic 
 
 test {
     _ = workspace_storage;
+}
+
+test "exact short output admits limits before reporting raw extent" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    // Independent RFC wires for one literal and a separate application byte after the stream.
+    const fixed_wire = [_]u8{ 0x73, 0x04, 0x00, 0xee };
+    const stored = [_]u8{ 0x01, 0x01, 0x00, 0xfe, 0xff, 'A', 0xee };
+    const dictionaries = [_]?[]const u8{ null, "", "dictionary history" };
+    for ([_][]const u8{ &fixed_wire, &stored }) |source| {
+        const end = source.len - 1;
+        for (dictionaries) |dictionary| {
+            const storage: DecodeStorage = .{ .workspace = workspace, .history = history };
+            var backing: [4]u8 = @splat(0xa5);
+            var options: DecodeOptions = .{ .dictionary = dictionary, .output_size = .exact };
+            // Exact reserves both destination bytes even though this stream restores only one.
+            for ([_]u64{ 0, 1, 2, 3 }) |limit| {
+                options.limits = .{ .output_bytes = limit };
+                @memset(&backing, 0xa5);
+                const result = decode(source[0..end], backing[1..3], storage, options);
+                try std.testing.expectError(
+                    if (limit < 2) error.LimitExceeded else error.OutputSizeMismatch,
+                    result,
+                );
+                try std.testing.expectEqual(@as(u8, 0xa5), backing[0]);
+                try std.testing.expectEqual(@as(u8, 0xa5), backing[3]);
+            }
+            // Work counts encoded and restored bytes, not trailing application bytes.
+            for ([_]u64{ 2, end, end + 1, end + 2 }) |limit| {
+                options.limits = .{ .work_units = limit };
+                const result = decode(source[0..end], backing[1..3], storage, options);
+                try std.testing.expectError(
+                    if (limit < end + 1) error.LimitExceeded else error.OutputSizeMismatch,
+                    result,
+                );
+            }
+            options.limits = .{ .input_bytes = end - 1 };
+            try std.testing.expectError(
+                error.LimitExceeded,
+                decode(source, backing[1..3], storage, options),
+            );
+            options.limits = .{ .input_bytes = end };
+            options.trailing_data = .allow;
+            try std.testing.expectError(
+                error.OutputSizeMismatch,
+                decode(source, backing[1..3], storage, options),
+            );
+            options.trailing_data = .reject;
+            try std.testing.expectError(
+                error.OutputSizeMismatch,
+                decode(source, backing[1..3], storage, options),
+            );
+            // Once exact output is filled, rejected following input remains an InvalidStream.
+            try std.testing.expectError(
+                error.InvalidStream,
+                decode(source, backing[1..2], storage, options),
+            );
+            options.trailing_data = .allow;
+            const result = try decode(source, backing[1..2], storage, options);
+            try std.testing.expectEqual(end, result.consumed);
+            try std.testing.expectEqual(@as(u8, 'A'), backing[1]);
+        }
+    }
+}
+
+test "exact dictionary admission preserves overlap priority and borrowed input" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const source = [_]u8{ 0x73, 0x04, 0x00 };
+    var output: [4]u8 = @splat(0xa5);
+    const options: DecodeOptions = .{
+        .dictionary = history[0..2],
+        .output_size = .exact,
+        .limits = .{ .output_bytes = 0 },
+    };
+    @memset(history, 0x4b);
+    // A dictionary overlapping incoming history is refused before extent admission or reset copy.
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decode(&source, output[0..2], .{ .workspace = workspace, .history = history }, options),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, history, 0x4b));
+    try std.testing.expect(std.mem.allEqual(u8, &output, 0xa5));
+    const workspace_bytes = std.mem.asBytes(workspace);
+    workspace_bytes[0] = 0x5a;
+    var workspace_alias = options;
+    workspace_alias.dictionary = workspace_bytes[0..1];
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decode(
+            &source,
+            output[0..2],
+            .{ .workspace = workspace, .history = history },
+            workspace_alias,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0x5a), workspace_bytes[0]);
+    const shared = try allocator.alignedAlloc(
+        u8,
+        .of(DecoderWorkspace),
+        @sizeOf(DecoderWorkspace) + 32768,
+    );
+    defer allocator.free(shared);
+    const overlapping_workspace: *DecoderWorkspace = @ptrCast(@alignCast(shared.ptr));
+    const overlapping_history: *[32768]u8 = @ptrCast(shared.ptr);
+    var reservation_alias = options;
+    reservation_alias.dictionary = "";
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decode(
+            &source,
+            output[0..2],
+            .{ .workspace = overlapping_workspace, .history = overlapping_history },
+            reservation_alias,
+        ),
+    );
+
+    // Dictionary bytes can still borrow either the source or the destination: reset copies them
+    // before the encoded input or output is used, with independent mutable reservations.
+    for ([_][]const u8{ source[0..1], output[0..1] }) |dictionary| {
+        const selection: DecodeOptions = .{ .dictionary = dictionary, .output_size = .exact };
+        try std.testing.expectError(
+            error.OutputSizeMismatch,
+            decode(
+                &source,
+                output[0..2],
+                .{ .workspace = workspace, .history = history },
+                selection,
+            ),
+        );
+    }
+    // Bounded decoding needs only the actual restored byte; exact reserves both requested bytes.
+    const bounded: DecodeOptions = .{ .dictionary = "", .limits = .{ .output_bytes = 1 } };
+    const result = try decode(
+        &source,
+        output[0..2],
+        .{ .workspace = workspace, .history = history },
+        bounded,
+    );
+    try std.testing.expectEqual(@as(usize, 1), result.produced);
+    try std.testing.expectEqual(@as(u8, 'A'), output[0]);
+    for ([_]?[]const u8{ null, "" }) |dictionary| {
+        try std.testing.expectError(
+            if (dictionary == null) error.InvalidStream else error.Truncated,
+            decode(
+                source[0..1],
+                output[0..2],
+                .{ .workspace = workspace, .history = history },
+                .{ .dictionary = dictionary, .output_size = .exact },
+            ),
+        );
+        try std.testing.expectError(
+            error.OutputTooSmall,
+            decode(
+                &source,
+                output[0..0],
+                .{ .workspace = workspace, .history = history },
+                .{ .dictionary = dictionary, .output_size = .exact },
+            ),
+        );
+    }
 }

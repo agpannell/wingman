@@ -13,8 +13,9 @@ complete stream and verifies its checksum while decoding.
 
 Use separate caller-owned encoding and decoding workspaces. Construct them at stable addresses
 with `create(allocator)` and destroy them through the same allocator. The workspaces are shared with
-the raw DEFLATE library; the [storage guide](deflate.md#complete-buffers) gives their approximate
-sizes. Codec operations allocate nothing and retain no buffer pointers or allocator.
+the raw DEFLATE library; the [storage guide](deflate.md#complete-buffers) explains how to determine
+their target-specific sizes. Codec operations allocate nothing and retain no buffer pointers or
+allocator.
 
 ```zig
 const zlib = @import("wingman").zlib;
@@ -42,11 +43,19 @@ declared window, payload and Adler-32 trailer; its copied counts include the zli
 default accepts a bounded destination and leaves following input unconsumed. Select exact output and
 rejected trailing data independently when the enclosing format supplies those constraints. Unused
 output stays unchanged on success.
+An exact-output mismatch detected in the raw stream returns `InvalidStream`; the Adler-32 trailer
+has not necessarily been verified when that error is returned.
 
 Source, output and used workspaces must be disjoint; overlap returns `StorageOverlap`. Failures
 can change output or scratch and return no progress counts; do not publish failed output.
 Byte and algorithmic work limits are explicit options; the encoder's raw effort and limits live in
 `EncodeOptions.deflate` and count zlib framing in its output limit.
+
+The raw compression options select levels 0–9, with level 6 as the default and level 0 producing
+stored blocks. Level and strategy affect encoding effort, output size, and the header's
+informational FLEVEL hint and FCHECK bits. Adler-32 verification remains the same. See the
+[DEFLATE guide](deflate.md#complete-buffers) for the level, optional search and pricing settings,
+their work and output tradeoffs, and workspace storage contracts.
 
 ## Preset dictionaries
 
@@ -69,6 +78,9 @@ output, dictionary or completion boundaries. Input fragments may retire after ea
 output is provisional until `complete` confirms the checksum. After an error, reset the owner
 before reuse. A decoder needs a separate 32 KiB history buffer; its small state may be transferred
 between calls only when exclusive access to the same reservations transfers with it.
+
+An encoder step that fails returns no progress value. Its cumulative `counts()` can still include
+input and work admitted during the failed step, along with framing bytes already copied to output.
 
 `decodeReader` drives an initialized decoder from `std.Io.Reader` and keeps buffered lookahead in
 the reader. Transport failures remain `ReadFailed`. `decodeStoredReader` is a separate,

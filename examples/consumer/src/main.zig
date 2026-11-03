@@ -98,6 +98,54 @@ test "raw DEFLATE round trip uses caller workspaces and checks extent" {
     try std.testing.expectEqualStrings(source, &output);
 }
 
+test "raw DEFLATE levels and exact output errors are available to consumers" {
+    const allocator = std.testing.allocator;
+    const encoder = try deflate.EncoderWorkspace.create(allocator);
+    defer encoder.destroy(allocator);
+    const decoder = try deflate.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+    const source = "a small repeated record; a small repeated record";
+    var encoded_storage: [256]u8 = undefined;
+    var output: [source.len + 2]u8 = @splat(0xa5);
+
+    for ([_]u8{ 0, 1, 3, 6, 9 }) |level| {
+        const encoded = try deflate.encode(
+            source,
+            &encoded_storage,
+            encoder,
+            .{ .compression = .{ .level = level } },
+        );
+        if (level == 0) {
+            // The two block-type bits identify an uncompressed stored block.
+            try std.testing.expectEqual(@as(u8, 0), (encoded[0] >> 1) & 0b11);
+        }
+        @memset(&output, 0xa5);
+        const decoded = try deflate.decode(
+            encoded,
+            output[1 .. source.len + 1],
+            .{ .workspace = decoder },
+            .{ .output_size = .exact, .trailing_data = .reject },
+        );
+        try std.testing.expectEqual(source.len, decoded.produced);
+        try std.testing.expectEqualSlices(u8, source, output[1 .. source.len + 1]);
+        try std.testing.expectEqual(@as(u8, 0xa5), output[0]);
+        try std.testing.expectEqual(@as(u8, 0xa5), output[source.len + 1]);
+
+        // A raw end before the requested exact extent has its own error; no output is published.
+        try std.testing.expectError(
+            error.OutputSizeMismatch,
+            deflate.decode(encoded, &output, .{ .workspace = decoder }, .{ .output_size = .exact }),
+        );
+    }
+
+    @memset(&encoded_storage, 0xa5);
+    try std.testing.expectError(
+        error.InvalidOptions,
+        deflate.encode(source, &encoded_storage, encoder, .{ .compression = .{ .level = 10 } }),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &encoded_storage, 0xa5));
+}
+
 test "ETC and EAC blocks preserve constants and report refused work" {
     const pixels: [16][4]u8 = @splat(.{ 0, 0, 0, 17 });
     var block: [8]u8 = undefined;

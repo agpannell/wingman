@@ -9,7 +9,7 @@ const DecoderWorkspace = deflate.DecoderWorkspace;
 const decode = decoding.decode;
 
 pub const EncoderWorkspace = deflate.EncoderWorkspace;
-pub const EncodeProfile = deflate.EncodeProfile;
+pub const Compression = deflate.Compression;
 pub const EncodeAction = deflate.EncodeAction;
 pub const EncodeStatus = deflate.EncodeStatus;
 pub const EncodeProgress = deflate.EncodeProgress;
@@ -103,12 +103,11 @@ pub const Encoder = struct {
         self.failed = false;
         const cinfo: u8 = @intCast(std.math.log2_int(usize, options.deflate.window_bytes) - 8);
         self.header[0] = cinfo << 4 | 8;
-        const level: u8 = switch (options.deflate.profile) {
-            .stored, .huffman => 0,
-            .greedy => 1,
-            .lazy => 2,
-            .offline => 3,
-        };
+        const compression = options.deflate.compression;
+        // FLEVEL is only a hint. Keep the former hints for their corresponding level/strategy.
+        const level: u8 = if (compression.level == 0 or compression.strategy == .huffman_only)
+            0
+        else if (compression.level <= 3) 1 else if (compression.level <= 6) 2 else 3;
         const dictionary_flag: u8 = if (options.dictionary != null) 32 else 0;
         self.header[1] = level << 6 | dictionary_flag;
         const check = std.mem.readInt(u16, self.header[0..2], .big) % 31;
@@ -119,7 +118,8 @@ pub const Encoder = struct {
         }
     }
 
-    /// Copied cumulative counts; output includes returned framing bytes.
+    /// Copied cumulative counts, including framing bytes copied to output. A failed step returns no
+    /// progress value, but counts can include bytes and work admitted during that step.
     pub fn counts(self: *const Encoder) EncodeStats {
         var stats = self.raw.counts();
         stats.output_bytes += self.framing_bytes;
@@ -264,4 +264,236 @@ test "zlib encoding refuses complete-buffer overlap before dictionary copying" {
         ),
     );
     for (encode_workspace.data[0..32]) |byte| try std.testing.expectEqual(0xa5, byte);
+}
+
+test "failed zlib encoding exposes admitted raw work and framing counts" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    var output: [128]u8 = undefined;
+    for (
+        [_]Compression{
+            .{ .level = 3 },
+            .{ .level = 9 },
+            .{ .level = 9, .offline_pricing = .maximum_lengths },
+            .{ .level = 9, .offline_refinement = .early },
+        },
+    ) |compression| {
+        try encoder.reset(
+            workspace,
+            .{ .deflate = .{ .compression = compression, .limits = .{ .work_units = 1 } } },
+        );
+        _ = try encoder.step("x", &output, .process);
+        const published = encoder.counts();
+        try std.testing.expectEqual(1, published.input_bytes);
+        try std.testing.expectEqual(2, published.output_bytes);
+        try std.testing.expectError(
+            error.LimitExceeded,
+            encoder.step("aaaaaaaaaaaa", &output, .finish),
+        );
+        try std.testing.expectEqual(1, encoder.counts().work_units);
+        try std.testing.expectEqual(1, encoder.counts().match_probes);
+        try std.testing.expect(encoder.counts().input_bytes > published.input_bytes);
+        try std.testing.expectEqual(published.output_bytes, encoder.counts().output_bytes);
+        try std.testing.expectError(error.NeedReset, encoder.step("", &output, .finish));
+    }
+}
+
+test "compression levels retain zlib header and dictionary contracts" {
+    const allocator = std.testing.allocator;
+    const encoder_workspace = try EncoderWorkspace.create(allocator);
+    defer encoder_workspace.destroy(allocator);
+    const decoder_workspace = try DecoderWorkspace.create(allocator);
+    defer decoder_workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const source = "small shared history, followed by another shared history";
+    const dictionaries = [_]?[]const u8{ null, "", "small shared history" };
+    const hints = [_]u8{ 0, 1, 1, 1, 2, 2, 2, 3, 3, 3 };
+    var wire: [512]u8 = undefined;
+    var restored: [source.len]u8 = undefined;
+    for (hints, 0..) |hint, level| {
+        for (dictionaries) |dictionary| {
+            const encoded = try encode(
+                source,
+                &wire,
+                encoder_workspace,
+                .{
+                    .deflate = .{ .compression = .{ .level = @intCast(level) } },
+                    .dictionary = dictionary,
+                },
+            );
+            // FLEVEL is a hint; FCHECK covers both header bytes, and an empty dictionary still has
+            // an identity distinct from no dictionary.
+            try std.testing.expectEqual(hint, encoded[1] >> 6);
+            try std.testing.expectEqual(
+                @as(u16, 0),
+                std.mem.readInt(u16, encoded[0..2], .big) % 31,
+            );
+            try std.testing.expectEqual(dictionary != null, encoded[1] & 0x20 != 0);
+            if (dictionary) |bytes| {
+                try std.testing.expectEqual(
+                    adler32.hash(bytes),
+                    std.mem.readInt(u32, encoded[2..6], .big),
+                );
+            }
+            try std.testing.expectEqual(
+                adler32.hash(source),
+                std.mem.readInt(u32, encoded[encoded.len - 4 ..][0..4], .big),
+            );
+            const result = try decode(
+                encoded,
+                &restored,
+                .{ .workspace = decoder_workspace, .history = history },
+                .{ .dictionary = dictionary, .output_size = .exact, .trailing_data = .reject },
+            );
+            try std.testing.expectEqual(source.len, result.produced);
+            try std.testing.expectEqualSlices(u8, source, &restored);
+        }
+    }
+    const literal_only = try encode(
+        source,
+        &wire,
+        encoder_workspace,
+        .{ .deflate = .{ .compression = .{ .strategy = .huffman_only } } },
+    );
+    try std.testing.expectEqual(@as(u8, 0), literal_only[1] >> 6);
+    for ([_]u8{ 4, 5, 6 }) |level| {
+        const dictionary = "small shared history";
+        const encoded = try encode(
+            source,
+            &wire,
+            encoder_workspace,
+            .{
+                .deflate = .{
+                    .compression = .{ .level = level, .lazy_lookahead = .reduced },
+                    .window_bytes = 256,
+                },
+                .dictionary = dictionary,
+            },
+        );
+        try std.testing.expectEqual(@as(u8, 2), encoded[1] >> 6);
+        try std.testing.expect(encoded[1] & 0x20 != 0);
+        const result = try decode(
+            encoded,
+            &restored,
+            .{ .workspace = decoder_workspace, .history = history },
+            .{ .dictionary = dictionary, .output_size = .exact, .trailing_data = .reject },
+        );
+        try std.testing.expectEqual(source.len, result.produced);
+        try std.testing.expectEqualSlices(u8, source, &restored);
+    }
+    for ([_]u8{ 7, 8, 9 }) |level| {
+        inline for (.{ .reduced, .maximum_lengths }) |pricing| {
+            const dictionary = "small shared history";
+            const encoded = try encode(
+                source,
+                &wire,
+                encoder_workspace,
+                .{
+                    .deflate = .{
+                        .compression = .{ .level = level, .offline_pricing = pricing },
+                        .window_bytes = 256,
+                    },
+                    .dictionary = dictionary,
+                },
+            );
+            try std.testing.expectEqual(@as(u8, 3), encoded[1] >> 6);
+            const result = try decode(
+                encoded,
+                &restored,
+                .{ .workspace = decoder_workspace, .history = history },
+                .{ .dictionary = dictionary, .output_size = .exact, .trailing_data = .reject },
+            );
+            try std.testing.expectEqual(source.len, result.produced);
+            try std.testing.expectEqualSlices(u8, source, &restored);
+        }
+    }
+    const early = try encode(
+        source,
+        &wire,
+        encoder_workspace,
+        .{
+            .deflate = .{ .compression = .{ .level = 9, .offline_refinement = .early } },
+            .dictionary = "small shared history",
+        },
+    );
+    const early_result = try decode(
+        early,
+        &restored,
+        .{ .workspace = decoder_workspace, .history = history },
+        .{ .dictionary = "small shared history", .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(source.len, early_result.produced);
+    try std.testing.expectEqualSlices(u8, source, &restored);
+    var encoder: Encoder = undefined;
+    try encoder.reset(encoder_workspace, .{});
+    const original_header = encoder.header[0..2].*;
+    const original_counts = encoder.counts();
+    try std.testing.expectError(
+        error.InvalidOptions,
+        encoder.reset(
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = 9, .lazy_lookahead = .reduced } } },
+        ),
+    );
+    try std.testing.expectEqualSlices(u8, &original_header, encoder.header[0..2]);
+    try std.testing.expectEqualDeep(original_counts, encoder.counts());
+    try std.testing.expectError(
+        error.InvalidOptions,
+        encoder.reset(
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = 6, .offline_pricing = .reduced } } },
+        ),
+    );
+    try std.testing.expectEqualSlices(u8, &original_header, encoder.header[0..2]);
+    try std.testing.expectEqualDeep(original_counts, encoder.counts());
+    try std.testing.expectError(
+        error.InvalidOptions,
+        encoder.reset(
+            encoder_workspace,
+            .{
+                .deflate = .{ .compression = .{ .level = 6, .offline_pricing = .maximum_lengths } },
+            },
+        ),
+    );
+    try std.testing.expectEqualSlices(u8, &original_header, encoder.header[0..2]);
+    try std.testing.expectEqualDeep(original_counts, encoder.counts());
+    @memset(&wire, 0xa5);
+    try std.testing.expectError(
+        error.InvalidOptions,
+        encode(
+            source,
+            &wire,
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = 10 } } },
+        ),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &wire, 0xa5));
+    // Framing must fit the caller's allowance before reset attempts raw compression options.
+    try std.testing.expectError(
+        error.LimitExceeded,
+        encode(
+            source,
+            &wire,
+            encoder_workspace,
+            .{ .deflate = .{ .compression = .{ .level = 10 }, .limits = .{ .output_bytes = 0 } } },
+        ),
+    );
+    inline for (.{ .reduced, .maximum_lengths }) |pricing| {
+        try std.testing.expectError(
+            error.LimitExceeded,
+            encode(
+                source,
+                &wire,
+                encoder_workspace,
+                .{
+                    .deflate = .{
+                        .compression = .{ .level = 6, .offline_pricing = pricing },
+                        .limits = .{ .output_bytes = 0 },
+                    },
+                },
+            ),
+        );
+    }
 }

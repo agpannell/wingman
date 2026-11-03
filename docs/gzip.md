@@ -13,8 +13,8 @@ one member with a name and header checksum, inspects the header and verifies the
 
 Create separate caller-owned encoding and decoding workspaces at stable addresses and destroy them
 through the same allocator. They are the same workspace types used by raw DEFLATE; see the
-[storage guide](deflate.md#complete-buffers) for approximate sizes. Codec calls allocate nothing
-and retain no input, output or allocator after return.
+[storage guide](deflate.md#complete-buffers) for target-specific sizing. Codec calls allocate
+nothing and retain no input, output or allocator after return.
 
 ```zig
 const gzip = @import("wingman").gzip;
@@ -44,11 +44,17 @@ per-member limits. Preset dictionaries are unsupported in gzip. Optional extra d
 its state. `header_crc` requests the format's optional FHCRC; the data CRC-32 and original-size
 trailer are always written.
 
+The raw compression level ranges from 0 to 9, defaults to 6 and uses stored blocks at 0. See the
+[DEFLATE guide](deflate.md#complete-buffers) for effort and strategy choices, optional search and
+pricing settings, and their work and output tradeoffs.
+
 Complete decoding verifies headers, optional FHCRC, data CRC-32 and original size modulo 2³². The
 default decodes one member, accepts bounded output and leaves following input unconsumed. Exact
 output and trailing-data rejection are separate options. Select `.members = .concatenate` to decode
 all supplied members; concatenation rejects trailing garbage. `MemberIterator` instead verifies
 and returns one member at a time, advancing only after successful validation.
+An exact-output mismatch detected in the raw stream returns `InvalidStream`; the member's trailer
+has not necessarily been verified when that error is returned.
 
 Source, output and used workspaces must be disjoint; overlap returns `StorageOverlap`. Failures can
 change output or scratch and publish no progress counts. Do not publish failed output. Complete
@@ -66,6 +72,9 @@ total header sizes. Header inspection alone does not validate the compressed pay
 `Encoder` accepts fragments and supports process, flush, full-flush and finish. `nextMember` starts
 another member with independent history while cumulative statistics continue. The caller supplies
 metadata and output; consumed fragments can retire after each step.
+
+An encoder step that fails returns no progress value; `counts()` retains the last successfully
+published counts. Output and workspace may still have changed, and the encoder requires reset.
 
 `Decoder` borrows an exclusive workspace and separate 32 KiB history; optional `HeaderBuffers`
 capture metadata in caller storage. It can stop after one member, return each verified member for

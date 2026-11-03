@@ -60,7 +60,7 @@ pub const decodeReader = decoding.decodeReader;
 pub const decodeStoredReader = decoding.decodeStoredReader;
 
 pub const EncoderWorkspace = encoding.EncoderWorkspace;
-pub const EncodeProfile = encoding.EncodeProfile;
+pub const Compression = encoding.Compression;
 pub const EncodeAction = encoding.EncodeAction;
 pub const EncodeStatus = encoding.EncodeStatus;
 pub const EncodeProgress = encoding.EncodeProgress;

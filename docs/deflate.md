@@ -19,8 +19,9 @@ encodes and recovers a complete raw stream.
 Create separate encoding and decoding workspaces at stable addresses with the allocator that will
 later destroy them. Codec calls allocate nothing and retain neither buffer nor allocator. An encoder
 workspace contains substantial search storage; avoid placing a large temporary on the stack.
-On x86-64 with Zig 0.17.0, the encoder workspace is about 6 MiB and the decoder workspace is
-about 20 KiB. Exact sizes depend on the target; use `@sizeOf` for the workspace type.
+Workspace sizes depend on the target and compiler; use `@sizeOf(deflate.EncoderWorkspace)` and
+`@sizeOf(deflate.DecoderWorkspace)` for the selected build. Streaming decoding also needs a
+separate 32 KiB history buffer.
 
 ```zig
 const deflate = @import("wingman").deflate;
@@ -43,10 +44,35 @@ const result = try deflate.decode(encoded, restored, .{ .workspace = decoder }, 
 // result.consumed == encoded.len and result.produced == expected_size.
 ```
 
-Encoding returns a prefix borrowed from output; retain the full reservation for cleanup. Its
-`.offline` default spends more work looking for a smaller result. Select `.stored`, `.huffman`,
-`.greedy` or `.lazy` to change effort; all produce ordinary DEFLATE. The options also bound input,
-output and algorithmic work. Work units are not elapsed time or instruction counts.
+Encoding returns a prefix borrowed from output; retain the full reservation for cleanup. Set
+`EncodeOptions.compression.level` from 0 through 9 to choose the effort spent on compression.
+Level 0 stores bytes without compression; levels 1–3 use greedy matching, 4–6 use lazy matching and
+7–9 use offline parsing. The default is level 6. Higher levels generally spend more effort to seek
+smaller output, but neither time nor size is guaranteed to improve for every input. Level numbers
+are not equivalent to another encoder's settings.
+
+Use `.{ .compression = .{ .level = 9 } }` when more encoding work is appropriate, or set
+`compression.strategy = .huffman_only` to skip match search. Level 0 always stores bytes, even
+with the Huffman-only strategy. Every level and strategy currently uses an `EncoderWorkspace`.
+The options also bound input, output and algorithmic work. Work units are not elapsed time or
+instruction counts; some bounded pricing scans and dictionary or wrapper metadata work are not
+charged. Bound input and metadata separately when those costs matter.
+
+The default compression settings perform full lazy lookahead and full offline pricing with
+standard refinement. For ordinary matching at levels 4–6, `lazy_lookahead = .reduced` spends less
+search effort on the position after a candidate match. At levels 7–9, `offline_pricing = .reduced`
+prices the first retained match supporting each length; that match need not be the nearest.
+`offline_pricing = .maximum_lengths` prices only each retained match's longest length. Both can
+exclude choices considered by full pricing. `offline_refinement = .early` can stop after the second
+pass when the dynamic cost improved by at most 1%; that threshold does not bound the final change
+in compressed size. Standard refinement continues until costs stop improving or the pass limit is
+reached.
+
+These choices can change encoded bytes, work used and whether a finite work allowance is exhausted;
+they do not guarantee faster encoding or smaller output for every input. Nondefault lookahead is
+valid only for ordinary matching at levels 4–6; nondefault offline pricing or refinement requires
+ordinary matching at levels 7–9. Other combinations return `InvalidOptions`. The input and output
+limits remain independent of these settings.
 
 Decoding defaults to bounded output and allows following input. On success, copied `consumed` and
 `produced` counts identify the raw stream and initialized output; unused output stays unchanged.
@@ -54,6 +80,12 @@ Use `.output_size = .exact` to require the full destination and `.trailing_data 
 require all supplied input. Decode limits bound accepted input, restored output and their combined
 work units. A dictionary-free decode needs only a decoder workspace. A selected preset dictionary
 also needs an independent 32 KiB history reservation in `DecodeStorage`.
+
+Exact decoding reserves the whole requested destination against output and work limits, even if
+the stream ends short. After work admission, a valid raw end before the destination is filled
+returns `OutputSizeMismatch`; that result does not validate trailing input or an enclosing
+checksum. A rejected trailing suffix is checked after the exact extent. Direct decoding can report
+`InvalidStream` for truncated input, while dictionary decoding can report `Truncated`.
 
 Source, output and workspace must be disjoint. Overlap is refused before mutation; other failures
 can modify output or workspace and publish no progress. Do not publish partial output from a failed

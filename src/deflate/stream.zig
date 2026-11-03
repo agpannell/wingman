@@ -73,7 +73,7 @@ pub const StreamStorage = struct {
 
 /// Streaming errors poison the context until reset. Truncated means EOF before the raw boundary;
 /// NeedReset refuses further work after any failure.
-pub const DecodeError = Error || error{
+pub const StreamDecodeError = Error || error{
     /// Final input ended before the raw stream's end marker.
     Truncated,
     /// A previous step failed; call `Decoder.reset` before continuing.
@@ -149,13 +149,13 @@ pub const Decoder = struct {
     work_left: u64 = 0,
 
     /// Starts a new independent stream, ending all previous borrows and failure state. History
-    /// contents need no initialization; no bytes are cleared. Invalid windows and overlapping
-    /// reservations fail before setup.
+    /// contents need no initialization; no bytes are cleared. Invalid windows and overlaps among
+    /// the incoming dictionary, owner and reservations fail before setup.
     pub fn reset(
         self: *Decoder,
         storage: StreamStorage,
         options: StreamDecodeOptions,
-    ) DecodeError!void {
+    ) StreamDecodeError!void {
         const workspace = storage.workspace;
         const history = storage.history;
         const limits = options.limits;
@@ -163,6 +163,13 @@ pub const Decoder = struct {
         try disjoint(std.mem.asBytes(self), history);
         try disjoint(std.mem.asBytes(workspace), history);
         if (options.window_bytes == 0 or options.window_bytes > 32768) return error.InvalidOptions;
+        if (options.dictionary) |dictionary| {
+            // Reset replaces self and then copies history. Refuse every incoming overlap before
+            // either write, including a dictionary borrowed from the previous owner.
+            try disjoint(dictionary, std.mem.asBytes(self));
+            try disjoint(dictionary, std.mem.asBytes(workspace));
+            try disjoint(dictionary, history);
+        }
         self.* = .{
             .workspace = workspace,
             .history = history,
@@ -176,7 +183,7 @@ pub const Decoder = struct {
     /// Seeds a fresh stream from only the reachable suffix. The dictionary is copied, can retire on
     /// return, and is not included in output or counters. Call before the first step; wrappers own
     /// dictionary identity checks.
-    pub fn setDictionary(self: *Decoder, dictionary: []const u8) DecodeError!void {
+    pub fn setDictionary(self: *Decoder, dictionary: []const u8) StreamDecodeError!void {
         if (self.failed) {
             @branchHint(.unlikely);
             return error.NeedReset;
@@ -191,7 +198,7 @@ pub const Decoder = struct {
     /// Advances until input/output is needed or the raw stream ends. Repeated blocked empty calls
     /// do no work. EOF turns need_input into Truncated, including when final bytes were consumed
     /// during an earlier output stall.
-    pub fn step(self: *Decoder, input: Input, output: []u8) DecodeError!DecodeProgress {
+    pub fn step(self: *Decoder, input: Input, output: []u8) StreamDecodeError!DecodeProgress {
         if (self.failed) {
             @branchHint(.unlikely);
             return error.NeedReset;
@@ -203,7 +210,7 @@ pub const Decoder = struct {
         };
     }
 
-    fn seed(self: *Decoder, dictionary: []const u8) DecodeError!void {
+    fn seed(self: *Decoder, dictionary: []const u8) StreamDecodeError!void {
         if (self.started) return error.InvalidState;
         try self.admit(dictionary, &.{});
         const count = @min(dictionary.len, self.window_bytes);
@@ -212,7 +219,7 @@ pub const Decoder = struct {
         self.history_position = count & 32767;
     }
 
-    fn admit(self: *Decoder, source: []const u8, output: []u8) DecodeError!void {
+    fn admit(self: *Decoder, source: []const u8, output: []u8) StreamDecodeError!void {
         try disjoint(source, output);
         const reservations = .{
             std.mem.asBytes(self),
@@ -229,7 +236,7 @@ pub const Decoder = struct {
         self: *Decoder,
         supplied_input: Input,
         supplied_output: []u8,
-    ) DecodeError!DecodeProgress {
+    ) StreamDecodeError!DecodeProgress {
         try self.admit(supplied_input.bytes, supplied_output);
         const input_left = self.limits.input_bytes -| self.input_bytes;
         const output_left = self.limits.output_bytes -| self.output_bytes;
@@ -479,13 +486,13 @@ pub const Decoder = struct {
         consumed: usize,
         produced: usize,
         count: usize,
-    ) DecodeError!void {
+    ) StreamDecodeError!void {
         if (consumed > self.work_left) return error.LimitExceeded;
         const remaining = self.work_left - consumed;
         if (produced > remaining or count > remaining - produced) return error.LimitExceeded;
     }
 
-    fn checkDistance(self: *const Decoder, distance: usize, written: usize) DecodeError!void {
+    fn checkDistance(self: *const Decoder, distance: usize, written: usize) StreamDecodeError!void {
         if (distance == 0 or distance > self.window_bytes) return error.InvalidStream;
         if (distance > written and distance - written > self.history_length)
             return error.InvalidStream;
@@ -500,7 +507,7 @@ pub const Decoder = struct {
         bits: *Bits,
         output: []u8,
         written: *usize,
-    ) DecodeError!void {
+    ) StreamDecodeError!void {
         if (bits.count > 7 or bits.source.len > self.work_left) return;
         if (output.len > self.work_left - bits.source.len) return;
         while (bits.source.len - bits.position >= 8 and output.len - written.* >= 258) {
@@ -622,6 +629,51 @@ fn streamEntry(table: anytype, bits: *Bits) Error!?Entry {
         bits.drop(used);
         return entry;
     }
+}
+
+test "decoder reset admits dictionary before replacing the owner" {
+    const allocator = std.testing.allocator;
+    const old_workspace = try DecoderWorkspace.create(allocator);
+    defer old_workspace.destroy(allocator);
+    const new_workspace = try DecoderWorkspace.create(allocator);
+    defer new_workspace.destroy(allocator);
+    const old_history = try allocator.create([32768]u8);
+    defer allocator.destroy(old_history);
+    const new_history = try allocator.create([32768]u8);
+    defer allocator.destroy(new_history);
+    var decoder: Decoder = undefined;
+    try decoder.reset(.{ .workspace = old_workspace, .history = old_history }, .{});
+    const raw = [_]u8{ 1, 1, 0, 254, 255, 'A' };
+    _ = try decoder.step(.{ .bytes = &raw, .final = true }, &.{});
+
+    // An aliased owner field is caller-supplied source, even when reset would overwrite it.
+    const owner_bytes = std.mem.asBytes(&decoder.input_bytes);
+    const before = owner_bytes[0..@sizeOf(u64)].*;
+    const storage: StreamStorage = .{ .workspace = new_workspace, .history = new_history };
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decoder.reset(storage, .{ .dictionary = owner_bytes }),
+    );
+    try std.testing.expectEqualSlices(u8, &before, owner_bytes);
+
+    // Incoming history cannot also be dictionary input. A retired history reservation remains a
+    // valid source when reset installs separate storage and copies its bytes.
+    @memset(new_history[0..8], 0xa5);
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decoder.reset(storage, .{ .dictionary = new_history[0..8] }),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, new_history[0..8], 0xa5));
+    const workspace_bytes = std.mem.asBytes(new_workspace);
+    @memset(workspace_bytes[0..8], 0xa5);
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decoder.reset(storage, .{ .dictionary = workspace_bytes[0..8] }),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, workspace_bytes[0..8], 0xa5));
+    @memcpy(old_history[0..8], "history!");
+    try decoder.reset(storage, .{ .dictionary = old_history[0..8] });
+    try std.testing.expectEqualSlices(u8, "history!", new_history[0..decoder.history_length]);
 }
 
 test "resumable DEFLATE retires fragments through tables matches and history wraps" {

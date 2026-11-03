@@ -123,7 +123,8 @@ fn decodeMember(
         .{ .workspace = workspace },
         .{ .output_size = options.output_size, .limits = options.limits },
     ) catch |err| switch (err) {
-        error.InvalidStream => return error.InvalidStream,
+        // A raw extent failure occurs before this member's CRC and size are checked.
+        error.InvalidStream, error.OutputSizeMismatch => return error.InvalidStream,
         error.InvalidOptions => return error.InvalidOptions,
         error.OutputTooSmall => return error.OutputTooSmall,
         error.StorageOverlap => return error.StorageOverlap,
@@ -364,7 +365,7 @@ pub const DecodeProgress = struct {
 };
 
 /// Any stream failure poisons the decoder until reset.
-pub const DecodeError = deflate.DecodeError || error{HeaderTooLong};
+pub const DecodeError = deflate.StreamDecodeError || error{HeaderTooLong};
 
 /// Resumable gzip framing over raw DEFLATE. Call reset at its final address;
 /// workspace/history/capture buffers remain exclusive borrows. Fragments can retire immediately. No
@@ -1472,4 +1473,43 @@ test "gzip exact member extents preserve finite admission and concatenated empty
     try std.testing.expectEqual(1, first.members);
     try std.testing.expectEqual(empty.len, first.consumed);
     try std.testing.expectEqual(0, first.produced);
+}
+
+test "exact short extent does not claim an unverified gzip trailer" {
+    const workspace = try DecoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    // Independent gzip stored-block framing for "A", including CRC-32 0xd3d99e8b and size 1.
+    const wire = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x01, 0x01, 0x00, 0xfe, 0xff,
+        'A',  0x8b, 0x9e, 0xd9, 0xd3, 0x01, 0x00, 0x00, 0x00,
+    };
+    var bad = wire;
+    bad[bad.len - 8] ^= 1;
+    var output: [4]u8 = @splat(0xa5);
+    const options: DecodeOptions = .{ .output_size = .exact };
+    // A short raw end does not validate the member's CRC or size.
+    for ([_][]const u8{ &wire, &bad, wire[0 .. wire.len - 1] }) |source| {
+        try std.testing.expectError(
+            error.InvalidStream,
+            decode(source, output[1..3], .{ .workspace = workspace }, options),
+        );
+    }
+    const result = try decode(&wire, output[1..2], .{ .workspace = workspace }, options);
+    try std.testing.expectEqual(@as(usize, 1), result.produced);
+    try std.testing.expectEqual(@as(u8, 'A'), output[1]);
+    try std.testing.expectError(
+        error.InvalidStream,
+        decode(&bad, output[1..2], .{ .workspace = workspace }, options),
+    );
+    try std.testing.expectError(
+        error.LimitExceeded,
+        decode(
+            &wire,
+            output[1..2],
+            .{ .workspace = workspace },
+            .{ .output_size = .exact, .limits = .{ .input_bytes = wire.len - 1 } },
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0xa5), output[0]);
+    try std.testing.expectEqual(@as(u8, 0xa5), output[3]);
 }

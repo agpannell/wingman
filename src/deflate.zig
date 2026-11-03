@@ -19,22 +19,32 @@
 //! Reserve `encodeBound(source.len)` output capacity and an `EncoderWorkspace`, then call `encode`.
 //! Optional dictionary bytes are copied from `EncodeOptions.dictionary` during setup. `Encoder`
 //! supports fragmented input with `process`, `flush`, `full_flush` and `finish` actions. The
-//! default `EncodeProfile.offline` spends more work on compressed size; other profiles reduce
-//! search effort. Stored encoding adds framing without compressing the payload. Complete stored
-//! finishes write directly to the destination when it fits; fragmented calls use the same bounded
-//! workspace. Every profile still requires an `EncoderWorkspace`.
+//! default compression level 6 balances search effort and size; levels 7–9 use offline parsing.
+//! Level 0 stores data without compression, and the optional Huffman-only strategy skips matches.
+//! Complete stored finishes write directly to the destination when it fits; fragmented calls use
+//! the same bounded workspace. Every level and strategy still requires an `EncoderWorkspace`.
 //!
-//! Compressed profiles compare exact stored, fixed and dynamic block sizes. Dynamic headers
-//! describe code widths with literals and repeat codes; each trial price table selects a cheapest
-//! legal sequence with deterministic ties. Work allowances retain their algorithmic charges when
-//! range minima accelerate the repeat search. Identical consecutive trials reuse the remaining
-//! trials within that header computation, charging their full work. A smaller allowance executes
-//! the trials to preserve partial counters and refusal.
+//! Compressed levels and the Huffman-only strategy compare exact stored, fixed and dynamic block
+//! sizes. Dynamic codebooks use an optimal length-limited Huffman construction with deterministic
+//! equal-cost choices. Dynamic headers describe code widths with literals and repeat codes; each
+//! trial price table selects a cheapest legal sequence with deterministic ties. Work allowances
+//! retain their algorithmic charges when range minima accelerate the repeat search. Identical
+//! consecutive trials reuse the remaining trials within that header computation, charging their
+//! full work. A smaller allowance executes the trials to preserve partial counters and refusal.
 //!
 //! Offline parsing prices paths through literals and matches, trying up to eight codebook updates.
-//! Equal-price length ranges share an exact suffix minimum, retaining the shortest match on ties.
-//! When code widths stabilize, later passes reuse the same parse. Their logical work is still
-//! charged; a smaller allowance executes the passes to preserve partial counters and refusal.
+//! After the first priced pass, it stops when the dynamic block cost no longer improves. The pass
+//! that triggers the stop can still supply the chosen block. Full offline pricing considers every
+//! retained match distance for each length; reduced pricing considers the first retained match for
+//! each length. Maximum-length pricing considers each retained match only at its longest length,
+//! skipping shorter length and distance choices. The non-full choices can change size and work and
+//! are available at ordinary levels 7–9. Optional early refinement stops after the second pass when
+//! its dynamic cost improves by at most 1% over the first; it can reduce time and work at the cost
+//! of a larger output. Skipped passes are not charged. Otherwise refinement continues normally.
+//! When code widths stabilize and another pass remains, that pass would repeat the cost. Its
+//! logical work is charged without running it when the allowance permits; otherwise it runs
+//! normally, preserving partial counters and refusal. The chosen parse and work count depend on the
+//! input and can affect encoded size and whether a finite work allowance suffices.
 //!
 //! ## Storage and failure
 //!
@@ -75,11 +85,12 @@ pub const Input = stream.Input;
 pub const DecodeStatus = stream.DecodeStatus;
 pub const DecodeProgress = stream.DecodeProgress;
 pub const DecodeLimits = stream.DecodeLimits;
-pub const DecodeError = stream.DecodeError;
+pub const DecodeError = decoding.DecodeError;
+pub const StreamDecodeError = stream.StreamDecodeError;
 pub const Decoder = stream.Decoder;
 
 pub const EncodeError = encoding.EncodeError;
-pub const EncodeProfile = encoding.EncodeProfile;
+pub const Compression = encoding.Compression;
 pub const EncodeLimits = encoding.EncodeLimits;
 pub const EncodeOptions = encoding.EncodeOptions;
 pub const EncodeAction = encoding.EncodeAction;
@@ -104,7 +115,7 @@ test "native encoder profiles preserve independent RFC wires and exact recovery"
     const stored_a = [_]u8{ 0x01, 0x01, 0x00, 0xfe, 0xff, 0x41 };
     const empty_fixed = [_]u8{ 0x03, 0x00 };
     const fixed_a = [_]u8{ 0x73, 0x04, 0x00 };
-    const stored = try encode("A", &wire, encoder_workspace, .{ .profile = .stored });
+    const stored = try encode("A", &wire, encoder_workspace, .{ .compression = .{ .level = 0 } });
     try std.testing.expectEqualSlices(u8, &stored_a, stored);
     try std.testing.expectEqualSlices(
         u8,
@@ -125,9 +136,31 @@ test "native encoder profiles preserve independent RFC wires and exact recovery"
             1 => @truncate((i *% 123457 +% (i >> 4)) >> 5),
             else => 0,
         };
-        inline for (std.meta.tags(EncodeProfile)) |profile| {
+        inline for (
+            [_]Compression{
+                .{ .level = 0 },
+                .{ .strategy = .huffman_only },
+                .{ .level = 3 },
+                .{ .level = 6 },
+                .{ .level = 9 },
+                .{ .level = 7, .offline_pricing = .reduced },
+                .{ .level = 8, .offline_pricing = .reduced },
+                .{ .level = 9, .offline_pricing = .reduced },
+                .{ .level = 7, .offline_pricing = .maximum_lengths },
+                .{ .level = 8, .offline_pricing = .maximum_lengths },
+                .{ .level = 9, .offline_pricing = .maximum_lengths },
+                .{ .level = 7, .offline_refinement = .early },
+                .{ .level = 8, .offline_pricing = .reduced, .offline_refinement = .early },
+                .{ .level = 9, .offline_pricing = .maximum_lengths, .offline_refinement = .early },
+            },
+        ) |compression| {
             @memset(output, 0xa5);
-            const result = try encode(data, encoded, encoder_workspace, .{ .profile = profile });
+            const result = try encode(
+                data,
+                encoded,
+                encoder_workspace,
+                .{ .compression = compression },
+            );
             const recovered = try decode(
                 result,
                 output[1 .. data.len + 1],
@@ -157,8 +190,28 @@ test "encoder retires byte fragments retains dictionaries and distinguishes flus
     var wire: [512]u8 = undefined;
     var output: [source.len]u8 = undefined;
     inline for (.{ EncodeAction.flush, EncodeAction.full_flush }) |flush| {
-        inline for (std.meta.tags(EncodeProfile)) |profile| {
-            try encoder.reset(encoder_workspace, .{ .profile = profile });
+        inline for (
+            [_]Compression{
+                .{ .level = 0 },
+                .{ .strategy = .huffman_only },
+                .{ .level = 3 },
+                .{ .level = 6 },
+                .{ .level = 4, .lazy_lookahead = .reduced },
+                .{ .level = 5, .lazy_lookahead = .reduced },
+                .{ .level = 6, .lazy_lookahead = .reduced },
+                .{ .level = 9 },
+                .{ .level = 7, .offline_pricing = .reduced },
+                .{ .level = 8, .offline_pricing = .reduced },
+                .{ .level = 9, .offline_pricing = .reduced },
+                .{ .level = 7, .offline_pricing = .maximum_lengths },
+                .{ .level = 8, .offline_pricing = .maximum_lengths },
+                .{ .level = 9, .offline_pricing = .maximum_lengths },
+                .{ .level = 7, .offline_refinement = .early },
+                .{ .level = 8, .offline_pricing = .reduced, .offline_refinement = .early },
+                .{ .level = 9, .offline_pricing = .maximum_lengths, .offline_refinement = .early },
+            },
+        ) |compression| {
+            try encoder.reset(encoder_workspace, .{ .compression = compression });
             try encoder.setDictionary(dictionary);
             var read: usize = 0;
             var written: usize = 0;
@@ -216,11 +269,17 @@ test "encoder bounds limits overlap failure reset and clearing are explicit" {
     try std.testing.expectError(error.NeedReset, encoder.step("", &wire, .finish));
     try encoder.reset(encoder_workspace, .{ .limits = .{ .work_units = 0 } });
     try std.testing.expectError(error.LimitExceeded, encoder.step("abcabc", &wire, .finish));
-    try encoder.reset(encoder_workspace, .{ .profile = .stored, .limits = .{ .output_bytes = 6 } });
+    try encoder.reset(
+        encoder_workspace,
+        .{ .compression = .{ .level = 0 }, .limits = .{ .output_bytes = 6 } },
+    );
     try std.testing.expectEqual(.complete, (try encoder.step("A", wire[1..7], .finish)).status);
     try std.testing.expectEqual(0xa5, wire[0]);
     try std.testing.expectEqual(0xa5, wire[7]);
-    try encoder.reset(encoder_workspace, .{ .profile = .stored, .limits = .{ .output_bytes = 5 } });
+    try encoder.reset(
+        encoder_workspace,
+        .{ .compression = .{ .level = 0 }, .limits = .{ .output_bytes = 5 } },
+    );
     try std.testing.expectError(error.LimitExceeded, encoder.step("A", &wire, .finish));
     try encoder.reset(encoder_workspace, .{});
     try std.testing.expectError(error.StorageOverlap, encoder.step(wire[0..3], &wire, .finish));
@@ -254,7 +313,7 @@ test "complete decode separates extent trailing data limits and dictionary stora
     try std.testing.expectEqualStrings("hello", output[0..result.produced]);
     try std.testing.expect(std.mem.allEqual(u8, output[5..], 0xa5));
     try std.testing.expectError(
-        error.InvalidStream,
+        error.OutputSizeMismatch,
         decode(&wire, &output, buffers, .{ .output_size = .exact }),
     );
     _ = try decode(&wire, output[0..5], buffers, .{ .output_size = .exact });
