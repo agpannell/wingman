@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
             .step = "xxhash-example",
             .source = "examples/xxhash.zig",
             .executable = "xxhashsum",
-            .description = "Compute seeded and seed-zero XXH32 and XXH64 hashes",
+            .description = "Compute classic and XXH3 hashes with seeds and a custom secret",
         },
         .{
             .step = "blake3-example",

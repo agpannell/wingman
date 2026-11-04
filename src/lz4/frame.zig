@@ -34,7 +34,7 @@
 
 const std = @import("std");
 
-const xxhash32 = @import("../xxhash32.zig");
+const Xxh32 = @import("../xxhash.zig").Xxh32;
 const lz4 = @import("block.zig");
 const high_compression = @import("hc.zig");
 
@@ -305,7 +305,7 @@ pub fn decodeFrame(
                 if (info.block_checksum) {
                     const checksum = try take(source, &read, 4, &counter);
                     const expected = std.mem.readInt(u32, checksum[0..4], .little);
-                    if (xxhash32.hash(block) != expected) return error.ChecksumMismatch;
+                    if (Xxh32.hash(block) != expected) return error.ChecksumMismatch;
                 }
                 const capacity = @min(output.len - written, info.block_size.bytes());
                 const allowed = counter.outputCapacity(capacity);
@@ -348,7 +348,7 @@ pub fn decodeFrame(
             if (info.content_checksum) {
                 const checksum = try take(source, &read, 4, &counter);
                 const expected = std.mem.readInt(u32, checksum[0..4], .little);
-                const actual = xxhash32.hash(output[begin..written]);
+                const actual = Xxh32.hash(output[begin..written]);
                 if (actual != expected) return error.ChecksumMismatch;
             }
         }
@@ -405,8 +405,8 @@ pub const FrameDecoder = struct {
     raw_block: bool,
     block_produced: usize,
     frame_produced: u64,
-    block_hash: xxhash32.Hasher,
-    content_hash: xxhash32.Hasher,
+    block_hash: Xxh32,
+    content_hash: Xxh32,
     final_input: bool,
 
     const Phase = enum {
@@ -459,8 +459,8 @@ pub const FrameDecoder = struct {
             .raw_block = false,
             .block_produced = 0,
             .frame_produced = 0,
-            .block_hash = .init,
-            .content_hash = .init,
+            .block_hash = Xxh32.init(0),
+            .content_hash = Xxh32.init(0),
             .final_input = false,
         };
         try self.raw.reset(&workspace.history, .{});
@@ -586,7 +586,7 @@ pub const FrameDecoder = struct {
                     try self.raw.setDictionary(self.workspace.dictionary[0..self.dictionary_size]);
                 }
                 self.block_produced = 0;
-                self.block_hash = .init;
+                self.block_hash = Xxh32.init(0);
                 self.phase = .block;
             },
             .block => {
@@ -736,7 +736,7 @@ pub const FrameDecoder = struct {
         try self.raw.reset(&self.workspace.history, .{});
         try self.raw.setDictionary(self.workspace.dictionary[0..self.dictionary_size]);
         self.frame_produced = 0;
-        self.content_hash = .init;
+        self.content_hash = Xxh32.init(0);
         self.phase = .block_size;
     }
 
@@ -870,7 +870,7 @@ pub const FrameEncoder = struct {
     body: []const u8,
     after_pending: Phase,
     phase: Phase,
-    content_hash: xxhash32.Hasher,
+    content_hash: Xxh32,
     finish_requested: bool,
     hc_work: u64,
 
@@ -916,7 +916,7 @@ pub const FrameEncoder = struct {
             .body = &.{},
             .after_pending = .input,
             .phase = .pending,
-            .content_hash = .init,
+            .content_hash = Xxh32.init(0),
             .finish_requested = false,
             .hc_work = 0,
         };
@@ -1069,7 +1069,7 @@ pub const FrameEncoder = struct {
         const stored_flag: u32 = if (compressed) 0 else 0x80000000;
         std.mem.writeInt(u32, &self.prefix, size | stored_flag, .little);
         if (self.options.block_checksum) {
-            std.mem.writeInt(u32, &self.suffix, xxhash32.hash(self.body), .little);
+            std.mem.writeInt(u32, &self.suffix, Xxh32.hash(self.body), .little);
         }
 
         if (!self.options.independent) {
@@ -1173,7 +1173,7 @@ fn descriptorSize(prefix: []const u8) FrameError!usize {
 fn descriptor(bytes: []const u8) FrameError!FrameInfo {
     const size = try descriptorSize(bytes[0..2]);
     std.debug.assert(bytes.len == size);
-    const checksum: u8 = @truncate(xxhash32.hash(bytes[0 .. size - 1]) >> 8);
+    const checksum: u8 = @truncate(Xxh32.hash(bytes[0 .. size - 1]) >> 8);
     if (checksum != bytes[size - 1]) return error.ChecksumMismatch;
     const flags = bytes[0];
     var cursor: usize = 2;
@@ -1267,7 +1267,7 @@ fn writeHeader(output: *[19]u8, options: FrameEncodeOptions) usize {
         std.mem.writeInt(u32, output[size..][0..4], value, .little);
         size += 4;
     }
-    output[size] = @truncate(xxhash32.hash(output[4..size]) >> 8);
+    output[size] = @truncate(Xxh32.hash(output[4..size]) >> 8);
     return size + 1;
 }
 

@@ -1,28 +1,37 @@
-//! Computes noncryptographic 32-bit XXH32 hashes for checksums and lookup keys.
-//! `hash` uses seed zero and `hashSeeded` accepts any u32 seed. Both accept
-//! exact, unaligned byte slices without padding.
+//! Computes noncryptographic 32-bit XXH32 hashes for checksums and lookup keys. `hash` uses seed
+//! zero and `hashSeeded` accepts any u32 seed. Both accept exact, unaligned byte slices without
+//! padding.
 //!
-//! For incremental input, start a `Hasher` with `.init` or seeded `reset`,
-//! append fragments with `update` and read `final` snapshots. Calls allocate
-//! nothing, retain no input and need no cleanup. Copies of a state continue
-//! independently; assign `.init` to start again. See hashSeeded for an
-//! executable one-shot and incremental example.
+//! Numeric results are independent of host byte order. The upstream canonical four bytes use
+//! big-endian order; LZ4 frame fields use little-endian order.
 //!
-//! Numeric results are independent of host byte order. The upstream canonical
-//! four bytes use big-endian order; LZ4 frame fields use little-endian order.
+//! Initialize a caller-owned state with `init(seed)`, then `update` and `final`. Copies continue
+//! independently; `final` is a snapshot and input is never retained.
 //!
 //! Algorithm specification and streaming reference:
 //! https://github.com/Cyan4973/xxHash/blob/v0.8.4/doc/xxhash_spec.md
 //! https://github.com/Cyan4973/xxHash/blob/v0.8.4/xxhash.h
 
+const Xxh32 = @This();
+
+/// Four running stripe accumulators. Initialize through `init` or `reset`.
+accumulators: [4]u32 = initialAccumulators(0),
+/// Accepted byte count modulo 2^32.
+total: u32 = 0,
+/// Copied partial stripe; only the `buffered` prefix is active.
+tail: [16]u8 = @splat(0),
+/// Active tail byte count, less than 16 in a valid state.
+buffered: u8 = 0,
+/// Remembers a processed stripe after the byte count wraps.
+striped: bool = false,
+
 const std = @import("std");
 const testing = std.testing;
 
-// Yann Collet's xxHash specification defines the word mixing. A stripe feeds
-// four independent accumulators with little-endian words; rotations and odd
-// multipliers mix each contribution. The lanes converge before the final short
-// tail and avalanche. This implementation keeps a copied partial stripe for
-// streaming and retains long-input mode when its length counter wraps.
+// Yann Collet's xxHash specification defines the word mixing. A stripe feeds four independent
+// accumulators with little-endian words; rotations and odd multipliers mix each contribution. The
+// lanes converge before the final short tail and avalanche. This implementation keeps a copied
+// partial stripe for streaming and retains long-input mode when its length counter wraps.
 // https://github.com/Cyan4973/xxHash/blob/c87183a/doc/xxhash_spec.md
 
 const prime_1: u32 = 0x9e3779b1;
@@ -31,86 +40,65 @@ const prime_3: u32 = 0xc2b2ae3d;
 const prime_4: u32 = 0x27d4eb2f;
 const prime_5: u32 = 0x165667b1;
 
-/// Incremental seeded XXH32 state. Retains accumulators and at most 15 tail
-/// bytes. Initialize before updating; copies are independent.
-pub const Hasher = struct {
-    /// Four running stripe accumulators; initialize with `.init` or `reset`.
-    accumulators: [4]u32 = initialAccumulators(0),
-    /// Accepted byte count modulo 2^32.
-    total: u32 = 0,
-    /// Copied bytes of the incomplete stripe; only the `buffered` prefix is
-    /// active.
-    tail: [16]u8 = @splat(0),
-    /// Active tail length, always less than 16 in a valid state.
-    buffered: u8 = 0,
-    /// Remembers that a full stripe was processed, independently of counter
-    /// wrapping.
-    striped: bool = false,
+/// Starts a new stream with any 32-bit seed.
+pub fn init(seed: u32) Xxh32 {
+    return .{ .accumulators = initialAccumulators(seed) };
+}
 
-    /// Seed-zero initial state. Copy or assign to begin another stream.
-    pub const init: Hasher = .{};
+/// Starts a stream with any seed in possibly uninitialized storage.
+pub fn reset(self: *Xxh32, seed: u32) void {
+    self.* = .{ .accumulators = initialAccumulators(seed) };
+}
 
-    /// Starts a stream with any seed in possibly uninitialized storage.
-    pub fn reset(self: *Hasher, seed: u32) void {
-        self.* = .{ .accumulators = initialAccumulators(seed) };
+/// Appends exact bytes without retaining them. Input must not overlap this mutable state. Total
+/// length wraps modulo 2^32; the long-input path survives counter wrapping.
+pub fn update(self: *Xxh32, input: []const u8) void {
+    self.total +%= @truncate(input.len);
+    var bytes = input;
+    if (bytes.len < 16 - @as(usize, self.buffered)) {
+        @memcpy(self.tail[self.buffered..][0..bytes.len], bytes);
+        self.buffered += @intCast(bytes.len);
+        return;
     }
 
-    /// Appends exact bytes. Total length contributes modulo 2^32; streams
-    /// longer than 4 GiB retain the long-input accumulator path after wrapping.
-    /// Input must remain readable and must not overlap this mutable state until
-    /// return.
-    pub fn update(self: *Hasher, input: []const u8) void {
-        self.total +%= @truncate(input.len);
-        var bytes = input;
-        if (bytes.len < 16 - @as(usize, self.buffered)) {
-            @memcpy(self.tail[self.buffered..][0..bytes.len], bytes);
-            self.buffered += @intCast(bytes.len);
-            return;
-        }
-
-        self.striped = true;
-        if (self.buffered != 0) {
-            const take = 16 - @as(usize, self.buffered);
-            @memcpy(self.tail[self.buffered..], bytes[0..take]);
-            consume(&self.accumulators, &self.tail);
-            bytes = bytes[take..];
-        }
-        while (bytes.len >= 16) : (bytes = bytes[16..]) consume(
-            &self.accumulators,
-            bytes[0..16],
-        );
-
-        @memcpy(self.tail[0..bytes.len], bytes);
-        self.buffered = @intCast(bytes.len);
+    self.striped = true;
+    if (self.buffered != 0) {
+        const take = 16 - @as(usize, self.buffered);
+        @memcpy(self.tail[self.buffered..], bytes[0..take]);
+        consume(&self.accumulators, &self.tail);
+        bytes = bytes[take..];
     }
+    while (bytes.len >= 16) : (bytes = bytes[16..]) consume(&self.accumulators, bytes[0..16]);
 
-    test update {
-        var state: Hasher = .init;
-        state.reset(1);
-        state.update("a");
-        const prefix = state.final();
-        state.update("bc");
-        try testing.expectEqual(hashSeeded(1, "a"), prefix);
-        try testing.expectEqual(hashSeeded(1, "abc"), state.final());
-    }
+    @memcpy(self.tail[0..bytes.len], bytes);
+    self.buffered = @intCast(bytes.len);
+}
 
-    /// Returns a snapshot without resetting. Later updates extend this stream.
-    pub fn final(self: *const Hasher) u32 {
-        const result: u32 = blk: {
-            if (self.striped) break :blk merge(self.accumulators);
-            break :blk self.accumulators[2] +% prime_5;
-        };
-        return finish(result +% self.total, self.tail[0..self.buffered]);
-    }
-};
+test update {
+    var state = init(1);
+    state.update("a");
+    const prefix = state.final();
+    state.update("bc");
+    try testing.expectEqual(hashSeeded(1, "a"), prefix);
+    try testing.expectEqual(0xaa3da8ff, state.final());
+}
+
+/// Returns a snapshot without resetting. Later updates extend this stream.
+pub fn final(self: *const Xxh32) u32 {
+    const result: u32 = blk: {
+        if (self.striped) break :blk merge(self.accumulators);
+        break :blk self.accumulators[2] +% prime_5;
+    };
+    return finish(result +% self.total, self.tail[0..self.buffered]);
+}
 
 /// Hashes a complete exact byte slice with seed zero and no retained state.
 pub fn hash(bytes: []const u8) u32 {
     return hashSeeded(0, bytes);
 }
 
-/// Hashes exactly `bytes` with the supplied seed. Empty and unaligned slices
-/// need no padding. The numeric result retains no input or other resource.
+/// Hashes exactly `bytes` with the supplied seed. Empty and unaligned slices need no padding. The
+/// numeric result retains no input or other resource.
 pub fn hashSeeded(seed: u32, bytes: []const u8) u32 {
     var cursor: usize = 0;
     var result = seed +% prime_5;
@@ -125,11 +113,10 @@ pub fn hashSeeded(seed: u32, bytes: []const u8) u32 {
 }
 
 test hashSeeded {
-    // Independent XXH32 result from xxHash v0.8.4, also retained in
-    // test_vectors.
+    // Independent XXH32 result from xxHash v0.8.4, also retained in test_vectors.
     try testing.expectEqual(0xaa3da8ff, hashSeeded(1, "abc"));
 
-    var state: Hasher = .init;
+    var state = init(0);
     state.reset(1);
     state.update("a");
     state.update("bc");
@@ -137,21 +124,13 @@ test hashSeeded {
 }
 
 fn initialAccumulators(seed: u32) [4]u32 {
-    return .{
-        seed +% prime_1 +% prime_2,
-        seed +% prime_2,
-        seed,
-        seed -% prime_1,
-    };
+    return .{ seed +% prime_1 +% prime_2, seed +% prime_2, seed, seed -% prime_1 };
 }
 
 inline fn consume(accumulators: *[4]u32, bytes: *const [16]u8) void {
     inline for (0..4) |i| {
         const word = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
-        accumulators[i] = rotate(
-            accumulators[i] +% word *% prime_2,
-            13,
-        ) *% prime_1;
+        accumulators[i] = rotate(accumulators[i] +% word *% prime_2, 13) *% prime_1;
     }
 }
 
@@ -186,8 +165,7 @@ fn rotate(value: u32, count: u5) u32 {
     return std.math.rotl(u32, value, count);
 }
 
-// Frozen numeric results from xxHash v0.8.4's XXH32. The reference code is
-// copyright Yann Collet, BSD-2-Clause. No reference code is linked here.
+// Frozen numeric results from xxHash v0.8.4's XXH32, designed by Yann Collet and contributors.
 // https://github.com/Cyan4973/xxHash/blob/v0.8.4/xxhash.h
 const test_vectors = [_]struct {
     seed: u32,
@@ -204,11 +182,8 @@ const test_vectors = [_]struct {
 
 test "XXH32 independent seeded vectors" {
     for (test_vectors) |vector| {
-        try testing.expectEqual(
-            vector.expected,
-            hashSeeded(vector.seed, vector.text),
-        );
-        var state: Hasher = .init;
+        try testing.expectEqual(vector.expected, hashSeeded(vector.seed, vector.text));
+        var state = init(0);
         state.reset(vector.seed);
         state.update(vector.text);
         try testing.expectEqual(vector.expected, state.final());
@@ -225,13 +200,10 @@ test "XXH32 every split, snapshots, independent copies and reset" {
                 const expected = std.hash.XxHash32.hash(seed, bytes);
                 try testing.expectEqual(expected, hashSeeded(seed, bytes));
                 for (0..length + 1) |split| {
-                    var state: Hasher = .init;
+                    var state = init(0);
                     state.reset(seed);
                     state.update(bytes[0..split]);
-                    try testing.expectEqual(
-                        hashSeeded(seed, bytes[0..split]),
-                        state.final(),
-                    );
+                    try testing.expectEqual(hashSeeded(seed, bytes[0..split]), state.final());
                     var copy = state;
                     state.update("");
                     state.update(bytes[split..]);
@@ -242,28 +214,25 @@ test "XXH32 every split, snapshots, independent copies and reset" {
             }
             const bytes = storage[offset..][0..1026];
             for (0..bytes.len + 1) |split| {
-                var state: Hasher = .init;
+                var state = init(0);
                 state.reset(seed);
                 state.update(bytes[0..split]);
                 state.update(bytes[split..]);
-                try testing.expectEqual(
-                    std.hash.XxHash32.hash(seed, bytes),
-                    state.final(),
-                );
+                try testing.expectEqual(std.hash.XxHash32.hash(seed, bytes), state.final());
             }
         }
     }
-    var state: Hasher = .init;
+    var state = init(0);
     for (storage) |byte| state.update(&.{byte});
     try testing.expectEqual(hash(&storage), state.final());
-    state = .init;
+    state = init(0);
     try testing.expectEqual(hash(""), state.final());
 }
 
 test "XXH32 reset initializes storage and snapshots own pending bytes" {
     const text = "a partially buffered input";
     var input = text.*;
-    var state: Hasher = undefined;
+    var state: Xxh32 = undefined;
     state.reset(0xffffffff);
     state.update(&input);
     const prefix = state.final();
@@ -272,10 +241,7 @@ test "XXH32 reset initializes storage and snapshots own pending bytes" {
     copy.update(" suffix");
     try testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, text), prefix);
     try testing.expectEqual(prefix, state.final());
-    try testing.expectEqual(
-        std.hash.XxHash32.hash(0xffffffff, text ++ " suffix"),
-        copy.final(),
-    );
+    try testing.expectEqual(std.hash.XxHash32.hash(0xffffffff, text ++ " suffix"), copy.final());
     state.reset(1);
     state.update("abc");
     try testing.expectEqual(@as(u32, 0xaa3da8ff), state.final());
@@ -295,47 +261,28 @@ test "XXH32 exact input at Linux protected pages" {
     defer std.posix.munmap(mapping);
     for ([_]usize{ 0, 3 * page }) |offset| {
         const result = std.os.linux.mprotect(mapping.ptr + offset, page, .{});
-        try std.testing.expectEqual(
-            std.posix.E.SUCCESS,
-            std.posix.errno(result),
-        );
+        try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(result));
     }
     const bytes = mapping[page..][0 .. 2 * page];
     for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 173 +% (i >> 4));
-    const protected = std.os.linux.mprotect(
-        bytes.ptr,
-        bytes.len,
-        .{ .READ = true },
-    );
-    try std.testing.expectEqual(
-        std.posix.E.SUCCESS,
-        std.posix.errno(protected),
-    );
+    const protected = std.os.linux.mprotect(bytes.ptr, bytes.len, .{ .READ = true });
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(protected));
     for (0..1025) |size| {
-        for (
-            [_][]const u8{ bytes[0..size], bytes[bytes.len - size ..] },
-        ) |input| {
-            try testing.expectEqual(
-                std.hash.XxHash32.hash(0, input),
-                hash(input),
-            );
-            var state: Hasher = .init;
+        for ([_][]const u8{ bytes[0..size], bytes[bytes.len - size ..] }) |input| {
+            try testing.expectEqual(std.hash.XxHash32.hash(0, input), hash(input));
+            var state = init(0);
             state.reset(1);
             const split = @min(input.len, 15);
             state.update(input[0..split]);
             state.update(input[split..]);
-            try testing.expectEqual(
-                std.hash.XxHash32.hash(1, input),
-                state.final(),
-            );
+            try testing.expectEqual(std.hash.XxHash32.hash(1, input), state.final());
         }
     }
 }
 
 test "XXH32 synthetic counter wraps retain the stripe branch" {
-    // Independent facts from xxHash v0.8.4 at c87183a. The public C digest
-    // supplies these results. Synthetic counters do not claim an executed
-    // prefix of 2^32 bytes.
+    // Independent facts from xxHash v0.8.4 at c87183a. The public C digest supplies these results.
+    // Synthetic counters do not claim an executed prefix of 2^32 bytes.
     const cases = [_]struct {
         seed: u32,
         before: u32,
@@ -346,7 +293,7 @@ test "XXH32 synthetic counter wraps retain the stripe branch" {
     };
     const stripe = "0123456789abcdef";
     for (cases) |case| {
-        var state: Hasher = .init;
+        var state = init(0);
         state.reset(case.seed);
         state.update(stripe);
         state.total = 0xfffffff0;

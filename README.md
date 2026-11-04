@@ -21,10 +21,10 @@ ownership and failure rules, and the ideas behind its implementation.
 | --- | --- | --- |
 | [`adler32`](docs/adler32.md) | zlib checksums, streaming and checksum combination | `example` |
 | [`crc32`](docs/crc32.md) | IEEE CRC-32 for gzip and PNG, streaming and combination | `crc32-example` |
-| [`xxhash32`, `xxhash64`](docs/xxhash.md) | Classic seeded hashes with copied streaming state | `xxhash-example` |
+| [`xxhash`](docs/xxhash.md) | Seeded and streaming XXH32/64 and XXH3-64/128; custom secrets for XXH3 | `xxhash-example` |
 | [`blake3`](docs/blake3.md) | Cryptographic digests, keyed hashing, key derivation and seekable output | `blake3-example` |
 
-Adler-32, CRC-32 and classic xxHash detect accidental corruption or support lookups; their
+Adler-32, CRC-32 and xxHash detect accidental corruption or support lookups; their
 noncryptographic values do not establish input identity or authenticate a message. BLAKE3 provides
 a cryptographic digest and separate keyed and key-derivation modes. IEEE CRC-32 differs from
 CRC-32C and the x86 instruction named CRC32.
@@ -166,7 +166,7 @@ test "complete and streaming checksums" {
 
 Input byte slices need no padding or extra alignment. Storage and lifetimes are explicit:
 
-- Checksum and hash states copy what they need; input chunks can be released after `update` returns.
+- Checksum and hash updates retain no input chunks. XXH3 custom-secret streams borrow the secret.
 - LZ4 complete calls retain no input; resumable owners borrow their workspace and copy accepted
   fragments. Output stays private until completion and any required integrity checks succeed.
 - RIFF and WAVE inspection views borrow encoded input. Keep it alive while using those views or

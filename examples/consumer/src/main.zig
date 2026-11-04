@@ -2,8 +2,9 @@
 const std = @import("std");
 const adler32 = @import("wingman").adler32;
 const crc32 = @import("wingman").crc32;
-const xxhash32 = @import("wingman").xxhash32;
-const xxhash64 = @import("wingman").xxhash64;
+const Xxh32 = @import("wingman").xxhash.Xxh32;
+const Xxh64 = @import("wingman").xxhash.Xxh64;
+const xxhash = @import("wingman").xxhash;
 const blake3 = @import("wingman").blake3;
 const lz4 = @import("wingman").lz4;
 const deflate = @import("wingman").deflate;
@@ -418,12 +419,12 @@ test "IEEE CRC reusable combination operators" {
 }
 
 test "classic xxHash fixed facts and seeded streaming" {
-    try std.testing.expectEqual(@as(u32, 0x32d153ff), xxhash32.hash("abc"));
-    try std.testing.expectEqual(@as(u64, 0x44bc2cf5ad770999), xxhash64.hash("abc"));
-    try std.testing.expectEqual(@as(u32, 0xaa3da8ff), xxhash32.hashSeeded(1, "abc"));
-    try std.testing.expectEqual(@as(u64, 0x13c1d910702770e6), xxhash64.hashSeeded(42, "abc"));
-    var state32: xxhash32.Hasher = undefined;
-    var state64: xxhash64.Hasher = undefined;
+    try std.testing.expectEqual(@as(u32, 0x32d153ff), Xxh32.hash("abc"));
+    try std.testing.expectEqual(@as(u64, 0x44bc2cf5ad770999), Xxh64.hash("abc"));
+    try std.testing.expectEqual(@as(u32, 0xaa3da8ff), Xxh32.hashSeeded(1, "abc"));
+    try std.testing.expectEqual(@as(u64, 0x13c1d910702770e6), Xxh64.hashSeeded(42, "abc"));
+    var state32: Xxh32 = undefined;
+    var state64: Xxh64 = undefined;
     state32.reset(0xffffffff);
     state64.reset(0x8000000000000001);
     state32.update("a");
@@ -447,22 +448,46 @@ test "classic xxHash fixed facts and seeded streaming" {
 test "classic xxHash numeric encoding and zero-seed reset" {
     var canonical32: [4]u8 = undefined;
     var canonical64: [8]u8 = undefined;
-    std.mem.writeInt(u32, &canonical32, xxhash32.hash("abc"), .big);
-    std.mem.writeInt(u64, &canonical64, xxhash64.hash("abc"), .big);
+    std.mem.writeInt(u32, &canonical32, Xxh32.hash("abc"), .big);
+    std.mem.writeInt(u64, &canonical64, Xxh64.hash("abc"), .big);
     try std.testing.expectEqual([4]u8{ 0x32, 0xd1, 0x53, 0xff }, canonical32);
     try std.testing.expectEqual([8]u8{
         0x44, 0xbc, 0x2c, 0xf5, 0xad, 0x77, 0x09, 0x99,
     }, canonical64);
-    var state32: xxhash32.Hasher = .init;
-    var state64: xxhash64.Hasher = .init;
+    var state32 = Xxh32.init(0);
+    var state64 = Xxh64.init(0);
     state32.update("discard");
     state64.update("discard");
-    state32 = .init;
-    state64 = .init;
+    state32 = Xxh32.init(0);
+    state64 = Xxh64.init(0);
     state32.update("");
     state64.update("");
     try std.testing.expectEqual(@as(u32, 0x02cc5d05), state32.final());
     try std.testing.expectEqual(@as(u64, 0xef46db3751d8e999), state64.final());
+}
+
+test "XXH3 seeded and borrowed-secret streams" {
+    const input = "abc";
+    try std.testing.expectEqual(@as(u64, 0x78af5f94892f3950), xxhash.Xxh3_64.hash(input));
+    try std.testing.expectEqual(
+        @as(u128, 0x6b05ab6733a618578af5f94892f3950),
+        xxhash.Xxh3_128.hash(input),
+    );
+    var secret: [136]u8 = undefined;
+    for (&secret, 0..) |*byte, i| byte.* = @truncate(i * 71 + 13);
+    const options: xxhash.Xxh3Options = .{ .mode = .{ .secret = &secret } };
+    var stream: xxhash.Xxh3_128 = undefined;
+    try stream.initWithOptions(options);
+    stream.update("a");
+    stream.update("bc");
+    try std.testing.expectEqual(
+        try xxhash.Xxh3_128.hashWithOptions(options, input),
+        stream.final(),
+    );
+    try std.testing.expectError(
+        error.InvalidSecret,
+        xxhash.Xxh3_64.hashWithOptions(.{ .mode = .{ .secret = secret[0..135] } }, input),
+    );
 }
 
 test "WAVE owned and caller samples retain rate and independent storage" {
