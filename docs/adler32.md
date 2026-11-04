@@ -88,6 +88,11 @@ A block of `n` bytes can express the same work as two independent reductions:
 - Add the sum of the bytes to the first sum.
 - Add `n` times the incoming first sum, plus bytes weighted `n, n-1, …, 1`, to the second sum.
 
+For complete inputs shorter than sixteen bytes, the initial sums stay below the modulus even for
+maximum-valued bytes. The one-shot operation uses the scalar recurrence directly and skips both
+vector setup and modular division. Incremental updates retain reduction for arbitrary valid
+incoming sums.
+
 The weights count how many later prefix sums contain each byte. This removes the serial per-byte
 dependency from the inner loop. Portable vector columns accumulate equal positions across blocks;
 x86 SSE2 and AVX2 use byte sums and paired multiplies; VNNI paths use byte dot products. Four

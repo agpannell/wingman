@@ -105,6 +105,17 @@ pub const Hasher = struct {
 /// stores this integer in big-endian order; the doctest writes those bytes into caller-owned footer
 /// storage.
 pub fn hash(bytes: []const u8) u32 {
+    // From the initial sums, at most fifteen maximum bytes give first <= 3826 and second <=
+    // 30615. Neither sum needs reduction, and these tiny inputs need no vector-column setup.
+    if (bytes.len < 16) {
+        var first: u32 = 1;
+        var second: u32 = 0;
+        for (bytes) |byte| {
+            first += byte;
+            second += first;
+        }
+        return (second << 16) | first;
+    }
     var state: Hasher = .init;
     // Inlining lets LLVM specialize the initial sums even when a caller also uses incremental
     // updates.
@@ -458,6 +469,9 @@ const maximum_byte_facts = [_]struct {
 }{
     .{ .length = 0, .expected = 0x00000001 },
     .{ .length = 1, .expected = 0x01000100 },
+    .{ .length = 14, .expected = 0x68a50df3 },
+    .{ .length = 15, .expected = 0x77970ef2 },
+    .{ .length = 16, .expected = 0x87880ff1 },
     .{ .length = 31, .expected = 0xee3e1ee2 },
     .{ .length = 32, .expected = 0x0e2e1fe1 },
     .{ .length = 63, .expected = 0xd8c83ec2 },

@@ -17,6 +17,9 @@ pub fn main(init: std.process.Init) !void {
         adler32.hash(input[split..]),
         input.len - split,
     );
+    const operator = adler32.CombineOperator.forLength(input.len - split);
+    const reused = operator.apply(adler32.hash(input[0..split]), adler32.hash(input[split..]));
+    if (reused != complete) return error.ChecksumMismatch;
     if (stream.final() != complete or combined != complete) return error.ChecksumMismatch;
 
     var footer: [4]u8 = undefined;
