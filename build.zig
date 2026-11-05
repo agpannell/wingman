@@ -30,10 +30,10 @@ pub fn build(b: *std.Build) void {
             .description = "Compute Adler-32 from complete, streamed and combined text",
         },
         .{
-            .step = "crc32-example",
-            .source = "examples/crc32.zig",
-            .executable = "crc32sum",
-            .description = "Compute IEEE CRC-32 and encode gzip and PNG checksum fields",
+            .step = "crc-example",
+            .source = "examples/crc.zig",
+            .executable = "crcsum",
+            .description = "Compute named CRC checksums and encode IEEE gzip and PNG fields",
         },
         .{
             .step = "xxhash-example",

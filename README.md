@@ -20,11 +20,11 @@ ownership and failure rules, and the ideas behind its implementation.
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`adler32`](docs/adler32.md) | zlib checksums, streaming and checksum combination | `example` |
-| [`crc32`](docs/crc32.md) | IEEE CRC-32 for gzip and PNG, streaming and combination | `crc32-example` |
+| [`crc`](docs/crc.md) | IEEE CRC-32, CRC-32C, GENIBUS and XZ CRC-64 with streaming and combination | `crc-example` |
 | [`xxhash`](docs/xxhash.md) | Seeded and streaming XXH32/64 and XXH3-64/128; custom secrets for XXH3 | `xxhash-example` |
 | [`blake3`](docs/blake3.md) | Cryptographic digests, keyed hashing, key derivation and seekable output | `blake3-example` |
 
-Adler-32, CRC-32 and xxHash detect accidental corruption or support lookups; their
+Adler-32, CRC and xxHash detect accidental corruption or support lookups; their
 noncryptographic values do not establish input identity or authenticate a message. BLAKE3 provides
 a cryptographic digest and separate keyed and key-derivation modes. IEEE CRC-32 differs from
 CRC-32C and the x86 instruction named CRC32.

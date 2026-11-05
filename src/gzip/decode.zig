@@ -1,7 +1,7 @@
 //! gzip headers, verified member decoding and fragmented decoding.
 
 const std = @import("std");
-const crc32 = @import("../crc32.zig");
+const Crc32IsoHdlc = @import("../crc.zig").Crc32IsoHdlc;
 const deflate = @import("../deflate.zig");
 const overlaps = @import("../common/byte_ranges.zig").overlaps;
 const format = @import("format.zig");
@@ -136,7 +136,7 @@ fn decodeMember(
     const footer = header.consumed + raw.consumed;
     if (source.len - footer < 8) return error.InvalidStream;
     const expected_crc = std.mem.readInt(u32, source[footer..][0..4], .little);
-    if (expected_crc != crc32.hash(output[0..raw.produced])) return error.InvalidStream;
+    if (expected_crc != Crc32IsoHdlc.hash(output[0..raw.produced])) return error.InvalidStream;
     const expected_size = std.mem.readInt(u32, source[footer + 4 ..][0..4], .little);
     const restored_size: u32 = @truncate(raw.produced);
     if (expected_size != restored_size) return error.InvalidStream;
@@ -249,7 +249,7 @@ pub fn parseHeader(source: []const u8, limits: HeaderLimits) HeaderError!HeaderR
     if (header.flags & flag_header_crc != 0) {
         if (limits.header_bytes - position < 2) return error.HeaderTooLong;
         if (source.len - position < 2) return error.InvalidStream;
-        const expected: u16 = @truncate(crc32.hash(source[0..position]));
+        const expected: u16 = @truncate(Crc32IsoHdlc.hash(source[0..position]));
         const recorded = std.mem.readInt(u16, source[position..][0..2], .little);
         if (recorded != expected) return error.InvalidStream;
         position += 2;
@@ -396,8 +396,8 @@ pub const Decoder = struct {
     metadata: Header = undefined,
     header_ready: bool = false,
     extra_done: usize = 0,
-    header_checksum: crc32.Hasher = .init,
-    checksum: crc32.Hasher = .init,
+    header_checksum: Crc32IsoHdlc = Crc32IsoHdlc.init(),
+    checksum: Crc32IsoHdlc = Crc32IsoHdlc.init(),
     failed: bool = false,
     eof: bool = false,
 
@@ -689,8 +689,8 @@ pub const Decoder = struct {
                     .{ .workspace = self.raw.workspace, .history = self.raw.history },
                     .{ .limits = .{} },
                 );
-                self.checksum = .init;
-                self.header_checksum = .init;
+                self.checksum = Crc32IsoHdlc.init();
+                self.header_checksum = Crc32IsoHdlc.init();
                 self.header_ready = false;
                 self.header_bytes = 0;
                 self.extra_done = 0;

@@ -1,7 +1,7 @@
 //! gzip member encoding and fragmented output.
 
 const std = @import("std");
-const crc32 = @import("../crc32.zig");
+const Crc32IsoHdlc = @import("../crc.zig").Crc32IsoHdlc;
 const deflate = @import("../deflate.zig");
 const overlaps = @import("../common/byte_ranges.zig").overlaps;
 const format = @import("format.zig");
@@ -91,7 +91,7 @@ pub fn encode(
 /// statistics.
 pub const Encoder = struct {
     raw: deflate.Encoder,
-    checksum: crc32.Hasher,
+    checksum: Crc32IsoHdlc,
     size: u32,
     header_bytes: usize,
     position: usize,
@@ -130,7 +130,7 @@ pub const Encoder = struct {
         var raw_options = options.deflate;
         raw_options.limits.output_bytes -= framing;
         try self.raw.reset(workspace, raw_options);
-        self.checksum = .init;
+        self.checksum = Crc32IsoHdlc.init();
         self.size = 0;
         self.header_bytes = header_bytes;
         self.position = 0;
@@ -172,7 +172,7 @@ pub const Encoder = struct {
             }
         }
         if (options.header_crc) {
-            const checksum: u16 = @truncate(crc32.hash(bytes[0..position]));
+            const checksum: u16 = @truncate(Crc32IsoHdlc.hash(bytes[0..position]));
             std.mem.writeInt(u16, bytes[position..][0..2], checksum, .little);
         }
     }
@@ -502,7 +502,7 @@ test "compression levels write gzip hints and verified trailers" {
         const hint: u8 = if (level == 1) 4 else if (level == 9) 2 else 0;
         try std.testing.expectEqual(hint, encoded[8]);
         try std.testing.expectEqual(
-            crc32.hash(source),
+            Crc32IsoHdlc.hash(source),
             std.mem.readInt(u32, encoded[encoded.len - 8 ..][0..4], .little),
         );
         try std.testing.expectEqual(

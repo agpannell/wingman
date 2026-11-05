@@ -1,22 +1,27 @@
+//! IEEE/ISO-HDLC: width 32, normal polynomial 0x04c11db7, initial remainder and final XOR
+//! 0xffffffff, both input and output reflected. Check("123456789") is 0xcbf43926.
+//!
 //! Computes IEEE CRC-32 checksums over exact byte slices without allocation. Use it to check
 //! content bytes or build gzip and PNG checksum fields. `hash` checksums a complete buffer. With
-//! `Hasher` the caller appends fragments of one stream and reads the numeric u32 result from a
-//! final snapshot.
+//! `Crc32IsoHdlc` the caller appends fragments of one stream and reads the numeric u32 result from
+//! a final snapshot.
 //!
 //! The caller owns the four-byte state. Input is consumed during each update and is never retained;
 //! arbitrary alignment, empty fragments and exact input extents need no padding. `final` takes a
 //! snapshot without resetting the stream. Copying the state permits independent continuation;
-//! assigning a new `init` value starts another stream. Serialize mutation of a shared state. No
+//! assigning a new `init()` value starts another stream. Serialize mutation of a shared state. No
 //! operation needs an allocator or cleanup. Empty input has checksum zero.
 //!
 //! Callers encode the numeric result for their format: gzip uses little-endian bytes and PNG uses
 //! big-endian bytes. `combine` computes the checksum of concatenated sequences from their finalized
 //! checksums and the second sequence's byte length. `CombineOperator` reuses that operation for a
-//! fixed length. See `Hasher.update` for an incremental example.
+//! fixed length. See `Crc32IsoHdlc.update` for an incremental example.
 //!
 //! CPU features follow the compile-time target, with acceleration on supported x86 and AArch64
 //! targets. This is the IEEE variant used by gzip and PNG. The x86 CRC32 instruction computes the
 //! distinct CRC-32C (Castagnoli) variant. Format: https://www.rfc-editor.org/rfc/rfc1952
+
+const Crc32IsoHdlc = @This();
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -65,43 +70,43 @@ const wide_bytes: usize = blk: {
 };
 
 /// Four-byte incremental IEEE CRC-32 state owned by the caller. Initialize before updating. Copies
-/// continue independently and need no cleanup.
-pub const Hasher = struct {
-    /// Unfinalized CRC remainder; initialize through `init` or copy a valid state.
-    remainder: u32 = 0xffffffff,
+/// continue independently and need no cleanup. Unfinalized CRC remainder; initialize through
+/// `init()` or copy a valid state.
+remainder: u32 = 0xffffffff,
 
-    /// Empty-stream state. Copy or assign `.init` to begin a new sequence with checksum zero.
-    pub const init: Hasher = .{};
+/// Empty-stream state. Copy or assign `init()` to begin a new sequence with checksum zero.
+pub fn init() Crc32IsoHdlc {
+    return .{};
+}
 
-    /// Appends exactly `bytes` without retaining input or requesting memory.
-    pub fn update(self: *Hasher, bytes: []const u8) void {
-        if (folding and bytes.len >= 16) {
-            self.remainder = updateFolded(self.remainder, bytes);
-        } else {
-            self.remainder = @call(.always_inline, updateSmall, .{ self.remainder, bytes });
-        }
+/// Appends exactly `bytes` without retaining input or requesting memory.
+pub fn update(self: *Crc32IsoHdlc, bytes: []const u8) void {
+    if (folding and bytes.len >= 16) {
+        self.remainder = updateFolded(self.remainder, bytes);
+    } else {
+        self.remainder = @call(.always_inline, updateSmall, .{ self.remainder, bytes });
     }
+}
 
-    test update {
-        const chunks = [_][]const u8{ "123", "456", "789" };
-        var state: Hasher = .init;
-        for (chunks) |chunk| state.update(chunk);
+test update {
+    const chunks = [_][]const u8{ "123", "456", "789" };
+    var state: Crc32IsoHdlc = init();
+    for (chunks) |chunk| state.update(chunk);
 
-        try testing.expectEqual(@as(u32, 0xcbf43926), state.final());
-    }
+    try testing.expectEqual(@as(u32, 0xcbf43926), state.final());
+}
 
-    /// Returns a numeric snapshot without resetting state; later updates extend the stream.
-    pub fn final(self: Hasher) u32 {
-        return ~self.remainder;
-    }
-};
+/// Returns a numeric snapshot without resetting state; later updates extend the stream.
+pub fn final(self: Crc32IsoHdlc) u32 {
+    return ~self.remainder;
+}
 
 /// Checksums one complete exact byte slice without allocation or retained state.
 pub fn hash(bytes: []const u8) u32 {
-    var state: Hasher = .init;
+    var state: Crc32IsoHdlc = init();
     // Keep the initial remainder visible in one-shot consumers even when incremental framing adds
     // other callers of the update kernel.
-    @call(.always_inline, Hasher.update, .{ &state, bytes });
+    @call(.always_inline, Crc32IsoHdlc.update, .{ &state, bytes });
     return state.final();
 }
 
@@ -553,11 +558,11 @@ fn matrixCombine(first: u32, second: u32, length: u64) u32 {
 }
 
 test "CRC32 known IEEE facts and continued finalization" {
-    try testing.expectEqual(@as(usize, 4), @sizeOf(Hasher));
+    try testing.expectEqual(@as(usize, 4), @sizeOf(Crc32IsoHdlc));
     try testing.expectEqual(@as(u32, 0), hash(""));
     try testing.expectEqual(@as(u32, 0xcbf43926), hash("123456789"));
 
-    var state: Hasher = .init;
+    var state: Crc32IsoHdlc = init();
     state.update("1234");
     try testing.expectEqual(std.hash.Crc32.hash("1234"), state.final());
     const prefix = state.final();
@@ -571,7 +576,7 @@ test "CRC32 known IEEE facts and continued finalization" {
     state.update("56789");
     try testing.expectEqual(@as(u32, 0xcbf43926), state.final());
 
-    state = .init;
+    state = init();
     try testing.expectEqual(@as(u32, 0), state.final());
 }
 
@@ -595,7 +600,7 @@ test "CRC32 exact alignment lengths chunks and independent bitwise oracle" {
             const expected = ~bitwiseRemainder(0xffffffff, data);
             try testing.expectEqual(expected, hash(data));
             for ([_]usize{ 1, 7, 16, 31, 128, 257 }) |chunk| {
-                var state: Hasher = .init;
+                var state: Crc32IsoHdlc = init();
                 var position: usize = 0;
                 while (position < data.len) {
                     const end = position + @min(chunk, data.len - position);
@@ -620,7 +625,7 @@ test "CRC32 short vector admission every length alignment and incremental bounda
             if (length != 0) oracle = bitwiseRemainder(oracle, data[length - 1 ..]);
             try testing.expectEqual(~oracle, hash(data));
             for ([_]usize{ 31, 63, 127, 255, 511 }) |split| {
-                var state: Hasher = .init;
+                var state: Crc32IsoHdlc = init();
                 const at = @min(split, length);
                 state.update(data[0..at]);
                 state.update(data[at..]);
@@ -654,7 +659,7 @@ test "CRC32 exact input ends stay within Linux protected pages" {
         for ([_][]const u8{ bytes[0..size], bytes[bytes.len - size ..] }) |input| {
             const expected = std.hash.Crc32.hash(input);
             try testing.expectEqual(expected, hash(input));
-            var state: Hasher = .init;
+            var state: Crc32IsoHdlc = init();
             const split = @min(7, size);
             state.update(input[0..split]);
             state.update(input[split..]);

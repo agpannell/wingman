@@ -1,7 +1,7 @@
 //! Complete public API calls from outside the library's test composition.
 const std = @import("std");
 const adler32 = @import("wingman").adler32;
-const crc32 = @import("wingman").crc32;
+const Crc32IsoHdlc = @import("wingman").crc.Crc32IsoHdlc;
 const Xxh32 = @import("wingman").xxhash.Xxh32;
 const Xxh64 = @import("wingman").xxhash.Xxh64;
 const xxhash = @import("wingman").xxhash;
@@ -366,9 +366,9 @@ test "Adler-32 retired inputs independent states and combination" {
 }
 
 test "IEEE CRC streaming snapshots copies and retired input" {
-    try std.testing.expectEqual(@as(u32, 0xcbf43926), crc32.hash("123456789"));
+    try std.testing.expectEqual(@as(u32, 0xcbf43926), Crc32IsoHdlc.hash("123456789"));
     var input = "1234".*;
-    var state: crc32.Hasher = .init;
+    var state: Crc32IsoHdlc = Crc32IsoHdlc.init();
     state.update(&input);
     const prefix = state.final();
     var copy = state;
@@ -376,46 +376,49 @@ test "IEEE CRC streaming snapshots copies and retired input" {
     state.update("");
     state.update("56789");
     copy.update("abcd");
-    try std.testing.expectEqual(crc32.hash("1234"), prefix);
+    try std.testing.expectEqual(Crc32IsoHdlc.hash("1234"), prefix);
     try std.testing.expectEqual(@as(u32, 0xcbf43926), state.final());
     try std.testing.expectEqual(std.hash.Crc32.hash("1234abcd"), copy.final());
-    state = .init;
+    state = Crc32IsoHdlc.init();
     try std.testing.expectEqual(@as(u32, 0), state.final());
-    try std.testing.expectEqual(@as(usize, 4), @sizeOf(crc32.Hasher));
-    try std.testing.expectEqual(@as(usize, 4), @sizeOf(crc32.CombineOperator));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Crc32IsoHdlc));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Crc32IsoHdlc.CombineOperator));
 }
 
 test "PNG type plus data coverage and format byte orders" {
     // A one-pixel, 8-bit RGBA IHDR payload; dimensions and format bytes are constructed here.
     const header = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0 };
-    var state: crc32.Hasher = .init;
+    var state: Crc32IsoHdlc = Crc32IsoHdlc.init();
     state.update("IHDR");
     state.update(&header);
     try std.testing.expectEqual(@as(u32, 0x1f15c489), state.final());
     try std.testing.expectEqual(
         state.final(),
-        crc32.combine(crc32.hash("IHDR"), crc32.hash(&header), header.len),
+        Crc32IsoHdlc.combine(Crc32IsoHdlc.hash("IHDR"), Crc32IsoHdlc.hash(&header), header.len),
     );
     var field: [4]u8 = undefined;
     std.mem.writeInt(u32, &field, state.final(), .big);
     try std.testing.expectEqual([4]u8{ 0x1f, 0x15, 0xc4, 0x89 }, field);
-    std.mem.writeInt(u32, &field, crc32.hash("123456789"), .little);
+    std.mem.writeInt(u32, &field, Crc32IsoHdlc.hash("123456789"), .little);
     try std.testing.expectEqual([4]u8{ 0x26, 0x39, 0xf4, 0xcb }, field);
-    try std.testing.expectEqual(@as(u32, 0xae426082), crc32.hash("IEND"));
+    try std.testing.expectEqual(@as(u32, 0xae426082), Crc32IsoHdlc.hash("IEND"));
 }
 
 test "IEEE CRC reusable combination operators" {
-    const operator = crc32.CombineOperator.forLength(3);
+    const operator = Crc32IsoHdlc.CombineOperator.forLength(3);
     var result: u32 = 0;
     for ([_][]const u8{ "123", "456", "789" }) |chunk| {
-        result = operator.apply(result, crc32.hash(chunk));
+        result = operator.apply(result, Crc32IsoHdlc.hash(chunk));
     }
     try std.testing.expectEqual(@as(u32, 0xcbf43926), result);
-    try std.testing.expectEqual(crc32.hash("prefix"), crc32.combine(crc32.hash("prefix"), 0, 0));
+    try std.testing.expectEqual(
+        Crc32IsoHdlc.hash("prefix"),
+        Crc32IsoHdlc.combine(Crc32IsoHdlc.hash("prefix"), 0, 0),
+    );
     // This length is an algebraic advance; it does not allocate an equally large buffer.
     const wide_length = @as(u64, 1) << 63;
-    const wide = crc32.CombineOperator.forLength(wide_length);
-    try std.testing.expectEqual(crc32.combine(1, 2, wide_length), wide.apply(1, 2));
+    const wide = Crc32IsoHdlc.CombineOperator.forLength(wide_length);
+    try std.testing.expectEqual(Crc32IsoHdlc.combine(1, 2, wide_length), wide.apply(1, 2));
 }
 
 test "classic xxHash fixed facts and seeded streaming" {
@@ -1104,5 +1107,20 @@ test "Acclaim paired clips reuse one skeleton and prepared public transforms" {
             try std.testing.expectApproxEqAbs(reference, actual, 1e-14);
         }
         try std.testing.expectEqualDeep(RigidTransform.identity, storage[2]);
+    }
+}
+
+test "named CRC variants survive the public module boundary" {
+    const crc = @import("wingman").crc;
+    try std.testing.expectEqual(@as(u32, 0xe3069283), crc.Crc32Iscsi.hash("123456789"));
+    try std.testing.expectEqual(@as(u16, 0xd64e), crc.Crc16Genibus.hash("123456789"));
+    try std.testing.expectEqual(@as(u64, 0x995dc9bbdf1939fa), crc.Crc64Xz.hash("123456789"));
+    inline for (.{ crc.Crc32Iscsi, crc.Crc16Genibus, crc.Crc64Xz }) |Crc| {
+        var state = Crc.init();
+        state.update("1234");
+        const prefix = state.final();
+        state.update("56789");
+        try std.testing.expectEqual(Crc.hash("123456789"), state.final());
+        try std.testing.expectEqual(state.final(), Crc.combine(prefix, Crc.hash("56789"), 5));
     }
 }

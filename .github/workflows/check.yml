@@ -41,3 +41,5 @@ jobs:
         run: |
           zig build test -Doptimize=ReleaseSafe -Dcpu=baseline --summary all
           zig build test -Doptimize=ReleaseFast -Dcpu=baseline --summary all
+      - name: Test a fetched package archive
+        run: .github/scripts/check-archive-consumer.sh
