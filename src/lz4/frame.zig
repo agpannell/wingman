@@ -37,6 +37,7 @@ const std = @import("std");
 const Xxh32 = @import("../xxhash.zig").Xxh32;
 const lz4 = @import("block.zig");
 const high_compression = @import("hc.zig");
+const copy = @import("copy.zig");
 
 const Input = lz4.Input;
 const magic: u32 = 0x184d2204;
@@ -278,6 +279,9 @@ pub fn decodeFrame(
     var read: usize = 0;
     var written: usize = 0;
     var skipped: u64 = 0;
+
+    // Parse whole frame members in order. Skippable members only advance input; ordinary members
+    // decode bounded blocks and keep a per-frame output start for linked history and size checks.
     while (true) {
         const tag = std.mem.readInt(u32, (try take(source, &read, 4, &counter))[0..4], .little);
         try counter.frame();
@@ -295,6 +299,9 @@ pub fn decodeFrame(
             if (info.block_size.bytes() > options.limits.block_bytes) return error.LimitExceeded;
             const dict = try dictionaryFor(info, options.dictionary);
             const begin = written;
+
+            // A zero header ends this member's data blocks; the footer then validates total content
+            // size and, when present, the checksum over all decoded bytes in this frame.
             while (true) {
                 const block_header = try take(source, &read, 4, &counter);
                 const field = std.mem.readInt(u32, block_header[0..4], .little);
@@ -302,11 +309,15 @@ pub fn decodeFrame(
                 const count: usize = field & 0x7fffffff;
                 if (count > info.block_size.bytes()) return error.InvalidFrame;
                 const block = try take(source, &read, count, &counter);
+
+                // Verify compressed bytes before decoding them. Stored blocks have no sequence
+                // work, while compressed blocks use only the output extent admitted by the caller.
                 if (info.block_checksum) {
                     const checksum = try take(source, &read, 4, &counter);
                     const expected = std.mem.readInt(u32, checksum[0..4], .little);
                     if (Xxh32.hash(block) != expected) return error.ChecksumMismatch;
                 }
+
                 const capacity = @min(output.len - written, info.block_size.bytes());
                 const allowed = counter.outputCapacity(capacity);
                 const produced = blk: {
@@ -315,7 +326,7 @@ pub fn decodeFrame(
                             if (allowed < capacity) return error.LimitExceeded;
                             return error.OutputTooSmall;
                         }
-                        @memcpy(output[written..][0..count], block);
+                        copy.nonOverlapping(output[written..][0..count], block);
                         break :blk count;
                     }
 
@@ -323,11 +334,20 @@ pub fn decodeFrame(
                         .older = if (info.independent) &.{} else dict,
                         .newer = if (info.independent) dict else output[begin..written],
                     };
-                    break :blk (lz4.decodeBlock(
+                    // Linked frame blocks can refer to the initial dictionary and every decoded
+                    // block since this frame began. Independent blocks always reset to the initial
+                    // dictionary.
+                    const decoded: lz4.BlockDecodeError!lz4.DecodeResult = if (!info.independent and
+                        dict.len == 0 and written > begin) lz4.decodeBlockWithPrefix(
+                        block,
+                        output[begin .. written + allowed],
+                        written - begin,
+                    ) else lz4.decodeBlock(
                         block,
                         output[written..][0..allowed],
                         .{ .dictionary = history, .output_size = .bounded },
-                    ) catch |err| {
+                    );
+                    break :blk (decoded catch |err| {
                         @branchHint(.unlikely);
                         if (err == error.OutputTooSmall) {
                             if (allowed < capacity) return error.LimitExceeded;
@@ -512,6 +532,9 @@ pub const FrameDecoder = struct {
         }
         if (self.final_input and input.bytes.len != 0) return error.InvalidState;
 
+        // The phase machine reads each field across fragments, negotiates dictionaries before
+        // content, and stops exactly after a frame footer. Encoded input and decoded output are
+        // never retained as caller slices between these transitions.
         var read: usize = 0;
         var written: usize = 0;
         while (true) switch (self.phase) {
@@ -590,6 +613,9 @@ pub const FrameDecoder = struct {
                 self.phase = .block;
             },
             .block => {
+                // A stored block copies one byte in for each byte out. A compressed block delegates
+                // sequence parsing to the raw decoder. Both paths update the container counters
+                // below, while block and content checksums cover different byte streams.
                 const info = self.frame_info.?;
                 const available_input = @min(self.remaining, input.bytes.len - read);
                 const available_output = @min(
@@ -689,6 +715,8 @@ pub const FrameDecoder = struct {
                 if (read == input.bytes.len) return self.blocked(input, read, written, .need_input);
             },
             .block_checksum, .content_checksum => {
+                // Block checksums cover encoded block bytes; content checksums cover recovered
+                // frame bytes. Their phase selects the matching accumulator.
                 if (!try self.field(input.bytes, &read, 4)) {
                     return self.blocked(input, read, written, .need_input);
                 }
@@ -714,6 +742,7 @@ pub const FrameDecoder = struct {
                 self.phase = .skip;
             },
             .skip => {
+                // Skippable payload contributes to input/work limits but never to decoded output.
                 const count = @min(self.remaining, input.bytes.len - read);
                 try self.counter.add(count, 0);
                 read += count;
@@ -833,11 +862,104 @@ pub fn encodeFrame(
     options: FrameEncodeOptions,
 ) FrameError![]u8 {
     if (output.len < try frameEncodeBound(source.len, options)) return error.OutputTooSmall;
+    if (options.dictionary == null and options.compression == .fast) {
+        return encodeFastFrame(source, output, storage, options);
+    }
     var encoder: FrameEncoder = undefined;
     try encoder.reset(storage, options);
     const result = try encoder.step(source, output, .finish);
     std.debug.assert(result.status == .complete and result.consumed == source.len);
     return output[0..result.produced];
+}
+
+// A complete caller slice remains available for this entire call. Read full blocks directly,
+// leaving the copying/resumption rules of FrameEncoder.step for fragmented callers.
+fn encodeFastFrame(
+    source: []const u8,
+    output: []u8,
+    storage: FrameEncodeStorage,
+    options: FrameEncodeOptions,
+) FrameError![]u8 {
+    var encoder: FrameEncoder = undefined;
+    try encoder.reset(storage, options);
+    if (try overlaps(source, output)) return error.Aliasing;
+    try checkEncoderStorage(&encoder, storage.workspace, null, source);
+    try checkEncoderStorage(&encoder, storage.workspace, null, output);
+
+    var written: usize = 0;
+    try encoder.counter.add(0, encoder.pending.len);
+    @memcpy(output[written..][0..encoder.pending.len], encoder.pending);
+    written += encoder.pending.len;
+
+    var read: usize = 0;
+    while (read < source.len) {
+        const count = @min(options.block_size.bytes(), source.len - read);
+        const block = source[read..][0..count];
+        try encoder.counter.add(count, 0);
+        if (options.content_size) |size| {
+            if (encoder.counter.input > size) return error.ContentSizeMismatch;
+        }
+        if (options.content_checksum) encoder.content_hash.update(block);
+
+        const encoded = if (options.independent) blk: {
+            if (block.len == 65536) break :blk (try lz4.encodeBlockWithInitialProbe(
+                block,
+                storage.workspace.encoded,
+                &storage.workspace.codec,
+            )) orelse block;
+            break :blk try lz4.encodeBlock(
+                block,
+                storage.workspace.encoded,
+                &storage.workspace.codec,
+                .{},
+            );
+        } else blk: {
+            // Linked blocks may reference the reachable suffix of earlier input.
+            const history_size = @min(read, max_history);
+            const history = source[read - history_size .. read];
+            break :blk try lz4.encodeBlockRolling(
+                block,
+                storage.workspace.encoded,
+                &storage.workspace.codec,
+                history,
+                true,
+                &encoder.linked_hash,
+            );
+        };
+
+        // Store a block verbatim when compression does not make it smaller.
+        const compressed = encoded.len < block.len;
+        const body = if (compressed) encoded else block;
+        const checksum_bytes: usize = if (options.block_checksum) 4 else 0;
+        const block_bytes = 4 + body.len + checksum_bytes;
+        try encoder.counter.add(0, block_bytes);
+
+        const stored_flag: u32 = if (compressed) 0 else 0x80000000;
+        const block_header = @as(u32, @intCast(body.len)) | stored_flag;
+        std.mem.writeInt(u32, output[written..][0..4], block_header, .little);
+        written += 4;
+        @memcpy(output[written..][0..body.len], body);
+        written += body.len;
+
+        if (options.block_checksum) {
+            std.mem.writeInt(u32, output[written..][0..4], Xxh32.hash(body), .little);
+            written += 4;
+        }
+        read += count;
+    }
+
+    if (options.content_size) |size| {
+        if (encoder.counter.input != size) return error.ContentSizeMismatch;
+    }
+    const footer_bytes: usize = if (options.content_checksum) 8 else 4;
+    try encoder.counter.add(0, footer_bytes);
+    @memset(output[written..][0..4], 0);
+    written += 4;
+    if (options.content_checksum) {
+        std.mem.writeInt(u32, output[written..][0..4], encoder.content_hash.final(), .little);
+        written += 4;
+    }
+    return output[0..written];
 }
 
 /// Distinct streaming requests. Flush emits pending bytes without ending the frame. Finish enforces
@@ -863,6 +985,7 @@ pub const FrameEncoder = struct {
     input_used: usize,
     dictionary_size: usize,
     history_size: usize,
+    linked_hash: lz4.RollingState,
     pending: []const u8,
     small: [19]u8,
     prefix: [4]u8,
@@ -909,6 +1032,7 @@ pub const FrameEncoder = struct {
             .input_used = 0,
             .dictionary_size = 0,
             .history_size = 0,
+            .linked_hash = .{},
             .pending = &.{},
             .small = undefined,
             .prefix = undefined,
@@ -950,6 +1074,9 @@ pub const FrameEncoder = struct {
         try checkEncoderStorage(self, self.workspace, self.hc_workspace, output);
         if (self.finish_requested and input.len != 0) return error.InvalidState;
 
+        // Pending header/block/footer bytes drain before more input is accepted. Once staged input
+        // reaches a block boundary, block() prepares its prefix, body and optional checksum for
+        // these same drain phases.
         var read: usize = 0;
         var written: usize = 0;
         while (true) switch (self.phase) {
@@ -996,10 +1123,11 @@ pub const FrameEncoder = struct {
                 read += count;
                 const input_accepted = read == input.len;
                 if (input_accepted and action == .finish) self.finish_requested = true;
-                const flush_pending = blk: {
-                    if (!input_accepted or self.input_used == 0) break :blk false;
-                    break :blk action != .process or self.finish_requested;
-                };
+                // A block may be emitted only after this call's input is accepted. Process keeps a
+                // short block pending; flush and finish publish it at the caller's request.
+                const action_requests_flush = action != .process or self.finish_requested;
+                const flush_pending = input_accepted and self.input_used != 0 and
+                    action_requests_flush;
                 if (self.input_used == block_capacity or flush_pending) {
                     try self.block();
                     continue;
@@ -1033,9 +1161,12 @@ pub const FrameEncoder = struct {
         };
     }
 
+    // Compress the staged input using the selected history mode, then queue the block fields for
+    // the step loop to drain. Updating linked history only after compression keeps the current
+    // block from referring to itself through the external dictionary.
     fn block(self: *FrameEncoder) FrameError!void {
         const source = self.workspace.input[0..self.input_used];
-        const dictionary = blk: {
+        const history = blk: {
             if (self.options.independent) {
                 break :blk self.workspace.dictionary[0..self.dictionary_size];
             }
@@ -1045,7 +1176,7 @@ pub const FrameEncoder = struct {
             if (self.hc_workspace) |hc| {
                 var options = self.options.compression.hc;
                 options.limits.work_units -= self.hc_work;
-                options.dictionary = dictionary;
+                options.dictionary = history;
                 const bytes = try high_compression.encodeBlockHc(
                     source,
                     self.workspace.encoded,
@@ -1055,14 +1186,25 @@ pub const FrameEncoder = struct {
                 self.hc_work += hc.stats.work_units;
                 break :blk bytes;
             }
+            if (!self.options.independent) {
+                break :blk try lz4.encodeBlockRolling(
+                    source,
+                    self.workspace.encoded,
+                    &self.workspace.codec,
+                    history,
+                    false,
+                    &self.linked_hash,
+                );
+            }
             break :blk try lz4.encodeBlock(
                 source,
                 self.workspace.encoded,
                 &self.workspace.codec,
-                .{ .dictionary = dictionary },
+                .{ .dictionary = history },
             );
         };
 
+        // The frame format allows a stored block; use it whenever compression fails to save bytes.
         const compressed = encoded.len < source.len;
         self.body = if (compressed) encoded else source;
         const size: u32 = @intCast(self.body.len);
@@ -1073,15 +1215,17 @@ pub const FrameEncoder = struct {
         }
 
         if (!self.options.independent) {
+            // Keep the newest 65,535 history bytes. Older history fills any space left before the
+            // current block's suffix.
             const kept = dictSuffix(source);
-            const old = @min(self.history_size, max_history - kept.len);
+            const retained_old = @min(self.history_size, max_history - kept.len);
             std.mem.copyForwards(
                 u8,
-                self.workspace.history[0..old],
-                self.workspace.history[self.history_size - old .. self.history_size],
+                self.workspace.history[0..retained_old],
+                self.workspace.history[self.history_size - retained_old .. self.history_size],
             );
-            @memcpy(self.workspace.history[old..][0..kept.len], kept);
-            self.history_size = old + kept.len;
+            @memcpy(self.workspace.history[retained_old..][0..kept.len], kept);
+            self.history_size = retained_old + kept.len;
         }
 
         self.input_used = 0;
@@ -1157,6 +1301,7 @@ const Counter = struct {
 };
 
 fn descriptorSize(prefix: []const u8) FrameError!usize {
+    // Validate the fixed descriptor bits before trusting the optional-field flags to size a read.
     const flags = prefix[0];
     const block_descriptor = prefix[1];
     const version = flags >> 6;
@@ -1175,6 +1320,9 @@ fn descriptor(bytes: []const u8) FrameError!FrameInfo {
     std.debug.assert(bytes.len == size);
     const checksum: u8 = @truncate(Xxh32.hash(bytes[0 .. size - 1]) >> 8);
     if (checksum != bytes[size - 1]) return error.ChecksumMismatch;
+
+    // Optional content size precedes dictionary ID in the wire descriptor. Preserve each as an
+    // optional value so a present zero remains distinguishable from an absent field.
     const flags = bytes[0];
     var cursor: usize = 2;
     const content_size: ?u64 = blk: {
@@ -1213,6 +1361,9 @@ fn take(source: []const u8, cursor: *usize, count: usize, counter: *Counter) Fra
     return result;
 }
 
+// The encoder mutates its owner and workspaces while borrowing the current caller span. Reject
+// every overlap among those objects up front so staged bytes, hash tables and pending fields cannot
+// overwrite one another during a later step.
 fn checkEncoderStorage(
     owner: *FrameEncoder,
     workspace: *FrameEncoderWorkspace,
@@ -1247,6 +1398,8 @@ fn checkEncoderStorage(
     ) or try overlaps(bytes, workspace.encoded)) return error.Aliasing;
 }
 
+// Serialize FLG, BD and optional values in the format's fixed order, then checksum the descriptor
+// bytes. The caller supplies the content size before writing so this header is never patched later.
 fn writeHeader(output: *[19]u8, options: FrameEncodeOptions) usize {
     std.mem.writeInt(u32, output[0..4], magic, .little);
     const id: ?u32 = if (options.dictionary) |dict| dict.id else null;
@@ -1478,6 +1631,68 @@ test "LZ4 frame encoder flush finish and copied dictionaries" {
         FrameEncodeStatus.complete,
         (try encoder.step(&.{}, &.{}, .finish)).status,
     );
+}
+
+test "LZ4 complete fast frames match the resumable encoder" {
+    const allocator = std.testing.allocator;
+    const source = try allocator.alloc(u8, 131089);
+    defer allocator.free(source);
+    var random: std.Random.DefaultPrng = .init(0x46e81a);
+    random.random().bytes(source[0..65536]);
+    @memcpy(source[65536..131072], source[0..65536]);
+    @memcpy(source[131072..], source[0..17]);
+    for ([_]FrameBlockSize{ .k64, .k256 }) |block_size| {
+        const direct_workspace = try FrameEncoderWorkspace.create(allocator, block_size);
+        defer direct_workspace.destroy(allocator);
+        const stream_workspace = try FrameEncoderWorkspace.create(allocator, block_size);
+        defer stream_workspace.destroy(allocator);
+        for ([_]bool{ false, true }) |independent| {
+            const options: FrameEncodeOptions = .{
+                .block_size = block_size,
+                .independent = independent,
+                .block_checksum = true,
+                .content_checksum = true,
+                .content_size = source.len,
+            };
+            const bound = try frameEncodeBound(source.len, options);
+            const direct_storage = try allocator.alloc(u8, bound + 1);
+            defer allocator.free(direct_storage);
+            const stream_storage = try allocator.alloc(u8, bound);
+            defer allocator.free(stream_storage);
+            @memset(direct_storage, 0xa7);
+            const direct = try encodeFrame(
+                source,
+                direct_storage[0..bound],
+                .{ .workspace = direct_workspace },
+                options,
+            );
+
+            var encoder: FrameEncoder = undefined;
+            try encoder.reset(.{ .workspace = stream_workspace }, options);
+            const progress = try encoder.step(source, stream_storage, .finish);
+            try std.testing.expectEqual(FrameEncodeStatus.complete, progress.status);
+            try std.testing.expectEqual(source.len, progress.consumed);
+            try std.testing.expectEqualSlices(u8, direct, stream_storage[0..progress.produced]);
+            try std.testing.expectEqual(@as(u8, 0xa7), direct_storage[bound]);
+
+            const recovered = try allocator.alloc(u8, source.len);
+            defer allocator.free(recovered);
+            _ = try decodeFrame(direct, recovered, .{ .trailing_data = .reject });
+            try std.testing.expectEqualSlices(u8, source, recovered);
+
+            var limited = options;
+            limited.limits.input_bytes = source.len - 1;
+            try std.testing.expectError(
+                error.LimitExceeded,
+                encodeFrame(
+                    source,
+                    direct_storage[0..bound],
+                    .{ .workspace = direct_workspace },
+                    limited,
+                ),
+            );
+        }
+    }
 }
 
 test "LZ4 frame concatenation skippable values iteration and lookahead" {

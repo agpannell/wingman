@@ -113,4 +113,5 @@ test {
     _ = block;
     _ = frame;
     _ = hc;
+    _ = @import("lz4/copy.zig");
 }

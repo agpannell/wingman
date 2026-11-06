@@ -26,8 +26,8 @@ from greedy raw encoding, HC raw encoding and a checksummed standard frame.
 
 The [public entry](../src/lz4.zig) groups raw, HC and frame APIs. The shallow `src/lz4/` group
 contains `block.zig` for sequences, history and block recovery; `hc.zig` for bounded search and
-parsing; and `frame.zig` for descriptors, checksums and frame state machines. Inline tests stay
-with those implementations.
+parsing; `frame.zig` for descriptors, checksums and frame state machines; and `copy.zig` for
+target-selected vector copies. Inline tests stay with those implementations.
 
 Codec calls allocate nothing. Workspace `create(allocator)` methods allocate directly at their
 final address; `destroy(allocator)` releases the complete reservation with that same allocator.

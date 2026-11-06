@@ -117,9 +117,16 @@ pub fn encodeBlockHc(
         .balanced => 128,
         .offline => 4096,
     };
+
+    // For each bounded horizon, dynamic programming keeps the cheapest path to each byte position.
+    // A path can add one literal or take a match edge of any discovered length. The five-byte
+    // suffix stays outside the search so emitted matches obey LZ4's final-literal rule; long
+    // matches use the shortcut below to cap parser work.
     while (source.len >= 12 and cursor <= source.len - 12) {
         // Price one path to each byte within this horizon, starting with pending literals.
         const count: usize = @min(horizon, source.len - 5 - cursor);
+        const pending_literals = cursor - anchor;
+        const initial_price: u32 = @intCast(literalPrice(pending_literals));
         @memset(
             workspace.nodes[0 .. count + 1],
             .{
@@ -131,8 +138,8 @@ pub fn encodeBlockHc(
             },
         );
         workspace.nodes[0] = .{
-            .price = @intCast(literalPrice(cursor - anchor)),
-            .literals = @intCast(cursor - anchor),
+            .price = initial_price,
+            .literals = @intCast(pending_literals),
             .previous = 0,
             .match = 0,
             .distance = 0,
@@ -156,10 +163,13 @@ pub fn encodeBlockHc(
                 shortcut = match;
                 break;
             }
+            // A literal edge adds one byte and pays only when it crosses an extension boundary.
             const node = workspace.nodes[i];
             try workspace.charge(1, options.limits.work_units);
             const added_extension = extension(node.literals + 1, 15) - extension(node.literals, 15);
-            const next_price = node.price + 1 + @as(u32, @intCast(added_extension));
+            const literal_byte_price: u32 = 1;
+            const literal_extension_price: u32 = @intCast(added_extension);
+            const next_price = node.price + literal_byte_price + literal_extension_price;
             if (next_price < workspace.nodes[i + 1].price) {
                 workspace.nodes[i + 1] = .{
                     .price = next_price,
@@ -173,13 +183,15 @@ pub fn encodeBlockHc(
             var length: usize = 4;
             while (length <= @min(match.length, count - i)) : (length += 1) {
                 try workspace.charge(1, options.limits.work_units);
+                // Decoder-cost mode penalizes short, overlapping copies heuristically.
                 const penalty: u32 = blk: {
                     if (options.decoder_cost != .throughput) break :blk 0;
                     const short_overlap: u32 = @intFromBool(match.distance < 8);
                     break :blk 2 + short_overlap * 2;
                 };
                 const match_extension: u32 = @intCast(extension(length - 4, 15));
-                const price = node.price + 3 + match_extension + penalty;
+                const sequence_header_price: u32 = 3;
+                const price = node.price + sequence_header_price + match_extension + penalty;
                 if (price < workspace.nodes[i + length].price) {
                     workspace.nodes[i + length] = .{
                         .price = price,
@@ -192,7 +204,9 @@ pub fn encodeBlockHc(
             }
         }
 
-        // Walk predecessors backward, then emit their match edges in source order.
+        // Predecessors are byte offsets relative to `cursor`. Walk the chosen path backward, then
+        // emit match edges in source order; literal-only edges need no direct write because the
+        // next match sequence includes every pending byte since the previous anchor.
         var path_count: usize = 0;
         var end = terminal;
         while (end != 0) {
@@ -247,9 +261,12 @@ const Data = struct {
             return std.mem.readInt(u32, self.dictionary[position..][0..4], .little);
         }
 
-        var result: u32 = 0;
-        inline for (0..4) |i| result |= @as(u32, self.byte(position + i)) << (i * 8);
-        return result;
+        // This word straddles the dictionary/source boundary, so assemble it byte by byte.
+        var assembled_word: u32 = 0;
+        inline for (0..4) |i| {
+            assembled_word |= @as(u32, self.byte(position + i)) << (i * 8);
+        }
+        return assembled_word;
     }
 };
 
@@ -260,7 +277,8 @@ fn insert(
     limit: u64,
 ) HcError!void {
     try workspace.charge(1, limit);
-    const slot = (data.word(position) *% 0x9e3779b1) >> 17;
+    const hash_word = data.word(position);
+    const slot = (hash_word *% 0x9e3779b1) >> 17;
     workspace.chains[position & 65535] = workspace.heads[slot];
     workspace.heads[slot] = @intCast(position + 1);
 }
@@ -273,8 +291,9 @@ fn find(
     depth: usize,
     options: HcEncodeOptions,
 ) HcError!Match {
-    // Admit an upper bound, then accumulate exact effort in registers. The checked specialization
-    // retains exact exhaustion at a smaller budget.
+    // A chain probe can cost at most one visit, one endpoint check and `maximum` byte comparisons.
+    // When that upper bound fits, findCounted(false) accumulates exact work locally and charges it
+    // once; near the budget boundary, findCounted(true) checks each unit so exhaustion is exact.
     const bound: u64 = @as(u64, depth) * (maximum + 2);
     if (bound <= options.limits.work_units - workspace.stats.work_units) {
         return findCounted(false, data, workspace, position, maximum, depth, options);
@@ -291,8 +310,8 @@ fn findCounted(
     depth: usize,
     options: HcEncodeOptions,
 ) HcError!Match {
-    const word = data.word(position);
-    const slot = (word *% 0x9e3779b1) >> 17;
+    const current_word = data.word(position);
+    const slot = (current_word *% 0x9e3779b1) >> 17;
     var link = workspace.heads[slot];
     var result: Match = .{};
     var work_units: u64 = 0;
@@ -303,8 +322,12 @@ fn findCounted(
     }
     var probes: usize = 0;
     while (link != 0 and probes < depth) : (probes += 1) {
-        const candidate: usize = link - 1;
-        if (candidate >= position or position - candidate > lz4.maximum_distance) break;
+        // Links store position + 1 so zero remains the empty-table sentinel.
+        const candidate_position: usize = link - 1;
+        if (candidate_position >= position or position - candidate_position > lz4.maximum_distance)
+            // Newer chain links point only to older positions, so the distance limit excludes every
+            // remaining candidate as well.
+            break;
         if (bounded) {
             try workspace.charge(1, options.limits.work_units);
         } else {
@@ -321,46 +344,52 @@ fn findCounted(
                 work_units += 1;
             }
             const endpoint = result.length - 3;
-            if (data.word(position + endpoint) != data.word(candidate + endpoint)) {
-                link = workspace.chains[candidate & 65535];
+            if (data.word(position + endpoint) != data.word(candidate_position + endpoint)) {
+                link = workspace.chains[candidate_position & 65535];
                 continue;
             }
         }
 
-        if (data.word(candidate) == word) {
+        if (data.word(candidate_position) == current_word) {
             var length: usize = 4;
-            while (length + 8 <= maximum and candidate + length >= data.dictionary.len) {
+            // Word comparisons start once the candidate reaches source history. Earlier bytes may
+            // straddle the dictionary boundary and use Data.byte below.
+            while (length + 8 <= maximum and candidate_position + length >= data.dictionary.len) {
                 if (bounded) {
                     try workspace.charge(1, options.limits.work_units);
                 } else {
                     work_units += 1;
                 }
-                const current_bytes = data.source[position + length - data.dictionary.len ..][0..8];
-                const prior_bytes = data.source[candidate + length - data.dictionary.len ..][0..8];
-                const current_word = std.mem.readInt(u64, current_bytes, .little);
-                const prior_word = std.mem.readInt(u64, prior_bytes, .little);
-                const unequal = current_word ^ prior_word;
+                const current_source_position = position + length - data.dictionary.len;
+                const candidate_source_position = candidate_position + length - data.dictionary.len;
+                const current_bytes = data.source[current_source_position..][0..8];
+                const prior_bytes = data.source[candidate_source_position..][0..8];
+                const current_chunk = std.mem.readInt(u64, current_bytes, .little);
+                const candidate_chunk = std.mem.readInt(u64, prior_bytes, .little);
+                const unequal = current_chunk ^ candidate_chunk;
                 if (unequal != 0) {
+                    // Little-endian XOR puts the first differing byte in the low set bits.
                     length += @ctz(unequal) / 8;
                     break;
                 }
                 length += 8;
             }
             while (length < maximum) : (length += 1) {
-                if (data.byte(position + length) != data.byte(candidate + length)) break;
+                const current_byte = data.byte(position + length);
+                const candidate_byte = data.byte(candidate_position + length);
+                if (current_byte != candidate_byte) break;
                 if (bounded) {
                     try workspace.charge(1, options.limits.work_units);
                 } else {
                     work_units += 1;
                 }
             }
-            if (length > result.length) result = .{
-                .length = length,
-                .distance = @intCast(position - candidate),
-            };
+            if (length > result.length) {
+                result = .{ .length = length, .distance = @intCast(position - candidate_position) };
+            }
             if (length == maximum) break;
         }
-        link = workspace.chains[candidate & 65535];
+        link = workspace.chains[candidate_position & 65535];
     }
     return result;
 }
