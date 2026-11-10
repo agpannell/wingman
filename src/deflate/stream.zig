@@ -6,7 +6,7 @@ const std = @import("std");
 const bit_io = @import("bits.zig");
 const copying = @import("match.zig");
 const decoding = @import("decode.zig");
-const fixtures = @import("fixtures.zig");
+const fixtures = @import("../common/deflate_test_data.zig");
 const huffman = @import("huffman.zig");
 const protocol = @import("format.zig");
 

@@ -10,7 +10,8 @@
 //!
 //! `Decoder` supports fragmented input/output and dictionary requests. Supply a decoding
 //! `DecoderWorkspace` and 32 KiB of history, then call `reset` before stepping. `decodeReader`
-//! drives the same decoder from a `std.Io.Reader`, preserving buffered lookahead.
+//! drives the same decoder from a `std.Io.Reader`, preserving buffered lookahead. `Reader` adapts
+//! it to a pull reader; drain its `reader` field to EndOfStream to verify the trailer.
 //! `decodeStoredReader` is a separate workspace-free Reader operation supporting stored blocks
 //! only; its documentation explains how to handle an unsupported compressed block.
 //!
@@ -37,6 +38,7 @@
 //! Format: https://www.rfc-editor.org/rfc/rfc1950
 
 const decoding = @import("zlib/decode.zig");
+const std = @import("std");
 const encoding = @import("zlib/encode.zig");
 
 pub const Error = decoding.Error;
@@ -58,6 +60,8 @@ pub const decode = decoding.decode;
 pub const Decoder = decoding.Decoder;
 pub const decodeReader = decoding.decodeReader;
 pub const decodeStoredReader = decoding.decodeStoredReader;
+/// Standard-I/O pull adapter over a complete zlib stream, with caller-owned history.
+pub const Reader = @import("zlib/Reader.zig");
 
 pub const EncoderWorkspace = encoding.EncoderWorkspace;
 pub const Compression = encoding.Compression;
@@ -70,8 +74,45 @@ pub const EncodeOptions = encoding.EncodeOptions;
 pub const encodeBound = encoding.encodeBound;
 pub const encode = encoding.encode;
 pub const Encoder = encoding.Encoder;
+pub const FourByteRunEncoder = encoding.FourByteRunEncoder;
+pub const FourByteRunEncoderWorkspace = encoding.FourByteRunEncoderWorkspace;
+pub const short_stored_max_input_bytes = encoding.short_stored_max_input_bytes;
+pub const short_stored_output_capacity = encoding.short_stored_output_capacity;
+pub const short_four_byte_run_max_input_bytes = encoding.short_four_byte_run_max_input_bytes;
+pub const short_four_byte_run_output_capacity = encoding.short_four_byte_run_output_capacity;
+pub const encodeShortStored = encoding.encodeShortStored;
+pub const encodeShortFourByteRuns = encoding.encodeShortFourByteRuns;
 
 test {
     _ = decoding;
+    _ = Reader;
     _ = encoding;
+}
+
+test "public short stream buffer refusals preserve destination" {
+    var source: [short_four_byte_run_max_input_bytes + 1]u8 = @splat(42);
+    var output: [short_four_byte_run_output_capacity]u8 = @splat(0xa5);
+    try std.testing.expectError(error.LimitExceeded, encodeShortFourByteRuns(&source, &output));
+    try std.testing.expect(std.mem.allEqual(u8, &output, 0xa5));
+    try std.testing.expectError(
+        error.OutputTooSmall,
+        encodeShortFourByteRuns(source[0..16], output[0 .. output.len - 1]),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &output, 0xa5));
+    const before = output;
+    try std.testing.expectError(
+        error.StorageOverlap,
+        encodeShortFourByteRuns(output[0..16], &output),
+    );
+    try std.testing.expectEqualSlices(u8, &before, &output);
+    try std.testing.expectError(
+        error.LimitExceeded,
+        encodeShortStored(source[0 .. short_stored_max_input_bytes + 1], &output),
+    );
+    try std.testing.expectError(
+        error.OutputTooSmall,
+        encodeShortStored(source[0..16], output[0..26]),
+    );
+    try std.testing.expectError(error.StorageOverlap, encodeShortStored(output[0..16], &output));
+    try std.testing.expectEqualSlices(u8, &before, &output);
 }

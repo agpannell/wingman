@@ -6,7 +6,7 @@ const overlaps = @import("../common/byte_ranges.zig").overlaps;
 
 const adler32 = @import("../adler32.zig");
 const deflate = @import("../deflate.zig");
-const fixture_data = @import("../deflate/fixtures.zig");
+const fixture_data = @import("../common/deflate_test_data.zig");
 
 const general_pairs = fixture_data.general_pairs;
 const paired_dense = fixture_data.paired_dense;
@@ -666,9 +666,9 @@ const reader_stored = struct {
 };
 
 // Independent RFC 1950 framing and Reader fixtures, verified with Python zlib 1.3.2. Raw-codec
-// facts stay with deflate/fixtures.zig. Repetition expands frozen bytes; no production encoder or
-// checksum supplies the source or expected output. The identity test checks each full byte
-// sequence.
+// facts stay with common/deflate_test_data.zig. Repetition expands frozen bytes; no production
+// encoder or checksum supplies the source or expected output. The identity test checks each full
+// byte sequence.
 const frozen_fixtures = struct {
     // expanded_48bit.zlib: frozen Python-zlib-verified bytes, SHA-256
     // ebb03e5a07e96a4945e0f054ef04225edbb36c81a7094a23116184db3504fdb0.
@@ -1000,24 +1000,12 @@ test "zlib small windows preserve every admitted dynamic table layout" {
         source: []const u8,
         expected: []const u8,
     }{
-        .{
-            .source = &fixture.ordinary_complete,
-            .expected = "AABA",
-        },
+        .{ .source = &fixture.ordinary_complete, .expected = "AABA" },
         .{ .source = &fixture.incomplete_eob, .expected = "" },
         .{ .source = &fixture.ordinary_payload_literals, .expected = &.{ 0, 1, 2, 0, 1, 2 } },
-        .{
-            .source = paired.source,
-            .expected = paired.expected,
-        },
-        .{
-            .source = dense.source,
-            .expected = dense.expected,
-        },
-        .{
-            .source = general.source,
-            .expected = general.expected,
-        },
+        .{ .source = paired.source, .expected = paired.expected },
+        .{ .source = dense.source, .expected = dense.expected },
+        .{ .source = general.source, .expected = general.expected },
         .{ .source = wide.source, .expected = &wide.expected },
         .{
             .source = &raw_fixtures.payload_literal_budget_deflate,

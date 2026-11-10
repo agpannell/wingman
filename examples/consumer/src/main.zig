@@ -2,6 +2,7 @@
 const std = @import("std");
 const adler32 = @import("wingman").adler32;
 const Crc32IsoHdlc = @import("wingman").crc.Crc32IsoHdlc;
+const crc = @import("wingman").crc;
 const Xxh32 = @import("wingman").xxhash.Xxh32;
 const Xxh64 = @import("wingman").xxhash.Xxh64;
 const xxhash = @import("wingman").xxhash;
@@ -11,9 +12,11 @@ const deflate = @import("wingman").deflate;
 const zlib = @import("wingman").zlib;
 const gzip = @import("wingman").gzip;
 const riff = @import("wingman").riff;
+const wav = @import("wingman").wav;
 const lpcm = @import("wingman").lpcm;
 const g711 = @import("wingman").g711;
 const adpcm = @import("wingman").adpcm;
+const png = @import("wingman").png;
 const exif = @import("wingman").exif;
 const icc = @import("wingman").icc;
 const ktx2 = @import("wingman").ktx2;
@@ -23,6 +26,175 @@ const sfnt = @import("wingman").sfnt;
 const bvh = @import("wingman").bvh;
 const acclaim = @import("wingman").acclaim;
 const RigidTransform = @import("wingman").RigidTransform;
+const ImageRegion = @import("wingman").ImageRegion;
+
+test "PNG package decodes independently framed pixels and writes a PNG" {
+    // Python zlib 1.3.2 compressed these RGBA8 rows; chunk lengths and CRCs were framed separately.
+    const fixture = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0xf4, 0x22, 0x7f,
+        0x8a, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xd0,
+        0xc0, 0x90, 0x72, 0xe2, 0x3f, 0x00, 0x0e, 0x3c,
+        0x03, 0xab, 0x18, 0x49, 0xf9, 0xe5, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+        0x60, 0x82,
+    };
+    const expected = [_]u8{ 255, 0, 0, 128, 0, 100, 200, 255 };
+    const allocator = std.testing.allocator;
+    const source = try png.Source.open(&fixture, .{});
+    try std.testing.expectEqual(2, source.width);
+    try std.testing.expectEqual(1, source.height);
+    const rectangle: ImageRegion = .{ .x = 0, .y = 0, .width = 2, .height = 1 };
+    try std.testing.expectError(
+        error.MetadataLimitExceeded,
+        source.regionRequirements(u8, rectangle, .{ .limits = .{ .maximum_records = 0 } }),
+    );
+    var decoded = try png.decode.rgbaAlloc(u8, allocator, &fixture, .{});
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &expected, decoded.texels);
+    try std.testing.expectEqual(8, decoded.encoded_bit_depth);
+    try std.testing.expectEqual(6, decoded.encoded_color_type);
+
+    const encoded = try png.encode.alloc(allocator, try png.ImageInput.rgba8(&expected, 2, 1), .{});
+    defer allocator.free(encoded);
+    var recovered = try png.decode.rgbaAlloc(u8, allocator, encoded, .{});
+    defer recovered.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &expected, recovered.texels);
+    encoded[encoded.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidPng, png.Source.open(encoded, .{}));
+}
+
+test "PNG chunk API preserves unknown metadata and decoded pixels" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]u8{ 11, 23, 47, 255 };
+    const encoded = try png.encode.alloc(allocator, try png.ImageInput.rgba8(&pixels, 1, 1), .{});
+    defer allocator.free(encoded);
+    const source = try png.Source.open(encoded, .{});
+    const custom: png.Chunk = .{ .name = "vpAg".*, .data = "private metadata" };
+    const output = try allocator.alloc(u8, encoded.len + try custom.byteCount());
+    defer allocator.free(output);
+    @memcpy(output[0..8], encoded[0..8]);
+    var offset: usize = 8;
+    var chunks = source.chunks();
+    while (try chunks.next()) |chunk| {
+        if (std.mem.eql(u8, &chunk.name, "IEND")) {
+            offset += (try custom.writeInto(output[offset..])).len;
+        }
+        offset += (try chunk.writeInto(output[offset..])).len;
+    }
+    try std.testing.expectEqual(output.len, offset);
+    const rewritten = try png.Source.open(output, .{});
+    var records = rewritten.chunks();
+    var found = false;
+    while (try records.next()) |chunk| {
+        if (std.mem.eql(u8, &chunk.name, &custom.name)) {
+            try std.testing.expect(chunk.isAncillary());
+            try std.testing.expect(chunk.isPrivate());
+            try std.testing.expect(chunk.isSafeToCopy());
+            try std.testing.expectEqualStrings(custom.data, chunk.data);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+    var decoded = try png.decode.rgbaAlloc(u8, allocator, output, .{});
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &pixels, decoded.texels);
+}
+
+test "PNG retained allocation owns output after borrowed storage retires" {
+    const allocator = std.testing.allocator;
+    var pixels: [65 * 9 * 4]u8 = undefined;
+    for (&pixels, 0..) |*byte, i| byte.* = @truncate(i *% 29 +% i / 61);
+    const expected = pixels;
+    var retention: [4098]u8 = @splat(0xa5);
+    const encoded = try png.encode.allocWithRetention(
+        allocator,
+        allocator,
+        try png.ImageInput.rgba8(&pixels, 65, 9),
+        .{
+            .filter = .{ .fixed = .up },
+            .compression = .{ .strategy = .four_byte_runs },
+            .data_chunk_bytes = 17,
+        },
+        retention[1 .. retention.len - 1],
+    );
+    defer allocator.free(encoded);
+    try std.testing.expectEqual(@as(u8, 0xa5), retention[0]);
+    try std.testing.expectEqual(@as(u8, 0xa5), retention[retention.len - 1]);
+    @memset(&pixels, 0);
+    @memset(&retention, 0);
+    var recovered = try png.decode.rgbaAlloc(u8, allocator, encoded, .{});
+    defer recovered.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &expected, recovered.texels);
+}
+
+test "APNG public frames inspect and compose into a borrowed canvas" {
+    const allocator = std.testing.allocator;
+    const base = [_]u8{ 7, 11, 13, 255, 17, 19, 23, 255 };
+    const overlay = [_]u8{ 29, 31, 37, 255 };
+    const frames = [_]png.AnimationInput.Frame{
+        .{
+            .width = 2,
+            .height = 1,
+            .samples = .{ .packed_bytes = .{ .bytes = &base } },
+            .delay = .{ .numerator = 1, .denominator = 0 },
+        },
+        .{
+            .width = 1,
+            .height = 1,
+            .x = 1,
+            .samples = .{ .packed_bytes = .{ .bytes = &overlay } },
+            .delay = .{ .numerator = 3, .denominator = 20 },
+            .dispose = .background,
+            .blend = .over,
+        },
+    };
+    const encoded = try png.encode.animation.alloc(
+        allocator,
+        .{
+            .width = 2,
+            .height = 1,
+            .color_type = .rgba,
+            .bit_depth = 8,
+            .frames = &frames,
+            .play_count = 1,
+        },
+        .{},
+    );
+    defer allocator.free(encoded);
+    const source = try png.AnimationSource.open(encoded, .{});
+    try std.testing.expectEqual(2, source.frame_count);
+    try std.testing.expectEqual(1, source.play_count);
+    try std.testing.expect(source.default_is_frame);
+    var iterator = source.frames();
+    const first_control = (iterator.next()).?.control;
+    const second_control = (iterator.next()).?.control;
+    try std.testing.expectEqual(100, first_control.delay.effectiveDenominator());
+    try std.testing.expectEqual(1, second_control.x);
+    try std.testing.expectEqual(png.FrameControl.Disposal.background, second_control.dispose);
+    try std.testing.expectEqual(png.FrameControl.Blend.over, second_control.blend);
+    try std.testing.expectEqual(null, iterator.next());
+
+    var animation = try png.decode.animation.alloc(u8, allocator, encoded, .{});
+    defer animation.deinit(allocator);
+    var player = try png.Animation(u8).Player.initCapacity(allocator, &animation, .{});
+    defer player.deinit(allocator);
+    const first = player.next().?;
+    const copy = first.pixels[0..8].*;
+    const canvas = first.pixels.ptr;
+    try std.testing.expectEqual(base, copy);
+    try std.testing.expectEqual(100, first.delay.effectiveDenominator());
+    const second = player.next().?;
+    try std.testing.expectEqual(canvas, second.pixels.ptr);
+    try std.testing.expectEqual(base, copy);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 11, 13, 255, 29, 31, 37, 255 }, second.pixels);
+    try std.testing.expectEqual(3, second.delay.numerator);
+    try std.testing.expectEqual(20, second.delay.denominator);
+    try std.testing.expectEqual(null, player.next());
+}
 
 test "gzip verifies a member and rejects a damaged trailer" {
     const allocator = std.testing.allocator;
@@ -99,6 +271,78 @@ test "raw DEFLATE round trip uses caller workspaces and checks extent" {
     try std.testing.expectEqualStrings(source, &output);
 }
 
+test "bounded run encoding and producer staging use the package facades" {
+    const allocator = std.testing.allocator;
+    var source: [96]u8 = undefined;
+    for (&source, 0..) |*byte, i| byte.* = "abcd"[i % 4];
+    var wire: [zlib.short_four_byte_run_output_capacity]u8 = undefined;
+    var restored: [source.len]u8 = undefined;
+    const decoder = try deflate.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+
+    const raw = try deflate.encodeShortFourByteRuns(&source, &wire);
+    const raw_result = try deflate.decode(
+        raw,
+        &restored,
+        .{ .workspace = decoder },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(raw.len, raw_result.consumed);
+    try std.testing.expectEqualSlices(u8, &source, &restored);
+
+    const framed = try zlib.encodeShortFourByteRuns(&source, &wire);
+    const framed_result = try zlib.decode(
+        framed,
+        &restored,
+        .{ .workspace = decoder },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(framed.len, framed_result.consumed);
+    try std.testing.expectEqualSlices(u8, &source, &restored);
+
+    // Independently framed final stored block containing A, with Adler-32 0x00420042.
+    const stored_a = [_]u8{
+        0x78, 0x01, 0x01, 0x01, 0x00, 0xfe, 0xff, 0x41,
+        0x00, 0x42, 0x00, 0x42,
+    };
+    var stored: [zlib.short_stored_output_capacity]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &stored_a, try zlib.encodeShortStored("A", &stored));
+
+    const workspace = try zlib.FourByteRunEncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    defer workspace.clear();
+    var encoder: zlib.FourByteRunEncoder = undefined;
+    try encoder.reset(
+        workspace,
+        .{ .deflate = .{ .compression = .{ .strategy = .four_byte_runs } } },
+    );
+    // Drain the header, then fill and immediately commit the borrowed input prefix.
+    var written = (try encoder.step(&.{}, &wire, .process)).produced;
+    const input = encoder.inputBuffer() orelse return error.MissingInputBuffer;
+    @memcpy(input[0..source.len], &source);
+    const committed = try encoder.commitInput(source.len, wire[written..]);
+    try std.testing.expectEqual(source.len, committed.consumed);
+    written += committed.produced;
+    var complete = false;
+    for (0..4) |_| {
+        const progress = try encoder.step(&.{}, wire[written..], .finish);
+        written += progress.produced;
+        if (progress.status == .complete) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    const staged = try zlib.decode(
+        wire[0..written],
+        &restored,
+        .{ .workspace = decoder },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(written, staged.consumed);
+    try std.testing.expectEqualSlices(u8, &source, &restored);
+}
+
 test "raw DEFLATE levels and exact output errors are available to consumers" {
     const allocator = std.testing.allocator;
     const encoder = try deflate.EncoderWorkspace.create(allocator);
@@ -170,9 +414,11 @@ test "KTX2 writes and borrows an explicitly supplied level" {
     const samples = [_]ktx2.Sample{
         .{ .bit_offset = 0, .bit_length = 8, .channel_type = 0, .lower = 0, .upper = 255 },
     };
-    const descriptor = ktx2.BasicDescriptor{ .color_model = 1, .bytes_plane = .{
-        1, 0, 0, 0, 0, 0, 0, 0,
-    }, .samples = &samples };
+    const descriptor = ktx2.BasicDescriptor{
+        .color_model = 1,
+        .bytes_plane = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .samples = &samples,
+    };
     var descriptor_storage: [44]u8 = undefined;
     const descriptor_bytes = try descriptor.encodeInto(&descriptor_storage);
     const pixels = [_]u8{ 23, 42 };
@@ -454,9 +700,10 @@ test "classic xxHash numeric encoding and zero-seed reset" {
     std.mem.writeInt(u32, &canonical32, Xxh32.hash("abc"), .big);
     std.mem.writeInt(u64, &canonical64, Xxh64.hash("abc"), .big);
     try std.testing.expectEqual([4]u8{ 0x32, 0xd1, 0x53, 0xff }, canonical32);
-    try std.testing.expectEqual([8]u8{
-        0x44, 0xbc, 0x2c, 0xf5, 0xad, 0x77, 0x09, 0x99,
-    }, canonical64);
+    try std.testing.expectEqual(
+        [8]u8{ 0x44, 0xbc, 0x2c, 0xf5, 0xad, 0x77, 0x09, 0x99 },
+        canonical64,
+    );
     var state32 = Xxh32.init(0);
     var state64 = Xxh64.init(0);
     state32.update("discard");
@@ -494,7 +741,6 @@ test "XXH3 seeded and borrowed-secret streams" {
 }
 
 test "WAVE owned and caller samples retain rate and independent storage" {
-    const wav = @import("wingman").wav;
     var bytes: [48]u8 = undefined;
     const encoded = try wav.encodePcm16Into(
         .{ .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 0.5 } },
@@ -502,9 +748,9 @@ test "WAVE owned and caller samples retain rate and independent storage" {
     );
     try std.testing.expectEqual(
         48,
-        try wav.encodePcm16Requirements(.{ .sample_rate = 8000, .channels = .mono, .samples = &.{
-            -1, 0.5,
-        } }),
+        try wav.encodePcm16Requirements(
+            .{ .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 0.5 } },
+        ),
     );
     const required = try wav.decodeRequirements(encoded, &.{});
     try std.testing.expectEqual(2, required.frames);
@@ -521,7 +767,6 @@ test "WAVE owned and caller samples retain rate and independent storage" {
 }
 
 test "WAVE chunk inspection and inline std.Io conversion use the public namespace" {
-    const wav = @import("wingman").wav;
     var bytes: [56]u8 = undefined;
     const encoded = try wav.encodePcm16Into(
         .{ .sample_rate = 48000, .channels = .stereo, .samples = &.{ -1, 1, -0.5, 0.5, 0, 0.25 } },
@@ -654,9 +899,11 @@ test "G.711 scalar facts normalized output and PCM16 composition" {
     );
     try std.testing.expectEqualSlices(f32, &.{ 42, 42 }, output[4..]);
     var bytes: [8]u8 = undefined;
-    try std.testing.expectEqualSlices(u8, &.{
-        0x84, 0x82, 0x7c, 0x7d, 0, 0, 0, 0,
-    }, try lpcm.encodeInto(samples, &bytes, .{ .encoding = .signed16 }));
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x84, 0x82, 0x7c, 0x7d, 0, 0, 0, 0 },
+        try lpcm.encodeInto(samples, &bytes, .{ .encoding = .signed16 }),
+    );
 }
 
 test "G.711 refusal ordering preserves caller storage" {
@@ -711,9 +958,11 @@ test "ADPCM Microsoft literal samples from caller-owned coefficients" {
     );
     try std.testing.expectEqualSlices(f32, &.{ 42, 42 }, output[4..]);
     var bytes: [8]u8 = undefined;
-    try std.testing.expectEqualSlices(u8, &.{
-        0x9c, 0xff, 100, 0, 116, 0, 148, 0,
-    }, try lpcm.encodeInto(decoded, &bytes, .{ .encoding = .signed16 }));
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x9c, 0xff, 100, 0, 116, 0, 148, 0 },
+        try lpcm.encodeInto(decoded, &bytes, .{ .encoding = .signed16 }),
+    );
 }
 
 test "ADPCM encoder reports padded capacity and trims supplied frames" {
@@ -770,11 +1019,18 @@ test "ADPCM prefix still rejects omitted invalid IMA blocks" {
 }
 
 test "Exif metadata borrows either TIFF byte order" {
-    for ([_][]const u8{ &.{
-        0x49, 0x49, 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
-    }, &.{
-        0x4d, 0x4d, 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
-    } }) |bytes| {
+    for (
+        [_][]const u8{
+            &.{
+                0x49, 0x49, 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0,
+                0,    0,
+            },
+            &.{
+                0x4d, 0x4d, 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0,
+                0,    0,
+            },
+        },
+    ) |bytes| {
         const view = try exif.View.open(bytes, .{});
         try std.testing.expectEqual(exif.Orientation.right_top, (try view.orientation()).?);
         try std.testing.expectEqual(2, view.record_count);
@@ -1111,7 +1367,6 @@ test "Acclaim paired clips reuse one skeleton and prepared public transforms" {
 }
 
 test "named CRC variants survive the public module boundary" {
-    const crc = @import("wingman").crc;
     try std.testing.expectEqual(@as(u32, 0xe3069283), crc.Crc32Iscsi.hash("123456789"));
     try std.testing.expectEqual(@as(u16, 0xd64e), crc.Crc16Genibus.hash("123456789"));
     try std.testing.expectEqual(@as(u64, 0x995dc9bbdf1939fa), crc.Crc64Xz.hash("123456789"));

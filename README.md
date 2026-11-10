@@ -66,6 +66,15 @@ loader composes them with file metadata; they can also serve other containers or
 The raw codecs convert samples or complete blocks without parsing a file. Callers own playback,
 resampling and speaker placement. The linked guides state supported layouts and numerical limits.
 
+### Images
+
+Use `png` to inspect and encode PNG images, recover RGBA samples, or work with APNG animation.
+It reports metadata without applying color or orientation transforms.
+
+| Library and guide | Purpose | Example step |
+| --- | --- | --- |
+| [`png`](docs/png.md) | PNG/APNG inspection, decoding, encoding and animation playback | `png-example`, `png-animation-example` |
+
 ### Image metadata
 
 Use `exif` for classic TIFF image attributes and stored thumbnail data, or `icc` for uncompressed

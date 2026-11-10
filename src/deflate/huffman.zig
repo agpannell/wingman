@@ -3,7 +3,7 @@
 const std = @import("std");
 
 const bit_io = @import("bits.zig");
-const fixture_data = @import("fixtures.zig");
+const fixture_data = @import("../common/deflate_test_data.zig");
 const protocol = @import("format.zig");
 
 const Bits = bit_io.Bits;
@@ -1100,9 +1100,10 @@ test "canonical tables reject oversubscription and invalid incomplete trees" {
         struct { literal: LiteralTable, distance: DistanceTable },
     );
     defer std.testing.allocator.destroy(tables);
-    try std.testing.expectError(error.InvalidStream, tables.literal.build(&.{
-        1, 1, 1,
-    }, false, true));
+    try std.testing.expectError(
+        error.InvalidStream,
+        tables.literal.build(&.{ 1, 1, 1 }, false, true),
+    );
     try std.testing.expectError(error.InvalidStream, tables.literal.build(&.{ 2, 2 }, false, true));
     try std.testing.expectError(error.InvalidStream, tables.literal.build(&.{16}, false, true));
     _ = try tables.literal.build(&.{1}, false, true);

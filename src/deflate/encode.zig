@@ -7,6 +7,7 @@
 //! implementation is called or linked by this library.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const protocol = @import("format.zig");
 const match_tree = @import("match_tree.zig");
@@ -36,7 +37,7 @@ pub const EncodeError = error{
     StorageOverlap,
     /// The complete-buffer destination cannot hold the encoded result; output may be changed.
     OutputTooSmall,
-    /// A configured input/output/work allowance was exhausted.
+    /// An input/output/work allowance, including a short-operation input bound, was exhausted.
     LimitExceeded,
     /// Required capacity or cumulative byte accounting cannot be represented.
     CounterOverflow,
@@ -50,12 +51,13 @@ pub const Compression = struct {
     /// InvalidOptions. The default 6 uses lazy matching. Levels are not equivalent to another
     /// library's numbers.
     level: u8 = 6,
-    /// Level 0 always stores bytes; otherwise this selects ordinary or literal-only encoding.
+    /// Level 0 always stores bytes; other levels select ordinary, literal-only or four-byte runs.
     strategy: Strategy = .default,
     /// Search effort for the next position when a lazy match is pending. Reduced lookahead is
     /// available only with ordinary matching at levels 4–6. It can change the wire, work consumed
     /// and whether a finite work limit is reached; neither size nor speed is guaranteed to improve.
-    /// Full lookahead is the default and has no effect on levels without lazy matching.
+    /// Full lookahead is the default and has no effect on levels without lazy matching. Automatic
+    /// chooses reduced for ordinary level 6 and full for other valid levels and strategies.
     lazy_lookahead: LazyLookahead = .full,
     /// Effort spent pricing retained match lengths and distances during offline parsing. Choices
     /// other than full are available only with ordinary matching at levels 7–9. They can change
@@ -79,9 +81,12 @@ pub const Compression = struct {
 
     test validate {
         for (0..10) |level| {
-            for ([_]Strategy{ .default, .huffman_only }) |strategy| {
+            for ([_]Strategy{ .default, .huffman_only, .four_byte_runs }) |strategy| {
                 const full: Compression = .{ .level = @intCast(level), .strategy = strategy };
                 try full.validate();
+                var automatic = full;
+                automatic.lazy_lookahead = .automatic;
+                try automatic.validate();
                 var reduced = full;
                 reduced.lazy_lookahead = .reduced;
                 if (level >= 4 and level <= 6 and strategy == .default) {
@@ -120,6 +125,11 @@ pub const Compression = struct {
         default,
         /// Emit literals without match search, while still selecting stored or Huffman blocks.
         huffman_only,
+        /// Match only repeated four-byte patterns, using prebuilt dynamic codebooks or stored
+        /// blocks. Levels 1–9 use the same fast policy; level 0 stores. Useful for four-byte
+        /// residuals, but output may be much larger on other data. This is a byte-stream policy:
+        /// matches may cross input fragments and image rows. It does not select a PNG filter.
+        four_byte_runs,
     };
 
     /// Effort spent pricing retained lengths and distances for offline matches.
@@ -151,6 +161,8 @@ pub const Compression = struct {
         full,
         /// Spend less effort on the lookahead search while retaining the initial search effort.
         reduced,
+        /// Use reduced lookahead for ordinary level 6 and full lookahead for other combinations.
+        automatic,
     };
 };
 
@@ -159,7 +171,7 @@ test {
     _ = match_tree;
 }
 
-const Profile = enum { stored, huffman, greedy, lazy, offline };
+const Profile = enum { stored, huffman, four_byte_runs, greedy, lazy, offline };
 
 const Effort = struct { profile: Profile, depth: u16 };
 
@@ -167,6 +179,7 @@ fn effort(compression: Compression) EncodeError!Effort {
     try compression.validate();
     if (compression.level == 0) return .{ .profile = .stored, .depth = 0 };
     if (compression.strategy == .huffman_only) return .{ .profile = .huffman, .depth = 0 };
+    if (compression.strategy == .four_byte_runs) return .{ .profile = .four_byte_runs, .depth = 0 };
     // Greedy and lazy levels use hash chains; offline levels use a prefix-aware tree. Increasing
     // the level spends different bounded search effort without promising monotonic output size.
     return switch (compression.level) {
@@ -194,10 +207,17 @@ pub const EncodeLimits = struct {
     /// eight-byte comparisons, including dictionary preparation and replayed history. Offline
     /// pricing charges the full logical length range even when a pricing choice skips lengths.
     /// Bounded table initialization, tree checkpoints, byte tails, cached-match scans, price-run
-    /// discovery, state comparisons and ordinary-tree attempts before a package-merge fallback are
-    /// uncharged. Also set input_bytes to bound source-dependent scan effort; dictionary and
-    /// wrapper metadata may require separate bounds. Callers must also bound repeated steps or
-    /// flushes when bounding aggregate fixed setup work.
+    /// discovery, state comparisons, the bounded small-block cost proof, and ordinary-tree attempts
+    /// before a package-merge fallback are uncharged. A proven fixed/stored block skips Huffman
+    /// book and dynamic-header work and therefore does not charge that work. Also set input_bytes
+    /// to bound source-dependent scan effort; dictionary and wrapper metadata may require separate
+    /// bounds. Callers must also bound repeated steps or flushes when bounding aggregate fixed
+    /// setup work. Four-byte runs charge 256 work units atomically for sampling blocks of at least
+    /// 4,096 bytes, one per compared run byte, and four or 32 per attempted grouped-literal probe,
+    /// according to its span. Each grouped probe is admitted atomically. From 8,192 bytes, book
+    /// selection also charges up to 32 sampled run extensions and 32 units per literal window, plus
+    /// at most four seeding bytes. A stored preflight may perform a second scan. Prebuilt-book
+    /// initialization is uncharged.
     work_units: u64 = std.math.maxInt(u64),
 };
 
@@ -205,7 +225,7 @@ pub const EncodeLimits = struct {
 pub const EncodeOptions = struct {
     /// Optional preset dictionary, copied during reset; raw streams carry no dictionary identity.
     dictionary: ?[]const u8 = null,
-    /// Compression level, lazy-lookahead effort and optional literal-only strategy.
+    /// Compression level, lazy-lookahead effort and optional match strategy.
     compression: Compression = .{},
     /// Maximum match distance, in 256..32768 and a power of two.
     window_bytes: usize = 32768,
@@ -257,7 +277,10 @@ pub const EncodeStats = struct {
     output_bytes: u64 = 0,
     /// Charged algorithmic units, including all attempted parses and splits.
     work_units: u64 = 0,
-    /// Prior match candidates examined by the selected search, including history preparation.
+    /// Prior match candidates examined by the selected search, including history preparation. For
+    /// four-byte runs this also counts eligible sample positions and attempted grouped-literal
+    /// probes. Every eligible sample position is charged even when the sample decision is proven
+    /// before all positions are read.
     match_probes: u64 = 0,
     /// Logical match-length edges charged, including lengths skipped by maximum-length pricing.
     parse_edges: u64 = 0,
@@ -273,6 +296,90 @@ pub const EncodeStats = struct {
 
 const Match = match_tree.Match;
 const Matches = match_tree.Matches;
+
+test "automatic lookahead matches explicit policy for each level and strategy" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const input = "small repeated data: ababacabababacababababacabababac";
+    var expected_storage: [1024]u8 = undefined;
+    var actual_storage: [1024]u8 = undefined;
+    for (0..10) |level| {
+        for ([_]Compression.Strategy{ .default, .huffman_only, .four_byte_runs }) |strategy| {
+            const automatic: Compression = .{
+                .level = @intCast(level),
+                .strategy = strategy,
+                .lazy_lookahead = .automatic,
+            };
+            try automatic.validate();
+            var explicit = automatic;
+            explicit.lazy_lookahead = if (level == 6 and strategy == .default) .reduced else .full;
+            const expected = try encode(
+                input,
+                &expected_storage,
+                workspace,
+                .{ .compression = explicit },
+            );
+            const actual = try encode(
+                input,
+                &actual_storage,
+                workspace,
+                .{ .compression = automatic },
+            );
+            try std.testing.expectEqualSlices(u8, expected, actual);
+        }
+    }
+}
+
+test "automatic lookahead keeps explicit policy work and failure boundaries" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const input = "ababacabababacababababacabababac";
+    var auto_storage: [1024]u8 = undefined;
+    var explicit_storage: [1024]u8 = undefined;
+    for (0..10) |level| {
+        for ([_]Compression.Strategy{ .default, .huffman_only, .four_byte_runs }) |strategy| {
+            for ([_]u64{ 0, 1, 100, 1000, std.math.maxInt(u64) }) |budget| {
+                const automatic: Compression = .{
+                    .level = @intCast(level),
+                    .strategy = strategy,
+                    .lazy_lookahead = .automatic,
+                };
+                var explicit = automatic;
+                explicit.lazy_lookahead = if (level == 6 and strategy == .default)
+                    .reduced
+                else
+                    .full;
+                var first: Encoder = undefined;
+                try first.reset(
+                    workspace,
+                    .{ .compression = automatic, .limits = .{ .work_units = budget } },
+                );
+                const actual = first.step(input, &auto_storage, .finish);
+                const actual_counts = first.counts();
+                var second: Encoder = undefined;
+                try second.reset(
+                    workspace,
+                    .{ .compression = explicit, .limits = .{ .work_units = budget } },
+                );
+                const expected = second.step(input, &explicit_storage, .finish);
+                if (actual) |progress| {
+                    const reference = try expected;
+                    try std.testing.expectEqualDeep(reference, progress);
+                    try std.testing.expectEqualSlices(
+                        u8,
+                        explicit_storage[0..reference.produced],
+                        auto_storage[0..progress.produced],
+                    );
+                } else |err| {
+                    try std.testing.expectError(err, expected);
+                }
+                try std.testing.expectEqualDeep(second.counts(), actual_counts);
+            }
+        }
+    }
+}
 
 // A zero length identifies a literal byte in value; otherwise value is the match distance.
 const Token = struct { length: u16, value: u16 };
@@ -292,6 +399,455 @@ const Header = struct {
     bits: u32,
 };
 
+// Prebuilt literal/length trees avoid constructing a Huffman tree for each run block. The original
+// tree gives zero a one-bit code; the balanced tree spends two bits on zero for shorter neighboring
+// literals and long-run tokens. The negative-heavy tree favors zero and 255. The latter two cover
+// thirty-two edge bytes with eight-bit codes for vector lookup and use twelve-bit middle codes.
+// sampleRunBook prices sampled literals and runs; every tree retains the fourteen-bit writer cap.
+const run_book: RunBook = RunBook.init(
+    .{
+        1,  3,  4,  6,  7,  7,  8,  8,  9,  9,  9,  10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11,
+        11, 12, 12, 12, 12, 12, 12, 12, 12, 13, 12, 13, 13, 13, 13, 13, 13, 13, 13, 13, 14, 13, 13,
+        13, 14, 14, 13, 14, 13, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 13,
+        14, 13, 13, 13, 13, 13, 13, 13, 13, 13, 14, 13, 13, 13, 13, 13, 13, 13, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 11, 12, 11, 12, 11, 11, 11, 11, 11, 10, 10, 10, 10, 10, 9,  9,  8,  7,  6,
+        5,  4,  4,  14, 7,  6,  8,  9,  9,  8,  9,  11, 9,  11, 10, 11, 10, 11, 12, 13, 12, 13, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    },
+);
+const balanced_run_book: RunBook = RunBook.init(
+    .{
+        2,  3,  4,  5,  6,  6,  6,  7,  7,  7,  7,  8,  8,  8,  8,  8,  12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 8,  8,  8,  8,  8,  7,  7,  7,  7,  7,  6,  6,  5,
+        5,  4,  3,  14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 11, 10, 11, 12,
+        12, 10, 10, 11, 11, 11, 11, 12, 12, 5,
+    },
+);
+
+// This zero/negative-heavy tree reserves short codes for zero and 255, while all thirty-two edge
+// bytes fit vector lookup. Middle bytes use twelve bits; lengths retain the fourteen-bit cap.
+const negative_run_book: RunBook = RunBook.init(
+    .{
+        1,  5,  6,  7,  7,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  7,
+        7,  6,  2,  14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 12, 11, 12, 13,
+        13, 11, 12, 12, 13, 12, 13, 13, 13, 7,
+    },
+);
+const run_books = [_]*const RunBook{ &run_book, &balanced_run_book, &negative_run_book };
+
+const RunBookChoice = enum {
+    original,
+    balanced,
+    negative,
+
+    inline fn book(choice: RunBookChoice) *const RunBook {
+        return switch (choice) {
+            .original => &run_book,
+            .balanced => &balanced_run_book,
+            .negative => &negative_run_book,
+        };
+    }
+};
+
+// Relative prices preserve the absolute comparison, including each rounded per-byte match price.
+// Adjacent signed fields keep both alternatives together for each sampled symbol or length.
+const RunLiteralPriceDelta = packed struct(u16) { balanced: i8, negative: i8 };
+const RunMatchPriceDelta = packed struct(u32) { balanced: i16, negative: i16 };
+const run_literal_price_deltas: [256]RunLiteralPriceDelta = blk: {
+    var deltas: [256]RunLiteralPriceDelta = undefined;
+    for (
+        &deltas,
+        0..,
+    ) |*delta, symbol| delta.* = .{
+        .balanced = @intCast(
+            @as(
+                i16,
+                balanced_run_book.header.literal.widths[symbol],
+            ) - run_book.header.literal.widths[symbol],
+        ),
+        .negative = @intCast(
+            @as(
+                i16,
+                negative_run_book.header.literal.widths[symbol],
+            ) - run_book.header.literal.widths[symbol],
+        ),
+    };
+    break :blk deltas;
+};
+const run_match_price_deltas: [259]RunMatchPriceDelta = blk: {
+    @setEvalBranchQuota(10_000);
+    var deltas: [259]RunMatchPriceDelta = @splat(.{ .balanced = 0, .negative = 0 });
+    for (3..259) |length| {
+        const original = sampleMatchPrice(&run_book, length);
+        deltas[length] = .{
+            .balanced = @intCast(@as(i32, sampleMatchPrice(&balanced_run_book, length)) - original),
+            .negative = @intCast(@as(i32, sampleMatchPrice(&negative_run_book, length)) - original),
+        };
+    }
+    break :blk deltas;
+};
+
+fn sampleMatchPrice(book: *const RunBook, length: usize) u16 {
+    return @intCast(((book.match_tokens[length] >> 24) * 256 + length / 2) / length);
+}
+
+const RunBook = struct {
+    header: Header,
+    header_wire: [96]u8,
+    header_bytes: usize,
+    header_tail: u64,
+    header_count: u8,
+    match_tokens: [259]u32,
+    literal_lanes: [256]u32,
+    planes: [2][2]@Vector(32, u8),
+    wide_edges: bool,
+    offset: u8,
+    limit: u8,
+
+    fn init(comptime widths: [286]u8) RunBook {
+        @setEvalBranchQuota(200_000);
+        var value: RunBook = std.mem.zeroes(RunBook);
+        var capacity: u32 = 0;
+        for (widths) |width| {
+            if (width == 0 or width > 14) @compileError("invalid fixed run code width");
+            capacity += @as(u32, 1) << @intCast(14 - width);
+        }
+        if (capacity != 1 << 14) @compileError("fixed run book must be complete");
+        value.header.literal.widths = widths;
+        canonical(&value.header.literal);
+        value.header.distance.widths[3] = 1;
+        canonical(&value.header.distance);
+        @memset(value.header.precode.widths[0..15], 4);
+        value.header.precode.widths[15] = 5;
+        value.header.precode.widths[16] = 5;
+        canonical(&value.header.precode);
+        value.header.literal_count = 286;
+        value.header.distance_count = 4;
+        value.header.precode_count = 19;
+        value.header.bits = 14 + 19 * 3;
+        var all_widths: [290]u8 = undefined;
+        @memcpy(all_widths[0..286], &widths);
+        @memcpy(all_widths[286..290], value.header.distance.widths[0..4]);
+        var pos: usize = 0;
+        while (pos < all_widths.len) {
+            const width = all_widths[pos];
+            var end = pos + 1;
+            while (end < all_widths.len and all_widths[end] == width) : (end += 1) {}
+            value.header.runs[value.header.run_count] = .{ .symbol = width, .extra = 0 };
+            value.header.run_count += 1;
+            value.header.bits += value.header.precode.widths[width];
+            pos += 1;
+            while (end - pos >= 3) {
+                const take = @min(6, end - pos);
+                value.header.runs[value.header.run_count] = .{
+                    .symbol = 16,
+                    .extra = @intCast(take - 3),
+                };
+                value.header.run_count += 1;
+                value.header.bits += value.header.precode.widths[16] + 2;
+                pos += take;
+            }
+            while (pos < end) : (pos += 1) {
+                value.header.runs[value.header.run_count] = .{ .symbol = width, .extra = 0 };
+                value.header.run_count += 1;
+                value.header.bits += value.header.precode.widths[width];
+            }
+        }
+
+        for (3..259) |length| {
+            const slot = lengthSlot(length);
+            const code_width = value.header.literal.widths[257 + @as(usize, slot)];
+            const extra_width = length_extra[slot];
+            const code = @as(
+                u32,
+                value.header.literal.codes[257 + @as(usize, slot)],
+            ) | (@as(u32, @intCast(length - length_base[slot])) << @intCast(code_width));
+            const width = code_width + extra_width + 1;
+            if (width > 24) @compileError("run match token exceeds its payload");
+            value.match_tokens[length] = code | (@as(u32, width) << 24);
+        }
+        for (&value.literal_lanes, 0..) |*lane, symbol| {
+            const width = widths[symbol];
+            const mask: u16 = (@as(u16, 1) << @as(u4, @intCast(width))) - 1;
+            lane.* = value.header.literal.codes[symbol] | (@as(u32, mask) << 16);
+        }
+        value.wide_edges = true;
+        for (0..16) |i| {
+            if (widths[i] > 8 or widths[240 + i] > 8) value.wide_edges = false;
+        }
+        value.offset = if (value.wide_edges) 16 else 6;
+        value.limit = if (value.wide_edges) 32 else 14;
+        var planes: [2][2][32]u8 = @splat(@splat(@splat(0)));
+        if (value.wide_edges) {
+            for (0..2) |side| for (0..32) |i| {
+                const symbol = i % 16 + side * 240;
+                planes[side][0][i] = @intCast(value.header.literal.codes[symbol]);
+                planes[side][1][i] = @truncate(value.literal_lanes[symbol] >> 16);
+            };
+        } else {
+            for (0..32) |i| {
+                const index = i % 16;
+                if (index >= 14) continue;
+                const symbol = (index + 250) % 256;
+                if (widths[symbol] > 8) @compileError("short run edge exceeds eight bits");
+                planes[0][0][i] = @intCast(value.header.literal.codes[symbol]);
+                planes[0][1][i] = @truncate(value.literal_lanes[symbol] >> 16);
+            }
+        }
+        value.planes = .{ .{ planes[0][0], planes[0][1] }, .{ planes[1][0], planes[1][1] } };
+        var writer: RunBitWriter = .{
+            .book = &value,
+            .wire = &value.header_wire,
+            .bits = 0,
+            .count = 0,
+            .pending = 0,
+        };
+        writer.put(0, 1);
+        writer.put(2, 2);
+        writer.put(value.header.literal_count - 257, 5);
+        writer.put(value.header.distance_count - 1, 5);
+        writer.put(value.header.precode_count - 4, 4);
+        for (precode_order[0..value.header.precode_count]) |symbol| {
+            writer.put(value.header.precode.widths[symbol], 3);
+        }
+        for (value.header.runs[0..value.header.run_count]) |run| {
+            writer.symbol(&value.header.precode, run.symbol);
+            writer.put(run.extra, runExtra(run.symbol));
+        }
+        writer.flush();
+        value.header_bytes = writer.pending;
+        value.header_tail = writer.bits;
+        value.header_count = writer.count;
+        if (writer.pending >= value.header_wire.len or writer.count >= 8) {
+            @compileError("fixed run header exceeds its staging");
+        }
+        return value;
+    }
+};
+
+const pext_run_literals = blk: {
+    if (builtin.cpu.arch != .x86_64) break :blk false;
+    // Keep FPNGE's scalar selection for these older AMD compiler targets.
+    if (builtin.cpu.model == &std.Target.x86.cpu.znver1 or builtin.cpu.model == &std.Target.x86.cpu
+        .znver2 or builtin.cpu.model == &std.Target.x86.cpu.bdver4) break :blk false;
+    break :blk std.Target.x86.featureSetHasAll(builtin.cpu.features, &.{ .bmi2, .popcnt });
+};
+const vector_run_matches = switch (builtin.cpu.arch) {
+    .x86, .x86_64 => std.Target.x86.featureSetHasAll(builtin.cpu.features, &.{.avx2}),
+    else => false,
+};
+
+const run_literal_shuffle: @Vector(
+    16,
+    i32,
+) = .{ 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15 };
+
+// FPNGE uses PEXT to join variable-length codes. Here four code/mask pairs preserve the existing
+// fixed book, including its variable middle-symbol widths.
+// https://github.com/veluca93/fpnge/blob/097ebccf3d3db443d9a8f238b1deed010a82f961/fpnge.cc
+inline fn pextRunQuad(book: *const RunBook, values: *const [4]u8) struct { bits: u64, width: u8 } {
+    const entries: @Vector(
+        4,
+        u32,
+    ) = .{
+        book.literal_lanes[values[0]],
+        book.literal_lanes[values[1]],
+        book.literal_lanes[values[2]],
+        book.literal_lanes[values[3]],
+    };
+    const bytes: @Vector(16, u8) = @bitCast(entries);
+    const lanes: @Vector(2, u64) = @bitCast(@shuffle(u8, bytes, undefined, run_literal_shuffle));
+    const bits = asm ("pext %[mask], %[bits], %[result]"
+        : [result] "=r" (-> u64),
+        : [bits] "r" (lanes[0]),
+          [mask] "r" (lanes[1]),
+    );
+    return .{ .bits = bits, .width = @intCast(@popCount(lanes[1])) };
+}
+
+const vector_run_octets = pext_run_literals and std.Target.x86.featureSetHasAll(
+    builtin.cpu.features,
+    &.{.avx2},
+);
+// Snapshot the immutable vector lookup once per block, independently of the mutable writer.
+const RunLiteralLookup = struct {
+    planes: [2][2]@Vector(32, u8),
+    offset: u8,
+    limit: u8,
+    wide_edges: bool,
+
+    inline fn init(book: *const RunBook) RunLiteralLookup {
+        return .{
+            .planes = book.planes,
+            .offset = book.offset,
+            .limit = book.limit,
+            .wide_edges = book.wide_edges,
+        };
+    }
+};
+
+const RunBitWriter = struct {
+    book: *const RunBook,
+    wire: []u8,
+    bits: u64,
+    count: u8,
+    pending: usize,
+
+    inline fn put(self: *RunBitWriter, value: usize, width: u8) void {
+        self.bits |= @as(u64, @intCast(value)) << @as(u6, @intCast(self.count));
+        self.count += width;
+        if (self.count >= 32) {
+            std.mem.writeInt(u32, self.wire[self.pending..][0..4], @truncate(self.bits), .little);
+            self.pending += 4;
+            self.bits >>= 32;
+            self.count -= 32;
+        }
+    }
+
+    inline fn flush(self: *RunBitWriter) void {
+        if (self.count >= 16) {
+            std.mem.writeInt(u16, self.wire[self.pending..][0..2], @truncate(self.bits), .little);
+            self.pending += 2;
+            self.bits >>= 16;
+            self.count -= 16;
+        }
+        if (self.count >= 8) {
+            self.wire[self.pending] = @truncate(self.bits);
+            self.pending += 1;
+            self.bits >>= 8;
+            self.count -= 8;
+        }
+    }
+
+    inline fn symbol(self: *RunBitWriter, book: *const Book, value: usize) void {
+        self.put(book.codes[value], book.widths[value]);
+    }
+
+    // The caller keeps fewer than eight pending bits; four literals add at most 56.
+    inline fn symbolQuad(self: *RunBitWriter, values: *const [4]u8) void {
+        var codes: u64 = 0;
+        var width: u8 = 0;
+        if (comptime pext_run_literals) {
+            const joined = pextRunQuad(self.book, values);
+            codes = joined.bits;
+            width = joined.width;
+        } else {
+            var count: u6 = 0;
+            inline for (0..4) |i| {
+                const value = values[i];
+                codes |= @as(u64, self.book.header.literal.codes[value]) << count;
+                count += @intCast(self.book.header.literal.widths[value]);
+            }
+            width = count;
+        }
+        self.putBytes(codes, width);
+    }
+
+    inline fn symbolSpan32(
+        self: *RunBitWriter,
+        values: *const [32]u8,
+        lookup: RunLiteralLookup,
+    ) void {
+        if (comptime vector_run_octets) {
+            const bytes: @Vector(32, u8) = values.*;
+            const indices = bytes +% @as(@Vector(32, u8), @splat(lookup.offset));
+            if (@reduce(.And, indices < @as(@Vector(32, u8), @splat(lookup.limit)))) {
+                var planes: [2]@Vector(32, u8) = undefined;
+                if (lookup.wide_edges) {
+                    inline for (0..2) |plane| {
+                        const low = asm ("vpshufb %[indices], %[table], %[result]"
+                            : [result] "=v" (-> @Vector(32, u8)),
+                            : [table] "v" (lookup.planes[0][plane]),
+                              [indices] "v" (indices),
+                        );
+                        const high = asm ("vpshufb %[indices], %[table], %[result]"
+                            : [result] "=v" (-> @Vector(32, u8)),
+                            : [table] "v" (lookup.planes[1][plane]),
+                              [indices] "v" (indices),
+                        );
+                        planes[plane] = @select(
+                            u8,
+                            bytes < @as(@Vector(32, u8), @splat(16)),
+                            low,
+                            high,
+                        );
+                    }
+                } else {
+                    inline for (
+                        0..2,
+                    ) |plane| planes[plane] = asm ("vpshufb %[indices], %[table], %[result]"
+                        : [result] "=v" (-> @Vector(32, u8)),
+                        : [table] "v" (lookup.planes[0][plane]),
+                          [indices] "v" (indices),
+                    );
+                }
+                const codes: @Vector(4, u64) = @bitCast(planes[0]);
+                const masks: @Vector(4, u64) = @bitCast(planes[1]);
+                inline for (0..4) |i| {
+                    const joined = asm ("pext %[mask], %[bits], %[result]"
+                        : [result] "=r" (-> u64),
+                        : [bits] "r" (codes[i]),
+                          [mask] "r" (masks[i]),
+                    );
+                    const width: u8 = @intCast(@popCount(masks[i]));
+                    if (self.count + width >= 64) {
+                        self.put(@as(u32, @truncate(joined)), 32);
+                        self.putBytes(joined >> 32, width - 32);
+                    } else {
+                        self.putBytes(joined, width);
+                    }
+                }
+                return;
+            }
+        }
+        inline for (0..8) |i| self.symbolQuad(values[i * 4 ..][0..4]);
+    }
+
+    inline fn runMatch(self: *RunBitWriter, length: usize) void {
+        // The fixed token has at most 24 bits; the ordinary writer retains fewer than 32.
+        const token = self.book.match_tokens[length];
+        self.putBytes(token & 0x00ffffff, @intCast(token >> 24));
+    }
+
+    // Like FPNGE's writer, normalize the complete-byte prefix with one padded store. Callers supply
+    // eight writable bytes and a total below 64 bits; fewer than eight remain.
+    inline fn putBytes(self: *RunBitWriter, codes: u64, width: u8) void {
+        std.debug.assert(self.count + width < 64);
+        self.bits |= codes << @as(u6, @intCast(self.count));
+        self.count += width;
+        std.mem.writeInt(u64, self.wire[self.pending..][0..8], self.bits, .little);
+        const complete = self.count & ~@as(u8, 7);
+        self.pending += complete / 8;
+        self.bits >>= @as(u6, @intCast(complete));
+        self.count -= complete;
+    }
+};
+
 const Package = struct { weight: u64, left: u16, right: u16, symbol: u16 };
 
 const HuffmanScratch = struct {
@@ -308,6 +864,33 @@ const Segment = struct { first: usize, end: usize, start: usize, bytes: usize };
 const ChainWorkspace = struct { heads: [65536]u32, previous: [window_bytes + slab_bytes]u32 };
 const search_bytes = @max(@sizeOf(ChainWorkspace), @sizeOf(match_tree.Workspace));
 const search_alignment = @max(@alignOf(ChainWorkspace), @alignOf(match_tree.Workspace));
+
+/// Exclusive scratch for stored and four-byte-run encoding, initialized on demand. Construct it at
+/// its final address and keep it exclusively borrowed by the encoder until reset or end of use. The
+/// allocator is not retained; clear retained bytes after use if needed before releasing storage.
+pub const FourByteRunEncoderWorkspace = struct {
+    /// Encoder-owned input and history; callers must not modify these bytes while borrowed.
+    data: [window_bytes + slab_bytes]u8,
+    /// Encoder-owned staged output; callers must not modify these bytes while borrowed.
+    wire: [slab_bytes + 128]u8,
+
+    /// Reserves undefined scratch without creating a large temporary.
+    pub fn create(
+        allocator: std.mem.Allocator,
+    ) std.mem.Allocator.Error!*FourByteRunEncoderWorkspace {
+        return allocator.create(FourByteRunEncoderWorkspace);
+    }
+
+    /// Releases scratch through its construction allocator after all borrows.
+    pub fn destroy(self: *FourByteRunEncoderWorkspace, allocator: std.mem.Allocator) void {
+        allocator.destroy(self);
+    }
+
+    /// Erases retained input, history and staged output after ending its use.
+    pub fn clear(self: *FourByteRunEncoderWorkspace) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+};
 
 /// Exclusive bounded scratch, with no allocator retained. Construct directly at its final address
 /// using create or caller storage. Encoder borrows it until reset/end of use. Contents are private
@@ -378,15 +961,15 @@ pub const EncoderWorkspace = struct {
     }
 };
 
-/// Bound for one complete-buffer encode call, including final padding. Overflow returns
-/// CounterOverflow. Streaming can add blocks when process fills a slab or flush/finish forces a
-/// boundary; use step's backpressure. Each empty stored synchronization marker occupies at most six
-/// bytes.
+/// Sufficient capacity for one stream, including final padding and a possible empty final block
+/// after process fills its last slab. Accepts a complete call or process calls followed by finish.
+/// Explicit flush/full_flush boundaries need additional capacity; each empty stored synchronization
+/// marker occupies at most six bytes. Overflow returns CounterOverflow.
 pub fn encodeBound(source_bytes: usize) EncodeError!usize {
     const partial = @intFromBool(source_bytes % slab_bytes != 0);
     const slabs = @max(1, source_bytes / slab_bytes + partial);
     const overhead = std.math.mul(usize, slabs, 5) catch return error.CounterOverflow;
-    return std.math.add(usize, source_bytes, overhead + 1) catch error.CounterOverflow;
+    return std.math.add(usize, source_bytes, overhead + 7) catch error.CounterOverflow;
 }
 
 /// Encodes one independent stream into exact unpadded caller storage. The returned prefix borrows
@@ -523,784 +1106,1577 @@ test encode {
 /// caller input/output pointer or allocator is retained. Construct the owner at its final address
 /// and serialize its exclusive workspace borrow. Errors require reset; reset abandons unpublished
 /// pending wire bytes.
-pub const Encoder = struct {
-    workspace: *EncoderWorkspace,
-    options: struct {
-        profile: Profile,
-        depth: u16,
-        reduced_lookahead: bool,
-        offline_pricing: Compression.OfflinePricing,
-        offline_refinement: Compression.OfflineRefinement,
-        window_bytes: usize,
-        limits: EncodeLimits,
-    },
-    stats: EncodeStats,
+pub const Encoder = EncoderImpl(EncoderWorkspace);
+/// Streaming encoder using the smaller workspace. Set compression.strategy to .four_byte_runs, or
+/// set compression.level to 0 for stored encoding. Default options select neither and are invalid.
+pub const FourByteRunEncoder = EncoderImpl(FourByteRunEncoderWorkspace);
 
-    history: usize,
-    buffered: usize,
+/// Maximum input length accepted by encodeShortFourByteRuns.
+pub const short_four_byte_run_max_input_bytes = 2048;
+/// Required output capacity, including temporary wide-write padding.
+pub const short_four_byte_run_output_capacity = short_four_byte_run_max_input_bytes + 128;
 
-    pending: usize,
-    sent: usize,
-    bits: u64,
-    bit_count: u6,
-
-    boundary: ?EncodeAction,
-    finished: bool,
-    failed: bool,
-    started: bool,
-
-    /// Initializes existing storage, copying optional dictionary history. Invalid options and
-    /// overlaps among the incoming dictionary, owner and workspace are refused before mutation.
-    pub fn reset(
-        self: *Encoder,
-        workspace: *EncoderWorkspace,
-        options: EncodeOptions,
-    ) EncodeError!void {
-        try disjoint(std.mem.asBytes(self), std.mem.asBytes(workspace));
-        if (options.window_bytes < 256 or options.window_bytes > window_bytes)
-            return error.InvalidOptions;
-        if (!std.math.isPowerOfTwo(options.window_bytes)) return error.InvalidOptions;
-        const selected = try effort(options.compression);
-        if (options.dictionary) |dictionary| {
-            // The dictionary may point into the old owner. Admit it before replacing self so a
-            // refused reset cannot corrupt the bytes the caller supplied.
-            try disjoint(dictionary, std.mem.asBytes(self));
-            try disjoint(dictionary, std.mem.asBytes(workspace));
-        }
-        self.* = .{
-            .workspace = workspace,
-            .options = .{
-                .profile = selected.profile,
-                .depth = selected.depth,
-                .reduced_lookahead = options.compression.lazy_lookahead == .reduced,
-                .offline_pricing = options.compression.offline_pricing,
-                .offline_refinement = options.compression.offline_refinement,
-                .window_bytes = options.window_bytes,
-                .limits = options.limits,
-            },
-            .stats = .{},
-            .history = 0,
-            .buffered = 0,
-            .pending = 0,
-            .sent = 0,
-            .bits = 0,
-            .bit_count = 0,
-            .boundary = null,
-            .finished = false,
-            .failed = false,
-            .started = false,
+/// Encodes a complete four-byte-run stream without a dictionary or work limit. Source and output
+/// must be disjoint. Output must have short_four_byte_run_output_capacity bytes; the result borrows
+/// its prefix and padding after it may change. Oversized input returns LimitExceeded; length,
+/// capacity and overlap errors precede writes.
+pub fn encodeShortFourByteRuns(source: []const u8, output: []u8) EncodeError![]u8 {
+    if (source.len > short_four_byte_run_max_input_bytes) return error.LimitExceeded;
+    if (output.len < short_four_byte_run_output_capacity) return error.OutputTooSmall;
+    try disjoint(source, output);
+    const wire: *[short_four_byte_run_output_capacity]u8 =
+        output[0..short_four_byte_run_output_capacity];
+    var count: usize = 0;
+    var fallback = source.len <= 35;
+    if (!fallback) {
+        @memcpy(wire[0..run_book.header_bytes], run_book.header_wire[0..run_book.header_bytes]);
+        wire[0] |= 1;
+        var writer: RunBitWriter = .{
+            .book = &run_book,
+            .wire = wire,
+            .bits = run_book.header_tail,
+            .count = run_book.header_count,
+            .pending = run_book.header_bytes,
         };
-        if (options.dictionary) |dictionary| try self.setDictionary(dictionary);
-    }
-
-    /// Copies only the reachable dictionary suffix before the first step. Dictionary bytes may
-    /// retire on return. Multiple attachments replace the previous history; invalid state/overlap
-    /// poisons the owner.
-    pub fn setDictionary(self: *Encoder, dictionary: []const u8) EncodeError!void {
-        if (self.failed) return error.NeedReset;
-        self.attach(dictionary) catch |err| {
-            self.failed = true;
-            return err;
-        };
-    }
-
-    /// Returns copied byte/effort counters without exposing internal scratch. After failure, counts
-    /// may include bytes and effort admitted during the failed step even though it returned no
-    /// progress. Reset starts counts anew.
-    pub fn counts(self: *const Encoder) EncodeStats {
-        return self.stats;
-    }
-
-    /// Processes one fragment. An empty output span may still accept input into scratch. A flush
-    /// boundary is returned once; resume with a new operation. Complete is idempotent only with
-    /// empty input and finish. Failure may change output, returns no progress value and requires
-    /// reset. Counts may still include work or bytes admitted during the failed call.
-    pub fn step(
-        self: *Encoder,
-        input: []const u8,
-        output: []u8,
-        action: EncodeAction,
-    ) EncodeError!EncodeProgress {
-        if (self.failed) {
-            @branchHint(.unlikely);
-            return error.NeedReset;
+        const limit_bits = 40 + source.len * 8;
+        var position: usize = 0;
+        while (position < source.len) {
+            if (writer.pending * 8 + writer.count >= limit_bits) {
+                fallback = true;
+                break;
+            }
+            var length: usize = 1;
+            if (position >= 4 and source[position] == source[position - 4]) {
+                const maximum = @min(258, source.len - position);
+                while (maximum - length >= 8) {
+                    const a = std.mem.readInt(u64, source[position + length ..][0..8], .little);
+                    const b = std.mem.readInt(u64, source[position + length - 4 ..][0..8], .little);
+                    const difference = a ^ b;
+                    if (difference != 0) {
+                        length += @as(usize, @intCast(@ctz(difference))) / 8;
+                        break;
+                    }
+                    length += 8;
+                } else {
+                    while (length < maximum and source[position + length] == source[
+                        position +
+                            length - 4
+                    ]) {
+                        length += 1;
+                    }
+                }
+            }
+            if (length >= 3) {
+                writer.runMatch(length);
+                position += length;
+            } else {
+                writer.symbol(&run_book.header.literal, source[position]);
+                position += 1;
+            }
         }
-        return self.advance(input, output, action) catch |err| {
-            @branchHint(.cold);
-            self.failed = true;
-            return err;
-        };
+        if (!fallback) {
+            writer.symbol(&run_book.header.literal, 256);
+            fallback = writer.pending * 8 + writer.count >= limit_bits;
+        }
+        if (!fallback) {
+            writer.flush();
+            count = writer.pending;
+            if (writer.count != 0) {
+                wire[count] = @truncate(writer.bits);
+                count += 1;
+            }
+        }
     }
-
-    fn attach(self: *Encoder, dictionary: []const u8) EncodeError!void {
-        if (self.started) return error.InvalidState;
-        try disjoint(dictionary, std.mem.asBytes(self));
-        try disjoint(dictionary, std.mem.asBytes(self.workspace));
-        self.history = @min(dictionary.len, self.options.window_bytes);
-        @memcpy(self.workspace.data[0..self.history], dictionary[dictionary.len - self.history ..]);
+    if (fallback) {
+        wire[0] = 1;
+        writeStoredBody(source, wire[1..][0 .. source.len + 4]);
+        count = source.len + 5;
     }
+    return wire[0..count];
+}
 
-    fn advance(
-        self: *Encoder,
-        input: []const u8,
-        output: []u8,
-        action: EncodeAction,
-    ) EncodeError!EncodeProgress {
-        try disjoint(input, output);
-        inline for (.{ std.mem.asBytes(self), std.mem.asBytes(self.workspace) }) |reservation| {
-            try disjoint(input, reservation);
-            try disjoint(output, reservation);
+fn EncoderImpl(comptime Workspace: type) type {
+    return struct {
+        const Self = @This();
+        workspace: *Workspace,
+        options: struct {
+            profile: Profile,
+            depth: u16,
+            reduced_lookahead: bool,
+            offline_pricing: Compression.OfflinePricing,
+            offline_refinement: Compression.OfflineRefinement,
+            window_bytes: usize,
+            limits: EncodeLimits,
+        },
+        stats: EncodeStats,
+
+        history: usize,
+        buffered: usize,
+
+        pending: usize,
+        sent: usize,
+        bits: u64,
+        bit_count: u6,
+
+        boundary: ?EncodeAction,
+        finished: bool,
+        failed: bool,
+        started: bool,
+
+        /// Direct producer input. A producer may fill the returned prefix and immediately commit
+        /// it, without another encoder operation in between. The borrow ends at commit; block
+        /// construction can reuse these bytes. Ordinary step still requires input disjoint from the
+        /// workspace.
+        pub fn inputBuffer(encoder: *Self) ?[]u8 {
+            if (encoder.failed or encoder.finished or encoder.boundary != null or encoder.pending !=
+                0 or encoder.sent != 0) return null;
+            const input_left = encoder.options.limits.input_bytes -| encoder.stats.input_bytes;
+            const room: usize = @intCast(@min(slab_bytes - encoder.buffered, input_left));
+            if (room == 0) return null;
+            return encoder.workspace.data[encoder.history + encoder.buffered ..][0..room];
         }
-        if (self.finished) {
-            if (input.len != 0 or action != .finish) return error.InvalidState;
-            return .{ .consumed = 0, .produced = 0, .status = .complete };
-        }
-        if (self.boundary) |latched| {
-            if (input.len != 0 or latched != action) return error.InvalidState;
-        }
-        self.started = true;
-        if (self.options.profile == .stored and action == .finish) {
-            if (try self.finishStored(
-                input,
-                output,
-            )) |written| return .{
-                .consumed = input.len,
-                .produced = written,
-                .status = .complete,
+
+        /// Commits the initialized prefix with process semantics. Output must not overlap the owner
+        /// or workspace. Errors poison the encoder until reset.
+        pub fn commitInput(encoder: *Self, length: usize, output: []u8) EncodeError!EncodeProgress {
+            if (encoder.failed) return error.NeedReset;
+            return encoder.commitBufferedInput(length, output) catch |err| {
+                encoder.failed = true;
+                return err;
             };
         }
 
-        var read: usize = 0;
-        var written: usize = 0;
-        while (true) {
-            const output_left = self.options.limits.output_bytes -| self.stats.output_bytes;
-            const available: usize = @intCast(@min(output.len - written, output_left));
-            const amount = @min(available, self.pending - self.sent);
-            @memcpy(output[written..][0..amount], self.workspace.wire[self.sent..][0..amount]);
-            self.sent += amount;
-            written += amount;
-            self.stats.output_bytes = try addCount(self.stats.output_bytes, amount);
-            if (self.sent != self.pending) {
-                if (self.stats.output_bytes == self.options.limits.output_bytes)
-                    return error.LimitExceeded;
-                return .{ .consumed = read, .produced = written, .status = .need_output };
+        fn commitBufferedInput(
+            encoder: *Self,
+            length: usize,
+            output: []u8,
+        ) EncodeError!EncodeProgress {
+            const available = encoder.inputBuffer() orelse return error.InvalidState;
+            if (length > available.len) return error.InvalidState;
+            try disjoint(output, std.mem.asBytes(encoder));
+            try disjoint(output, std.mem.asBytes(encoder.workspace));
+            encoder.started = true;
+            encoder.buffered += length;
+            encoder.stats.input_bytes = try addCount(encoder.stats.input_bytes, length);
+            const progress = try encoder.advance(&.{}, output, .process);
+            return .{
+                .consumed = length,
+                .produced = progress.produced,
+                .status = progress.status,
+            };
+        }
+
+        /// Initializes existing storage, copying optional dictionary history. Invalid options and
+        /// overlaps among the incoming dictionary, owner and workspace are refused before mutation.
+        pub fn reset(self: *Self, workspace: *Workspace, options: EncodeOptions) EncodeError!void {
+            try disjoint(std.mem.asBytes(self), std.mem.asBytes(workspace));
+            if (options.window_bytes < 256 or options.window_bytes > window_bytes)
+                return error.InvalidOptions;
+            if (!std.math.isPowerOfTwo(options.window_bytes)) return error.InvalidOptions;
+            const selected = try effort(options.compression);
+            if (comptime Workspace == FourByteRunEncoderWorkspace) {
+                if (selected.profile != .stored and selected.profile != .four_byte_runs)
+                    return error.InvalidOptions;
             }
-            self.pending = 0;
-            self.sent = 0;
+            if (options.dictionary) |dictionary| {
+                // The dictionary may point into the old owner. Admit it before replacing self so a
+                // refused reset cannot corrupt the bytes the caller supplied.
+                try disjoint(dictionary, std.mem.asBytes(self));
+                try disjoint(dictionary, std.mem.asBytes(workspace));
+            }
+            self.* = .{
+                .workspace = workspace,
+                .options = .{
+                    .profile = selected.profile,
+                    .depth = selected.depth,
+                    .reduced_lookahead = switch (options.compression.lazy_lookahead) {
+                        .full => false,
+                        .reduced => true,
+                        .automatic,
+                        => options.compression.level == 6 and options.compression.strategy ==
+                            .default,
+                    },
+                    .offline_pricing = options.compression.offline_pricing,
+                    .offline_refinement = options
+                        .compression.offline_refinement,
+                    .window_bytes = options.window_bytes,
+                    .limits = options.limits,
+                },
+                .stats = .{},
+                .history = 0,
+                .buffered = 0,
+                .pending = 0,
+                .sent = 0,
+                .bits = 0,
+                .bit_count = 0,
+                .boundary = null,
+                .finished = false,
+                .failed = false,
+                .started = false,
+            };
+            if (options.dictionary) |dictionary| try self.setDictionary(dictionary);
+        }
+
+        /// Copies only the reachable dictionary suffix before the first step. Dictionary bytes may
+        /// retire on return. Multiple attachments replace the previous history; invalid
+        /// state/overlap poisons the owner.
+        pub fn setDictionary(self: *Self, dictionary: []const u8) EncodeError!void {
+            if (self.failed) return error.NeedReset;
+            self.attach(dictionary) catch |err| {
+                self.failed = true;
+                return err;
+            };
+        }
+
+        /// Returns copied byte/effort counters without exposing internal scratch. After failure,
+        /// counts may include bytes and effort admitted during the failed step even though it
+        /// returned no progress. Reset starts counts anew.
+        pub fn counts(self: *const Self) EncodeStats {
+            return self.stats;
+        }
+
+        /// Processes one fragment. An empty output span may still accept input into scratch. A
+        /// flush boundary is returned once; resume with a new operation. Complete is idempotent
+        /// only with empty input and finish. Failure may change output, returns no progress value
+        /// and requires reset. Counts may still include work or bytes admitted during the failed
+        /// call.
+        pub fn step(
+            self: *Self,
+            input: []const u8,
+            output: []u8,
+            action: EncodeAction,
+        ) EncodeError!EncodeProgress {
+            if (self.failed) {
+                @branchHint(.unlikely);
+                return error.NeedReset;
+            }
+            return self.advance(input, output, action) catch |err| {
+                @branchHint(.cold);
+                self.failed = true;
+                return err;
+            };
+        }
+
+        fn attach(self: *Self, dictionary: []const u8) EncodeError!void {
+            if (self.started) return error.InvalidState;
+            try disjoint(dictionary, std.mem.asBytes(self));
+            try disjoint(dictionary, std.mem.asBytes(self.workspace));
+            self.history = @min(dictionary.len, self.historyLimit());
+            @memcpy(
+                self.workspace.data[0..self.history],
+                dictionary[dictionary.len - self.history ..],
+            );
+        }
+
+        fn advance(
+            self: *Self,
+            input: []const u8,
+            output: []u8,
+            action: EncodeAction,
+        ) EncodeError!EncodeProgress {
+            try disjoint(input, output);
+            inline for (.{ std.mem.asBytes(self), std.mem.asBytes(self.workspace) }) |reservation| {
+                try disjoint(input, reservation);
+                try disjoint(output, reservation);
+            }
+            if (self.finished) {
+                if (input.len != 0 or action != .finish) return error.InvalidState;
+                return .{ .consumed = 0, .produced = 0, .status = .complete };
+            }
             if (self.boundary) |latched| {
-                self.boundary = null;
-                if (latched == .finish) self.finished = true;
-                if (latched == .full_flush) self.history = 0;
-                return .{
-                    .consumed = read,
+                if (input.len != 0 or latched != action) return error.InvalidState;
+            }
+            self.started = true;
+            if (self.options.profile == .stored and action == .finish) {
+                if (try self.finishStored(
+                    input,
+                    output,
+                )) |written| return .{
+                    .consumed = input.len,
                     .produced = written,
-                    .status = if (latched == .finish) .complete else .flushed,
+                    .status = .complete,
                 };
             }
-            const input_left = self.options.limits.input_bytes -| self.stats.input_bytes;
-            const room: usize = @intCast(@min(slab_bytes - self.buffered, input_left));
-            const take = @min(room, input.len - read);
-            @memcpy(
-                self.workspace.data[self.history + self.buffered ..][0..take],
-                input[read..][0..take],
-            );
-            self.buffered += take;
-            read += take;
-            self.stats.input_bytes = try addCount(self.stats.input_bytes, take);
-            if (read < input.len and self.stats.input_bytes == self.options.limits.input_bytes)
-                return error.LimitExceeded;
-            const at_end = read == input.len;
-            if (self.buffered == slab_bytes or (at_end and action != .process)) {
-                const closing = at_end and action != .process;
-                try self.buildBlock(closing and action == .finish);
-                if (closing) {
-                    if (action != .finish) {
-                        try self.stored(&.{}, false);
-                    } else {
-                        self.alignBits();
-                    }
-                    self.boundary = action;
+
+            var read: usize = 0;
+            var written: usize = 0;
+            while (true) {
+                const output_left = self.options.limits.output_bytes -| self.stats.output_bytes;
+                const available: usize = @intCast(@min(output.len - written, output_left));
+                const amount = @min(available, self.pending - self.sent);
+                @memcpy(output[written..][0..amount], self.workspace.wire[self.sent..][0..amount]);
+                self.sent += amount;
+                written += amount;
+                self.stats.output_bytes = try addCount(self.stats.output_bytes, amount);
+                if (self.sent != self.pending) {
+                    if (self.stats.output_bytes == self.options.limits.output_bytes)
+                        return error.LimitExceeded;
+                    return .{ .consumed = read, .produced = written, .status = .need_output };
                 }
-                continue;
-            }
-            return .{ .consumed = read, .produced = written, .status = .need_input };
-        }
-    }
-
-    // A complete stored finish needs neither staged input nor a retained match history. Use the
-    // ordinary path when buffering, pending output or a limit can suspend/refuse this operation.
-    fn finishStored(self: *Encoder, input: []const u8, output: []u8) EncodeError!?usize {
-        if (self.buffered != 0 or self.pending != 0 or self.boundary != null) return null;
-        if (self.bit_count != 0) return null;
-        const blocks = @max(1, input.len / slab_bytes + @intFromBool(input.len % slab_bytes != 0));
-        const overhead = std.math.mul(usize, blocks, 5) catch return null;
-        const bytes = std.math.add(usize, input.len, overhead) catch return null;
-        const input_left = self.options.limits.input_bytes -| self.stats.input_bytes;
-        const output_left = self.options.limits.output_bytes -| self.stats.output_bytes;
-        if (bytes > output.len or input.len > input_left or bytes > output_left) return null;
-
-        var next_stats = self.stats;
-        next_stats.input_bytes = try addCount(next_stats.input_bytes, input.len);
-        next_stats.output_bytes = try addCount(next_stats.output_bytes, bytes);
-        next_stats.blocks = try addCount(next_stats.blocks, blocks);
-        next_stats.stored_blocks = try addCount(next_stats.stored_blocks, blocks);
-
-        var read: usize = 0;
-        var written: usize = 0;
-        for (0..blocks) |index| {
-            const take: usize = @min(slab_bytes, input.len - read);
-            output[written] = @intFromBool(index + 1 == blocks);
-            writeStoredBody(input[read..][0..take], output[written + 1 ..][0 .. take + 4]);
-            read += take;
-            written += take + 5;
-        }
-        self.stats = next_stats;
-        self.history = 0;
-        self.finished = true;
-        return written;
-    }
-
-    fn work(self: *Encoder, units: u64) EncodeError!void {
-        if (units > self.options.limits.work_units -| self.stats.work_units)
-            return error.LimitExceeded;
-        self.stats.work_units = try addCount(self.stats.work_units, units);
-    }
-
-    fn buildBlock(self: *Encoder, final: bool) EncodeError!void {
-        const workspace = self.workspace;
-        if (self.options.profile == .stored) {
-            try self.stored(workspace.data[self.history..][0..self.buffered], final);
-        } else {
-            try self.compressedBlock(final);
-        }
-        const total = self.history + self.buffered;
-        self.history = @min(total, self.options.window_bytes);
-        std.mem.copyForwards(
-            u8,
-            workspace.data[0..self.history],
-            workspace.data[total - self.history .. total],
-        );
-        self.buffered = 0;
-    }
-
-    fn compressedBlock(self: *Encoder, final: bool) EncodeError!void {
-        const workspace = self.workspace;
-        if (self.options.profile == .offline) {
-            try self.findOfflineTreeMatches(final);
-        } else if (self.options.profile != .huffman) {
-            try self.findMatches();
-        }
-        var count = self.referenceParse(
-            self.options.profile == .lazy or self.options.profile == .offline,
-        );
-        var selection = try self.select(workspace.tokens[0..count], self.buffered, self.bit_count);
-        if (self.options.profile != .offline) {
-            // Selection leaves the exact chosen books/header ready for emission. Only offline
-            // parsing can replace these tokens or split them into separately priced blocks.
-            return self.emit(
-                workspace.tokens[0..count],
-                .{ .first = 0, .end = count, .start = 0, .bytes = self.buffered },
-                selection.kind,
-                final,
-            );
-        }
-
-        // The reusable state needs a long run of identical match metadata. Prices can split such
-        // runs but cannot create one, so this scan may conservatively select the reuse path.
-        const reuse_possible = mayReusePricing(workspace.matches[0..self.buffered]);
-        var best_count = count;
-        var best_bits = selection.bits;
-        @memcpy(workspace.best[0..count], workspace.tokens[0..count]);
-        fixedBook(&workspace.header.literal, false);
-        fixedBook(&workspace.header.distance, true);
-        var previous_dynamic_best: ?u32 = null;
-        for (0..8) |pass| {
-            const literal_widths = workspace.header.literal.widths;
-            const distance_widths = workspace.header.distance.widths[0..30].*;
-            const work_before = self.stats.work_units;
-            const edges_before = self.stats.parse_edges;
-            count = switch (self.options.offline_pricing) {
-                .maximum_lengths => if (reuse_possible) try self.priceParse(
-                    true,
-                    .maximum_lengths,
-                    &workspace.header.literal,
-                    &workspace.header.distance,
-                ) else try self.priceParse(
-                    false,
-                    .maximum_lengths,
-                    &workspace.header.literal,
-                    &workspace.header.distance,
-                ),
-                .reduced => if (reuse_possible) try self.priceParse(
-                    true,
-                    .reduced,
-                    &workspace.header.literal,
-                    &workspace.header.distance,
-                ) else try self.priceParse(
-                    false,
-                    .reduced,
-                    &workspace.header.literal,
-                    &workspace.header.distance,
-                ),
-                .full => if (reuse_possible) try self.priceParse(
-                    true,
-                    .full,
-                    &workspace.header.literal,
-                    &workspace.header.distance,
-                ) else try self.priceParse(
-                    false,
-                    .full,
-                    &workspace.header.literal,
-                    &workspace.header.distance,
-                ),
-            };
-            selection = try self.select(workspace.tokens[0..count], self.buffered, self.bit_count);
-            if (selection.bits < best_bits) {
-                best_bits = selection.bits;
-                best_count = count;
-                @memcpy(workspace.best[0..count], workspace.tokens[0..count]);
-            }
-            // Both stopping rules consider the triggering pass before returning the best parse.
-            if (self.options.offline_refinement == .early and earlyStop(
-                pass,
-                previous_dynamic_best,
-                selection.dynamic_bits,
-            )) break;
-            // Standard refinement stops on equal or worse dynamic cost; a one-bit gain continues.
-            if (adaptiveStop(previous_dynamic_best, selection.dynamic_bits)) break;
-            previous_dynamic_best = selection.dynamic_bits;
-            // select constructs the next dynamic price books, including when a fixed/stored
-            // candidate won the serialized choice.
-            if (!std.mem.eql(
-                u8,
-                &literal_widths,
-                &workspace.header.literal.widths,
-            ) or !std.mem.eql(
-                u8,
-                &distance_widths,
-                workspace.header.distance.widths[0..30],
-            )) continue;
-            // Stable books guarantee that the next pass has the same dynamic price and stops.
-            // Reserve that one logical pass only when it fits. Otherwise execute it normally so
-            // refusal still reports the actual admission point and partial counters.
-            const remaining: u64 = if (pass < 7) 1 else 0;
-            const units = std.math.mul(
-                u64,
-                self.stats.work_units - work_before,
-                remaining,
-            ) catch continue;
-            const edges = std.math.mul(
-                u64,
-                self.stats.parse_edges - edges_before,
-                remaining,
-            ) catch continue;
-            const work_left = self.options.limits.work_units -| self.stats.work_units;
-            const edges_left = std.math.maxInt(u64) - self.stats.parse_edges;
-            if (units > work_left or edges > edges_left) continue;
-            try self.work(units);
-            self.stats.parse_edges += edges;
-            break;
-        }
-        workspace.segments[0] = .{
-            .first = 0,
-            .end = best_count,
-            .start = 0,
-            .bytes = self.buffered,
-        };
-        var segments: usize = 1;
-        if (self.buffered >= 4096) {
-            segments = try self.split(0, best_count, 0, self.buffered, self.bit_count, 0, 0);
-        }
-        for (workspace.segments[0..segments], 0..) |segment, index| {
-            const tokens = workspace.best[segment.first..segment.end];
-            const chosen = try self.select(tokens, segment.bytes, self.bit_count);
-            try self.emit(tokens, segment, chosen.kind, final and index + 1 == segments);
-        }
-    }
-
-    // A checkpoint excludes the final 257 positions whose comparisons may need later bytes.
-    // Coordinates are derived from accepted input counts, so no additional owner state is kept.
-    noinline fn findOfflineTreeMatches(self: *Encoder, final: bool) EncodeError!void {
-        const processed = self.stats.input_bytes - self.buffered;
-        const cycle: u64 = 1 << 31;
-        const phase: usize = @intCast(processed & (cycle - 1));
-        // Rebuild near each coordinate rollover. The margin exceeds a slab plus any history,
-        // covering the block that crossed the boundary even after a short flush.
-        const near_rollover = processed >= cycle and phase < slab_bytes + window_bytes;
-        const rebuild = processed == 0 or self.history == 0 or near_rollover;
-        if (final and rebuild) return self.findOfflineTreeMatchesStandalone();
-        const workspace = self.workspace;
-        const total = self.history + self.buffered;
-        const data = workspace.data[0..total];
-        const depth: usize = self.options.depth;
-        const nice: usize = if (depth <= 35) 75 else if (depth <= 100) 150 else 258;
-        const origin = self.options.window_bytes + phase - self.history;
-        if (rebuild) workspace.tree().resetAll();
-        const pending = if (final) 0 else @min(total, self.options.window_bytes, 257);
-        const checkpoint = total - pending;
-        const first = if (rebuild) @as(usize, 0) else self.history - @min(self.history, 257);
-        std.debug.assert(first <= checkpoint);
-        for (first..total) |position| {
-            if (pending != 0 and position == checkpoint) workspace.copyTreeCheckpoint(false);
-            const remaining = self.options.limits.work_units - self.stats.work_units;
-            const matches = if (position < self.history) null else &workspace.matches[
-                position -
-                    self.history
-            ];
-            var partial: match_tree.Stats = undefined;
-            const result = if (remaining >= depth * 34 + 1) match_tree.insertAndFindAt(
-                false,
-                workspace.tree(),
-                data,
-                position,
-                origin,
-                self.options.window_bytes,
-                depth,
-                nice,
-                matches,
-                remaining,
-                &partial,
-            ) else match_tree.insertAndFindAt(
-                true,
-                workspace.tree(),
-                data,
-                position,
-                origin,
-                self.options.window_bytes,
-                depth,
-                nice,
-                matches,
-                remaining,
-                &partial,
-            );
-            const stats = result catch |err| {
-                try self.work(partial.units);
-                self.stats.match_probes = try addCount(self.stats.match_probes, partial.probes);
-                return err;
-            };
-            try self.work(stats.units);
-            self.stats.match_probes = try addCount(self.stats.match_probes, stats.probes);
-        }
-        if (pending != 0) workspace.copyTreeCheckpoint(true);
-    }
-
-    // Rebuild the bounded tree for a standalone slab, including copied dictionary history.
-    noinline fn findOfflineTreeMatchesStandalone(self: *Encoder) EncodeError!void {
-        const workspace = self.workspace;
-        const total = self.history + self.buffered;
-        const depth: usize = self.options.depth;
-        const nice: usize = if (depth <= 35) 75 else if (depth <= 100) 150 else 258;
-        workspace.tree().reset(workspace.data[0..total]);
-        for (0..total) |position| {
-            const remaining = self.options.limits.work_units - self.stats.work_units;
-            const matches = if (position < self.history) null else &workspace.matches[
-                position -
-                    self.history
-            ];
-            var partial: match_tree.Stats = undefined;
-            const result = if (remaining >= depth * 34 + 1) match_tree.insertAndFind(
-                false,
-                workspace.tree(),
-                workspace.data[0..total],
-                position,
-                self.options.window_bytes,
-                depth,
-                nice,
-                matches,
-                remaining,
-                &partial,
-            ) else match_tree.insertAndFind(
-                true,
-                workspace.tree(),
-                workspace.data[0..total],
-                position,
-                self.options.window_bytes,
-                depth,
-                nice,
-                matches,
-                remaining,
-                &partial,
-            );
-            const stats = result catch |err| {
-                try self.work(partial.units);
-                self.stats.match_probes = try addCount(self.stats.match_probes, partial.probes);
-                return err;
-            };
-            try self.work(stats.units);
-            self.stats.match_probes = try addCount(self.stats.match_probes, stats.probes);
-        }
-    }
-
-    fn findMatches(self: *Encoder) EncodeError!void {
-        if (self.options.reduced_lookahead) return self.findMatchesMode(true);
-        return self.findMatchesMode(false);
-    }
-
-    // Select the lookahead policy once per block, keeping it out of the full-search loop.
-    noinline fn findMatchesMode(self: *Encoder, comptime reduced: bool) EncodeError!void {
-        const workspace = self.workspace;
-        const total = self.history + self.buffered;
-        if (total <= 256) {
-            // Only hashes present in this slab can be read below. Clear those heads first so short
-            // inputs avoid clearing the whole table, even when keys collide or scratch was reused.
-            for (0..total -| 2) |position| {
-                workspace.chain().heads[hash3(workspace.data[position..][0..3])] = no_position;
-            }
-        } else {
-            @memset(&workspace.chain().heads, no_position);
-        }
-        const depth: usize = self.options.depth;
-        const lazy = self.options.profile == .lazy;
-        var next_search = self.history;
-        var pending_length: usize = 0;
-        for (0..total) |position| {
-            if (total - position < 3) {
-                if (position >= self.history) workspace.matches[position - self.history].count = 0;
-                continue;
-            }
-            const hash = hash3(workspace.data[position..][0..3]);
-            const candidate = workspace.chain().heads[hash];
-            workspace.chain().previous[position] = candidate;
-            workspace.chain().heads[hash] = @intCast(position);
-            if (position < self.history) continue;
-            // Every position enters the chain, including bytes covered by an earlier match.
-            // Greedy/lazy parsing only needs matches at the next token and its lazy lookahead.
-            if (position < next_search) continue;
-            const matches = &workspace.matches[position - self.history];
-            matches.count = 0;
-            const remaining = self.options.limits.work_units - self.stats.work_units;
-            const search_depth = if (reduced and pending_length != 0) depth / 2 else depth;
-            // One candidate plus at most 31 word comparisons fits this bound. Admit the whole
-            // position when possible, otherwise check each charged operation. Both paths publish
-            // identical exact counters.
-            var partial: SearchStats = undefined;
-            const result = if (remaining >= search_depth * 34) self.scanMatches(
-                false,
-                position,
-                total,
-                candidate,
-                search_depth,
-                remaining,
-                &partial,
-            ) else self.scanMatches(
-                true,
-                position,
-                total,
-                candidate,
-                search_depth,
-                remaining,
-                &partial,
-            );
-            const measured = result catch |err| {
-                try self.work(partial.units);
-                self.stats.match_probes = try addCount(self.stats.match_probes, partial.probes);
-                return err;
-            };
-            try self.work(measured.units);
-            self.stats.match_probes = try addCount(self.stats.match_probes, measured.probes);
-            var length: usize = 0;
-            if (matches.count != 0) length = matches.items[matches.count - 1].length;
-            if (lazy and pending_length != 0 and length <= pending_length) {
-                // The previous position's match wins; this position was its lookahead.
-                next_search = position + pending_length - 1;
-                pending_length = 0;
-            } else {
-                // A longer lookahead makes the previous byte a literal. It is now the next token.
-                pending_length = if (lazy) length else 0;
-                next_search = position + if (lazy) 1 else @max(1, length);
-            }
-        }
-    }
-
-    fn scanMatches(
-        self: *Encoder,
-        comptime bounded: bool,
-        position: usize,
-        total: usize,
-        first: u32,
-        depth: usize,
-        budget: u64,
-        partial: *SearchStats,
-    ) EncodeError!SearchStats {
-        const workspace = self.workspace;
-        const matches = &workspace.matches[position - self.history];
-        const maximum = @min(258, total - position);
-        const earliest = position -| self.options.window_bytes;
-        const source = workspace.data[position..];
-        var candidate = first;
-        var longest: usize = 2;
-        var measured: SearchStats = .{ .units = 0, .probes = 0 };
-        defer partial.* = measured;
-        while (candidate != no_position and candidate >= earliest and measured.probes < depth) {
-            const candidate_position: usize = candidate;
-            try searchWork(bounded, &measured.units, budget);
-            measured.probes += 1;
-            const prior = workspace.data[candidate_position..];
-            if (prior[longest] == source[longest] and std.mem.eql(u8, prior[0..3], source[0..3])) {
-                var length: usize = 3;
-                while (length + 8 <= maximum) : (length += 8) {
-                    try searchWork(bounded, &measured.units, budget);
-                    const prior_word = std.mem.readInt(u64, prior[length..][0..8], .little);
-                    const source_word = std.mem.readInt(u64, source[length..][0..8], .little);
-                    if (prior_word != source_word) break;
-                }
-                while (length < maximum and prior[length] == source[length]) : (length += 1) {}
-                if (length > longest) {
-                    const slot = @min(matches.count, alternatives - 1);
-                    matches.items[slot] = .{
-                        .length = @intCast(length),
-                        .distance = @intCast(position - candidate_position),
+                self.pending = 0;
+                self.sent = 0;
+                if (self.boundary) |latched| {
+                    self.boundary = null;
+                    if (latched == .finish) self.finished = true;
+                    if (latched == .full_flush) self.history = 0;
+                    return .{
+                        .consumed = read,
+                        .produced = written,
+                        .status = if (latched == .finish) .complete else .flushed,
                     };
-                    matches.count = @min(alternatives, matches.count + 1);
-                    longest = length;
-                    if (length == maximum) break;
                 }
-            }
-            candidate = workspace.chain().previous[candidate_position];
-        }
-        return measured;
-    }
-
-    inline fn searchWork(comptime bounded: bool, units: *u32, budget: u64) EncodeError!void {
-        if (bounded and units.* >= budget) return error.LimitExceeded;
-        units.* += 1;
-    }
-
-    fn referenceParse(self: *Encoder, lazy: bool) usize {
-        const workspace = self.workspace;
-        var count: usize = 0;
-        var position: usize = 0;
-        while (position < self.buffered) {
-            const matches = &workspace.matches[position];
-            var length: usize = 0;
-            var distance: u16 = 0;
-            if (self.options.profile != .huffman and matches.count != 0) {
-                const match = matches.items[matches.count - 1];
-                length = match.length;
-                distance = match.distance;
-                if (lazy and position + 1 < self.buffered) {
-                    const next = &workspace.matches[position + 1];
-                    if (next.count != 0 and next.items[next.count - 1].length > length) length = 0;
+                const input_left = self.options.limits.input_bytes -| self.stats.input_bytes;
+                const room: usize = @intCast(@min(slab_bytes - self.buffered, input_left));
+                const take = @min(room, input.len - read);
+                @memcpy(
+                    self.workspace.data[self.history + self.buffered ..][0..take],
+                    input[read..][0..take],
+                );
+                self.buffered += take;
+                read += take;
+                self.stats.input_bytes = try addCount(self.stats.input_bytes, take);
+                if (read < input.len and self.stats.input_bytes == self.options.limits.input_bytes)
+                    return error.LimitExceeded;
+                const at_end = read == input.len;
+                if (self.buffered == slab_bytes or (at_end and action != .process)) {
+                    const closing = at_end and action != .process;
+                    try self.buildBlock(closing and action == .finish);
+                    if (closing) {
+                        if (action != .finish) {
+                            try self.stored(&.{}, false);
+                        } else {
+                            self.alignBits();
+                        }
+                        self.boundary = action;
+                    }
+                    continue;
                 }
+                return .{ .consumed = read, .produced = written, .status = .need_input };
             }
-            const value: u16 = if (length == 0) workspace.data[
-                self.history +
-                    position
-            ] else distance;
-            workspace.tokens[count] = .{ .length = @intCast(length), .value = value };
-            position += @max(1, length);
-            count += 1;
         }
-        return count;
-    }
 
-    noinline fn priceParse(
-        self: *Encoder,
-        comptime reuse: bool,
-        comptime policy: Compression.OfflinePricing,
-        literal: *const Book,
-        distance: *const Book,
-    ) EncodeError!usize {
-        const workspace = self.workspace;
-        // Copy prices: header construction after this parse may replace books.
-        var literal_prices: [286]u32 = undefined;
-        var distance_prices: [30]u32 = undefined;
-        for (&literal_prices, literal.widths) |*cost, width| cost.* = if (width == 0) 13 else width;
-        for (&distance_prices, distance.widths[0..30], 0..) |*cost, width, i| {
-            const code_price: u32 = if (width == 0) 10 else width;
-            cost.* = code_price + distance_extra[i];
-        }
-        var length_prices: [259]u32 = undefined;
-        for (3..259) |length| {
-            const slot = lengthSlot(length);
-            length_prices[length] = literal_prices[257 + @as(usize, slot)] + length_extra[slot];
-        }
-        workspace.costs[self.buffered] = 0;
-        var run: PriceRun = .{ .first = self.buffered };
-        var position = self.buffered;
-        while (position != 0) {
-            position -= 1;
-            if (reuse and position < run.first) run = PriceRun.find(
-                self,
-                position,
-                &literal_prices,
+        // A complete stored finish needs neither staged input nor a retained match history. Use the
+        // ordinary path when buffering, pending output or a limit can suspend/refuse this
+        // operation.
+        fn finishStored(self: *Self, input: []const u8, output: []u8) EncodeError!?usize {
+            if (self.buffered != 0 or self.pending != 0 or self.boundary != null) return null;
+            if (self.bit_count != 0) return null;
+            const blocks = @max(
+                1,
+                input.len / slab_bytes + @intFromBool(input.len % slab_bytes != 0),
             );
-            const value = workspace.data[self.history + position];
-            var cost = literal_prices[value] + workspace.costs[position + 1];
-            var choice: Token = .{ .length = 0, .value = value };
-            const matches = &workspace.matches[position];
-            if (matches.count != 0) {
-                const maximum = matches.items[matches.count - 1].length;
-                // Charge the full logical length range even when a pricing choice skips lengths.
-                try self.work(maximum - 2);
-                self.stats.parse_edges = try addCount(self.stats.parse_edges, maximum - 2);
-                if (policy == .maximum_lengths) {
-                    // Only retained maximum lengths participate in this pruned parse.
-                    for (matches.items[0..matches.count]) |match| {
-                        const length: usize = match.length;
-                        const distance_price = distance_prices[distanceSlot(match.distance)];
-                        const candidate = distance_price + length_prices[length] + workspace
-                            .costs[position + length];
-                        if (candidate < cost) {
-                            cost = candidate;
-                            choice = .{ .length = match.length, .value = match.distance };
+            const overhead = std.math.mul(usize, blocks, 5) catch return null;
+            const bytes = std.math.add(usize, input.len, overhead) catch return null;
+            const input_left = self.options.limits.input_bytes -| self.stats.input_bytes;
+            const output_left = self.options.limits.output_bytes -| self.stats.output_bytes;
+            if (bytes > output.len or input.len > input_left or bytes > output_left) return null;
+
+            var next_stats = self.stats;
+            next_stats.input_bytes = try addCount(next_stats.input_bytes, input.len);
+            next_stats.output_bytes = try addCount(next_stats.output_bytes, bytes);
+            next_stats.blocks = try addCount(next_stats.blocks, blocks);
+            next_stats.stored_blocks = try addCount(next_stats.stored_blocks, blocks);
+
+            var read: usize = 0;
+            var written: usize = 0;
+            for (0..blocks) |index| {
+                const take: usize = @min(slab_bytes, input.len - read);
+                output[written] = @intFromBool(index + 1 == blocks);
+                writeStoredBody(input[read..][0..take], output[written + 1 ..][0 .. take + 4]);
+                read += take;
+                written += take + 5;
+            }
+            self.stats = next_stats;
+            self.history = 0;
+            self.finished = true;
+            return written;
+        }
+
+        fn work(self: *Self, units: u64) EncodeError!void {
+            if (units > self.options.limits.work_units -| self.stats.work_units)
+                return error.LimitExceeded;
+            self.stats.work_units = try addCount(self.stats.work_units, units);
+        }
+
+        fn historyLimit(self: *const Self) usize {
+            // This profile only refers to the previous four bytes. Retaining a full window would
+            // copy unused history after each nonfinal block.
+            return if (self.options.profile == .four_byte_runs) 4 else self.options.window_bytes;
+        }
+
+        fn buildBlock(self: *Self, final: bool) EncodeError!void {
+            const workspace = self.workspace;
+            if (self.options.profile == .stored) {
+                try self.stored(workspace.data[self.history..][0..self.buffered], final);
+            } else {
+                try self.compressedBlock(final);
+            }
+            if (!final) {
+                const total = self.history + self.buffered;
+                self.history = @min(total, self.historyLimit());
+                // When the retained suffix starts at zero it is already in place.
+                if (total > self.history) {
+                    std.mem.copyForwards(
+                        u8,
+                        workspace.data[0..self.history],
+                        workspace.data[total - self.history .. total],
+                    );
+                }
+            }
+            self.buffered = 0;
+        }
+
+        fn compressedBlock(self: *Self, final: bool) EncodeError!void {
+            const workspace = self.workspace;
+            if (self.options.profile == .four_byte_runs) {
+                // This book's empty dynamic block needs 663 bits. A stored block of at most 35
+                // bytes needs at most 322 bits, including worst-case alignment.
+                if (self.buffered <= 35) {
+                    return self.stored(workspace.data[self.history..][0..self.buffered], final);
+                }
+                return self.encodeFourByteRuns(final);
+            }
+            if (comptime Workspace == FourByteRunEncoderWorkspace) {
+                unreachable;
+            } else {
+                if (self.options.profile == .offline) {
+                    try self.findOfflineTreeMatches(final);
+                } else if (self.options.profile != .huffman) {
+                    try self.findMatches();
+                }
+                var count = self.referenceParse(
+                    self.options.profile == .lazy or self.options.profile == .offline,
+                );
+                if (self.options.profile != .offline and count <= 64) {
+                    if (count <= 5) {
+                        if (try self.selectProvablySmall(
+                            workspace.tokens[0..count],
+                            self.buffered,
+                            self.bit_count,
+                        )) |small| {
+                            return self.emit(
+                                workspace.tokens[0..count],
+                                .{ .first = 0, .end = count, .start = 0, .bytes = self.buffered },
+                                small.kind,
+                                final,
+                            );
+                        }
+                    } else {
+                        @branchHint(.unlikely);
+                        if (smallHuffmanBound(
+                            workspace.tokens[0..count],
+                            self.buffered,
+                            self.bit_count,
+                        )) |proof| {
+                            if (proof.best.bits <= proof.lower) {
+                                try self.work(count + 1);
+                                return self.emit(
+                                    workspace.tokens[0..count],
+                                    .{
+                                        .first = 0,
+                                        .end = count,
+                                        .start = 0,
+                                        .bytes = self.buffered,
+                                    },
+                                    proof.best.kind,
+                                    final,
+                                );
+                            }
                         }
                     }
-                } else if (reuse and matches.count == 1) {
-                    const match = matches.items[0];
-                    self.priceSingleMatch(
-                        position,
-                        match,
-                        &length_prices,
-                        distance_prices[distanceSlot(match.distance)],
-                        &cost,
-                        &choice,
+                }
+                var selection = try self.select(
+                    workspace.tokens[0..count],
+                    self.buffered,
+                    self.bit_count,
+                );
+                if (self.options.profile != .offline) {
+                    // Selection leaves the exact chosen books/header ready for emission. Only
+                    // offline parsing can replace these tokens or split them into separately priced
+                    // blocks.
+                    return self.emit(
+                        workspace.tokens[0..count],
+                        .{ .first = 0, .end = count, .start = 0, .bytes = self.buffered },
+                        selection.kind,
+                        final,
                     );
-                } else if (policy == .reduced) {
+                }
+
+                // The reusable state needs a long run of identical match metadata. Prices can split
+                // such runs but cannot create one, so this scan may conservatively select the reuse
+                // path.
+                const reuse_possible = mayReusePricing(workspace.matches[0..self.buffered]);
+                var best_count = count;
+                var best_bits = selection.bits;
+                @memcpy(workspace.best[0..count], workspace.tokens[0..count]);
+                fixedBook(&workspace.header.literal, false);
+                fixedBook(&workspace.header.distance, true);
+                var previous_dynamic_best: ?u32 = null;
+                for (0..8) |pass| {
+                    const literal_widths = workspace.header.literal.widths;
+                    const distance_widths = workspace.header.distance.widths[0..30].*;
+                    const work_before = self.stats.work_units;
+                    const edges_before = self.stats.parse_edges;
+                    count = switch (self.options.offline_pricing) {
+                        .maximum_lengths => if (reuse_possible) try self.priceParse(
+                            true,
+                            .maximum_lengths,
+                            &workspace.header.literal,
+                            &workspace.header.distance,
+                        ) else try self.priceParse(
+                            false,
+                            .maximum_lengths,
+                            &workspace.header.literal,
+                            &workspace.header.distance,
+                        ),
+                        .reduced => if (reuse_possible) try self.priceParse(
+                            true,
+                            .reduced,
+                            &workspace.header.literal,
+                            &workspace.header.distance,
+                        ) else try self.priceParse(
+                            false,
+                            .reduced,
+                            &workspace.header.literal,
+                            &workspace.header.distance,
+                        ),
+                        .full => if (reuse_possible) try self.priceParse(
+                            true,
+                            .full,
+                            &workspace.header.literal,
+                            &workspace.header.distance,
+                        ) else try self.priceParse(
+                            false,
+                            .full,
+                            &workspace.header.literal,
+                            &workspace.header.distance,
+                        ),
+                    };
+                    selection = try self.select(
+                        workspace.tokens[0..count],
+                        self.buffered,
+                        self.bit_count,
+                    );
+                    if (selection.bits < best_bits) {
+                        best_bits = selection.bits;
+                        best_count = count;
+                        @memcpy(workspace.best[0..count], workspace.tokens[0..count]);
+                    }
+                    // Both stopping rules consider the triggering pass before returning the best
+                    // parse.
+                    if (self.options.offline_refinement == .early and earlyStop(
+                        pass,
+                        previous_dynamic_best,
+                        selection.dynamic_bits,
+                    )) break;
+                    // Standard refinement stops on equal or worse dynamic cost; a one-bit gain
+                    // continues.
+                    if (adaptiveStop(previous_dynamic_best, selection.dynamic_bits)) break;
+                    previous_dynamic_best = selection.dynamic_bits;
+                    // select constructs the next dynamic price books, including when a fixed/stored
+                    // candidate won the serialized choice.
+                    if (!std.mem.eql(
+                        u8,
+                        &literal_widths,
+                        &workspace.header.literal.widths,
+                    ) or !std.mem.eql(
+                        u8,
+                        &distance_widths,
+                        workspace.header.distance.widths[0..30],
+                    )) continue;
+                    // Stable books guarantee that the next pass has the same dynamic price and
+                    // stops. Reserve that one logical pass only when it fits. Otherwise execute it
+                    // normally so refusal still reports the actual admission point and partial
+                    // counters.
+                    const remaining: u64 = if (pass < 7) 1 else 0;
+                    const units = std.math.mul(
+                        u64,
+                        self.stats.work_units - work_before,
+                        remaining,
+                    ) catch continue;
+                    const edges = std.math.mul(
+                        u64,
+                        self.stats.parse_edges - edges_before,
+                        remaining,
+                    ) catch continue;
+                    const work_left = self.options.limits.work_units -| self.stats.work_units;
+                    const edges_left = std.math.maxInt(u64) - self.stats.parse_edges;
+                    if (units > work_left or edges > edges_left) continue;
+                    try self.work(units);
+                    self.stats.parse_edges += edges;
+                    break;
+                }
+                workspace.segments[0] = .{
+                    .first = 0,
+                    .end = best_count,
+                    .start = 0,
+                    .bytes = self.buffered,
+                };
+                var segments: usize = 1;
+                if (self.buffered >= 4096) {
+                    segments = try self.split(
+                        0,
+                        best_count,
+                        0,
+                        self.buffered,
+                        self.bit_count,
+                        0,
+                        0,
+                    );
+                }
+                for (workspace.segments[0..segments], 0..) |segment, index| {
+                    const tokens = workspace.best[segment.first..segment.end];
+                    const chosen = try self.select(tokens, segment.bytes, self.bit_count);
+                    try self.emit(tokens, segment, chosen.kind, final and index + 1 == segments);
+                }
+            }
+        }
+
+        // A checkpoint excludes the final 257 positions whose comparisons may need later bytes.
+        // Coordinates are derived from accepted input counts, so no additional owner state is kept.
+        noinline fn findOfflineTreeMatches(self: *Self, final: bool) EncodeError!void {
+            const processed = self.stats.input_bytes - self.buffered;
+            const cycle: u64 = 1 << 31;
+            const phase: usize = @intCast(processed & (cycle - 1));
+            // Rebuild near each coordinate rollover. The margin exceeds a slab plus any history,
+            // covering the block that crossed the boundary even after a short flush.
+            const near_rollover = processed >= cycle and phase < slab_bytes + window_bytes;
+            const rebuild = processed == 0 or self.history == 0 or near_rollover;
+            if (final and rebuild) return self.findOfflineTreeMatchesStandalone();
+            const workspace = self.workspace;
+            const total = self.history + self.buffered;
+            const data = workspace.data[0..total];
+            const depth: usize = self.options.depth;
+            const nice: usize = if (depth <= 35) 75 else if (depth <= 100) 150 else 258;
+            const origin = self.options.window_bytes + phase - self.history;
+            if (rebuild) workspace.tree().resetAll();
+            const pending = if (final) 0 else @min(total, self.options.window_bytes, 257);
+            const checkpoint = total - pending;
+            const first = if (rebuild) @as(usize, 0) else self.history - @min(self.history, 257);
+            std.debug.assert(first <= checkpoint);
+            for (first..total) |position| {
+                if (pending != 0 and position == checkpoint) workspace.copyTreeCheckpoint(false);
+                const remaining = self.options.limits.work_units - self.stats.work_units;
+                const matches = if (position < self.history) null else &workspace.matches[
+                    position -
+                        self.history
+                ];
+                var partial: match_tree.Stats = undefined;
+                const result = if (remaining >= depth * 34 + 1) match_tree.insertAndFindAt(
+                    false,
+                    workspace.tree(),
+                    data,
+                    position,
+                    origin,
+                    self.options.window_bytes,
+                    depth,
+                    nice,
+                    matches,
+                    remaining,
+                    &partial,
+                ) else match_tree.insertAndFindAt(
+                    true,
+                    workspace.tree(),
+                    data,
+                    position,
+                    origin,
+                    self.options.window_bytes,
+                    depth,
+                    nice,
+                    matches,
+                    remaining,
+                    &partial,
+                );
+                const stats = result catch |err| {
+                    try self.work(partial.units);
+                    self.stats.match_probes = try addCount(self.stats.match_probes, partial.probes);
+                    return err;
+                };
+                try self.work(stats.units);
+                self.stats.match_probes = try addCount(self.stats.match_probes, stats.probes);
+            }
+            if (pending != 0) workspace.copyTreeCheckpoint(true);
+        }
+
+        // Rebuild the bounded tree for a standalone slab, including copied dictionary history.
+        noinline fn findOfflineTreeMatchesStandalone(self: *Self) EncodeError!void {
+            const workspace = self.workspace;
+            const total = self.history + self.buffered;
+            const depth: usize = self.options.depth;
+            const nice: usize = if (depth <= 35) 75 else if (depth <= 100) 150 else 258;
+            workspace.tree().reset(workspace.data[0..total]);
+            for (0..total) |position| {
+                const remaining = self.options.limits.work_units - self.stats.work_units;
+                const matches = if (position < self.history) null else &workspace.matches[
+                    position -
+                        self.history
+                ];
+                var partial: match_tree.Stats = undefined;
+                const result = if (remaining >= depth * 34 + 1) match_tree.insertAndFind(
+                    false,
+                    workspace.tree(),
+                    workspace.data[0..total],
+                    position,
+                    self.options.window_bytes,
+                    depth,
+                    nice,
+                    matches,
+                    remaining,
+                    &partial,
+                ) else match_tree.insertAndFind(
+                    true,
+                    workspace.tree(),
+                    workspace.data[0..total],
+                    position,
+                    self.options.window_bytes,
+                    depth,
+                    nice,
+                    matches,
+                    remaining,
+                    &partial,
+                );
+                const stats = result catch |err| {
+                    try self.work(partial.units);
+                    self.stats.match_probes = try addCount(self.stats.match_probes, partial.probes);
+                    return err;
+                };
+                try self.work(stats.units);
+                self.stats.match_probes = try addCount(self.stats.match_probes, stats.probes);
+            }
+        }
+
+        fn findMatches(self: *Self) EncodeError!void {
+            if (self.options.reduced_lookahead) return self.findMatchesMode(true);
+            return self.findMatchesMode(false);
+        }
+
+        // Select the lookahead policy once per block, keeping it out of the full-search loop.
+        noinline fn findMatchesMode(self: *Self, comptime reduced: bool) EncodeError!void {
+            const workspace = self.workspace;
+            const total = self.history + self.buffered;
+            if (total <= 256) {
+                // Only hashes present in this slab can be read below. Clear those heads first so
+                // short inputs avoid clearing the whole table, even when keys collide or scratch
+                // was reused.
+                for (0..total -| 2) |position| {
+                    workspace.chain().heads[hash3(workspace.data[position..][0..3])] = no_position;
+                }
+            } else {
+                @memset(&workspace.chain().heads, no_position);
+            }
+            const depth: usize = self.options.depth;
+            const lazy = self.options.profile == .lazy;
+            var next_search = self.history;
+            var pending_length: usize = 0;
+            for (0..total) |position| {
+                if (total - position < 3) {
+                    if (position >= self.history) workspace.matches[position - self.history].count =
+                        0;
+                    continue;
+                }
+                const hash = hash3(workspace.data[position..][0..3]);
+                const candidate = workspace.chain().heads[hash];
+                workspace.chain().previous[position] = candidate;
+                workspace.chain().heads[hash] = @intCast(position);
+                if (position < self.history) continue;
+                // Every position enters the chain, including bytes covered by an earlier match.
+                // Greedy/lazy parsing only needs matches at the next token and its lazy lookahead.
+                if (position < next_search) continue;
+                const matches = &workspace.matches[position - self.history];
+                matches.count = 0;
+                const remaining = self.options.limits.work_units - self.stats.work_units;
+                const search_depth = if (reduced and pending_length != 0) depth / 2 else depth;
+                // One candidate plus at most 31 word comparisons fits this bound. Admit the whole
+                // position when possible, otherwise check each charged operation. Both paths
+                // publish identical exact counters.
+                var partial: SearchStats = undefined;
+                const result = if (remaining >= search_depth * 34) self.scanMatches(
+                    false,
+                    position,
+                    total,
+                    candidate,
+                    search_depth,
+                    remaining,
+                    &partial,
+                ) else self.scanMatches(
+                    true,
+                    position,
+                    total,
+                    candidate,
+                    search_depth,
+                    remaining,
+                    &partial,
+                );
+                const measured = result catch |err| {
+                    try self.work(partial.units);
+                    self.stats.match_probes = try addCount(self.stats.match_probes, partial.probes);
+                    return err;
+                };
+                try self.work(measured.units);
+                self.stats.match_probes = try addCount(self.stats.match_probes, measured.probes);
+                var length: usize = 0;
+                if (matches.count != 0) length = matches.items[matches.count - 1].length;
+                if (lazy and pending_length != 0 and length <= pending_length) {
+                    // The previous position's match wins; this position was its lookahead.
+                    next_search = position + pending_length - 1;
+                    pending_length = 0;
+                } else {
+                    // A longer lookahead makes the previous byte a literal. It is now the next
+                    // token.
+                    pending_length = if (lazy) length else 0;
+                    next_search = position + if (lazy) 1 else @max(1, length);
+                }
+            }
+        }
+
+        fn scanMatches(
+            self: *Self,
+            comptime bounded: bool,
+            position: usize,
+            total: usize,
+            first: u32,
+            depth: usize,
+            budget: u64,
+            partial: *SearchStats,
+        ) EncodeError!SearchStats {
+            const workspace = self.workspace;
+            const matches = &workspace.matches[position - self.history];
+            const maximum = @min(258, total - position);
+            const earliest = position -| self.options.window_bytes;
+            const source = workspace.data[position..];
+            var candidate = first;
+            var longest: usize = 2;
+            var measured: SearchStats = .{ .units = 0, .probes = 0 };
+            defer partial.* = measured;
+            while (candidate != no_position and candidate >= earliest and measured.probes < depth) {
+                const candidate_position: usize = candidate;
+                try searchWork(bounded, &measured.units, budget);
+                measured.probes += 1;
+                const prior = workspace.data[candidate_position..];
+                if (prior[longest] == source[longest] and std.mem.eql(
+                    u8,
+                    prior[0..3],
+                    source[0..3],
+                )) {
                     var length: usize = 3;
-                    for (matches.items[0..matches.count]) |match| {
-                        const distance_price = distance_prices[distanceSlot(match.distance)];
-                        while (length <= match.length) : (length += 1) {
+                    while (length + 8 <= maximum) : (length += 8) {
+                        try searchWork(bounded, &measured.units, budget);
+                        const prior_word = std.mem.readInt(u64, prior[length..][0..8], .little);
+                        const source_word = std.mem.readInt(u64, source[length..][0..8], .little);
+                        if (prior_word != source_word) break;
+                    }
+                    while (length < maximum and prior[length] == source[length]) : (length += 1) {}
+                    if (length > longest) {
+                        const slot = @min(matches.count, alternatives - 1);
+                        matches.items[slot] = .{
+                            .length = @intCast(length),
+                            .distance = @intCast(position - candidate_position),
+                        };
+                        matches.count = @min(alternatives, matches.count + 1);
+                        longest = length;
+                        if (length == maximum) break;
+                    }
+                }
+                candidate = workspace.chain().previous[candidate_position];
+            }
+            return measured;
+        }
+
+        inline fn searchWork(comptime bounded: bool, units: *u32, budget: u64) EncodeError!void {
+            if (bounded and units.* >= budget) return error.LimitExceeded;
+            units.* += 1;
+        }
+
+        // Charge each comparison, including the mismatch that ends a run.
+        inline fn runLength(
+            self: *Self,
+            position: usize,
+            end: usize,
+            comptime bounded: bool,
+            comptime unroll_long: bool,
+            units: *u64,
+            probes: *u64,
+        ) EncodeError!usize {
+            if (position < 4) return 1;
+            if (bounded) {
+                try self.work(1);
+                self.stats.match_probes = try addCount(self.stats.match_probes, 1);
+            } else {
+                units.* += 1;
+                probes.* += 1;
+            }
+            const data = &self.workspace.data;
+            if (data[position] != data[position - 4]) return 1;
+            const maximum = @min(258, end - position);
+            var length: usize = 1;
+            if (!bounded) {
+                // Wide comparisons may inspect later bytes. Charge only the logical prefix through
+                // the first mismatch, matching the bounded byte-wise path.
+                if (comptime vector_run_matches) {
+                    // Most grouped candidates end quickly. Keep their first probe on the cheap word
+                    // path, then use vectors only after eight bytes agree.
+                    if (!unroll_long and maximum - length >= 8) {
+                        const a = std.mem.readInt(u64, data[position + length ..][0..8], .little);
+                        const b = std.mem.readInt(
+                            u64,
+                            data[position + length - 4 ..][0..8],
+                            .little,
+                        );
+                        const difference = a ^ b;
+                        if (difference != 0) {
+                            const matched = @as(usize, @intCast(@ctz(difference))) / 8;
+                            units.* += matched + 1;
+                            return length + matched;
+                        }
+                        units.* += 8;
+                        length += 8;
+                    }
+                    while (maximum - length >= 32) {
+                        const a: @Vector(32, u8) = data[position + length ..][0..32].*;
+                        const b: @Vector(32, u8) = data[position + length - 4 ..][0..32].*;
+                        const different: u32 = @bitCast(a != b);
+                        if (different != 0) {
+                            const matched: usize = @ctz(different);
+                            units.* += matched + 1;
+                            return length + matched;
+                        }
+                        units.* += 32;
+                        length += 32;
+                    }
+                } else if (unroll_long and maximum - length >= 32) {
+                    while (maximum - length >= 16) {
+                        inline for (0..2) |group| {
+                            const offset = length + group * 8;
+                            const a = std.mem.readInt(
+                                u64,
+                                data[position + offset ..][0..8],
+                                .little,
+                            );
+                            const b = std.mem.readInt(
+                                u64,
+                                data[position + offset - 4 ..][0..8],
+                                .little,
+                            );
+                            const difference = a ^ b;
+                            if (difference != 0) {
+                                const matched = @as(usize, @intCast(@ctz(difference))) / 8;
+                                units.* += group * 8 + matched + 1;
+                                return offset + matched;
+                            }
+                        }
+                        units.* += 16;
+                        length += 16;
+                    }
+                }
+                while (maximum - length >= 8) {
+                    const a = std.mem.readInt(u64, data[position + length ..][0..8], .little);
+                    const b = std.mem.readInt(u64, data[position + length - 4 ..][0..8], .little);
+                    const difference = a ^ b;
+                    if (difference != 0) {
+                        const matched = @as(usize, @intCast(@ctz(difference))) / 8;
+                        units.* += matched + 1;
+                        return length + matched;
+                    }
+                    units.* += 8;
+                    length += 8;
+                }
+            }
+            while (length < maximum) {
+                if (bounded) try self.work(1) else {
+                    units.* += 1;
+                }
+                if (data[position + length] != data[position + length - 4]) break;
+                length += 1;
+            }
+            return length;
+        }
+
+        // Thirty-two spread windows estimate emitted literal and run prices. Each candidate extends
+        // at most 258 bytes; the first four source bytes may need literal seeding.
+        noinline fn sampleRunBook(
+            self: *Self,
+            comptime bounded: bool,
+            units: *u64,
+            probes: *u64,
+        ) EncodeError!RunBookChoice {
+            std.debug.assert(self.buffered >= 8192);
+            const workspace = self.workspace;
+            const prefix = 4 -| self.history;
+            const original_header: i64 = 3 + run_book.header.bits + run_book.header.literal
+                .widths[256];
+            var balanced_header: i64 = 3 + balanced_run_book.header.bits + balanced_run_book.header
+                .literal.widths[256] - original_header;
+            var negative_header: i64 = 3 + negative_run_book.header.bits + negative_run_book.header
+                .literal.widths[256] - original_header;
+            if (bounded) try self.work(prefix) else units.* += prefix;
+            for (workspace.data[self.history..][0..prefix]) |value| {
+                const delta = run_literal_price_deltas[value];
+                balanced_header += delta.balanced;
+                negative_header += delta.negative;
+            }
+            var balanced_price: i32 = 0;
+            var negative_price: i32 = 0;
+            const end = self.history + self.buffered;
+            for (0..32) |i| {
+                const position = self.history + prefix + i * (self.buffered - prefix - 258) / 31;
+                const length = try self.runLength(position, end, bounded, true, units, probes);
+                if (length >= 32) {
+                    const delta = run_match_price_deltas[length];
+                    balanced_price += delta.balanced;
+                    negative_price += delta.negative;
+                } else {
+                    if (bounded) try self.work(32) else units.* += 32;
+                    var balanced_bits: i32 = 0;
+                    var negative_bits: i32 = 0;
+                    for (workspace.data[position..][0..32]) |value| {
+                        const delta = run_literal_price_deltas[value];
+                        balanced_bits += delta.balanced;
+                        negative_bits += delta.negative;
+                    }
+                    balanced_price += balanced_bits * 8;
+                    negative_price += negative_bits * 8;
+                }
+            }
+            const bytes: i64 = @intCast(self.buffered - prefix);
+            var choice: RunBookChoice = .original;
+            var best: i64 = 0;
+            const balanced = @as(i64, balanced_price) * bytes + balanced_header * (256 * 32);
+            if (balanced < best) {
+                choice = .balanced;
+                best = balanced;
+            }
+            if (@as(
+                i64,
+                negative_price,
+            ) * bytes + negative_header * (256 * 32) < best) return .negative;
+            return choice;
+        }
+
+        noinline fn preferStoredRuns(
+            self: *Self,
+            comptime bounded: bool,
+            units: *u64,
+            probes: *u64,
+            group_literals: *bool,
+            selected_choice: *RunBookChoice,
+        ) EncodeError!bool {
+            const workspace = self.workspace;
+            var header = &run_book.header;
+            selected_choice.* = .original;
+            if (self.buffered >= 4096) {
+                const n: usize = 256;
+                if (bounded) try self.work(n) else {
+                    units.* += n;
+                }
+                if (self.buffered >= 8192) {
+                    selected_choice.* = try self.sampleRunBook(bounded, units, probes);
+                    header = &selected_choice.*.book().header;
+                }
+                var sample_bits: usize = 0;
+                var matches: usize = 0;
+                for (0..n) |i| {
+                    const pos = self.history + i * (self.buffered - 1) / (n - 1);
+                    const value = workspace.data[pos];
+                    sample_bits += header.literal.widths[value];
+                    if (pos >= 4) {
+                        if (bounded) self.stats.match_probes = try addCount(
+                            self.stats.match_probes,
+                            1,
+                        ) else {
+                            probes.* += 1;
+                        }
+                        if (value == workspace.data[pos - 4]) matches += 1;
+                    }
+                    if (!bounded and i % 32 == 31 and matches >= n / 32) {
+                        const remaining = n - 1 - i;
+                        if (matches >= 224 or matches + remaining < 224) {
+                            // All remaining positions are eligible once eight matches have been
+                            // seen. Charge their logical probes even though the decision is already
+                            // fixed.
+                            probes.* += remaining;
+                            group_literals.* = matches < 224;
+                            return false;
+                        }
+                        // The stored choice is now impossible. Sample subsequent positions in
+                        // groups of 32, checking the same thresholds at the same boundaries.
+                        var block = i + 1;
+                        while (block < n) : (block += 32) {
+                            var j = block;
+                            while (j < block + 32) : (j += 4) {
+                                inline for (0..4) |lane| {
+                                    const next = self.history + (j + lane) * (self.buffered - 1) /
+                                        (n - 1);
+                                    matches += @intFromBool(
+                                        workspace.data[next] == workspace.data[next - 4],
+                                    );
+                                }
+                            }
+                            probes.* += 32;
+                            const rest = n - block - 32;
+                            if (matches >= 224 or matches + rest < 224) {
+                                probes.* += rest;
+                                group_literals.* = matches < 224;
+                                return false;
+                            }
+                        }
+                        group_literals.* = matches < 224;
+                        return false;
+                    }
+                }
+                // Keep the match-density result for stored preflight and small-block parsing.
+                // Larger blocks use spans; small repetitive blocks retain byte-wise matching.
+                group_literals.* = matches < 224;
+                if (sample_bits > n * 10 and matches < n / 32) {
+                    const padding = (8 - (@as(u32, self.bit_count) + 3) % 8) % 8;
+                    const stored_bits: usize = 3 + padding + 32 + self.buffered * 8;
+                    return self.groupedRunsPreferStored(
+                        selected_choice.*.book(),
+                        bounded,
+                        units,
+                        probes,
+                        stored_bits,
+                    );
+                }
+            }
+            return false;
+        }
+
+        noinline fn groupedRunsPreferStored(
+            self: *Self,
+            book: *const RunBook,
+            comptime bounded: bool,
+            units: *u64,
+            probes: *u64,
+            stored_bits: usize,
+        ) EncodeError!bool {
+            const workspace = self.workspace;
+            const header = &book.header;
+            var predicted: usize = 3 + header.bits + header.literal.widths[256];
+            var cursor = self.history;
+            const end = self.history + self.buffered;
+            while (cursor < end and predicted < stored_bits) {
+                // Match the span policy and strict writer cutoff, excluding the reserved end code.
+                if (cursor >= 4 and end - cursor >= 32 and predicted - header.literal.widths[256] +
+                    448 < stored_bits)
+                {
+                    if (bounded) {
+                        try self.work(32);
+                        self.stats.match_probes = try addCount(self.stats.match_probes, 1);
+                    } else {
+                        units.* += 32;
+                        probes.* += 1;
+                    }
+                    const current: @Vector(32, u8) = workspace.data[cursor..][0..32].*;
+                    const prior: @Vector(32, u8) = workspace.data[cursor - 4 ..][0..32].*;
+                    if (@reduce(.And, current == prior)) {
+                        const length = try self.runLength(
+                            cursor,
+                            end,
+                            bounded,
+                            false,
+                            units,
+                            probes,
+                        );
+                        predicted += book.match_tokens[length] >> 24;
+                        cursor += length;
+                    } else {
+                        for (workspace.data[cursor..][0..32]) |value| {
+                            predicted += header.literal.widths[value];
+                        }
+                        cursor += 32;
+                    }
+                    continue;
+                }
+                if (cursor >= 4 and end - cursor >= 4) {
+                    if (bounded) {
+                        try self.work(4);
+                        self.stats.match_probes = try addCount(self.stats.match_probes, 1);
+                    } else {
+                        units.* += 4;
+                        probes.* += 1;
+                    }
+                    const current = std.mem.readInt(u32, workspace.data[cursor..][0..4], .little);
+                    const prior = std.mem.readInt(
+                        u32,
+                        workspace.data[cursor - 4 ..][0..4],
+                        .little,
+                    );
+                    if (((current ^ prior) & 0x00ffffff) != 0) {
+                        var literal_bits: usize = 0;
+                        for (
+                            workspace.data[cursor..][0..4],
+                        ) |value| literal_bits += header.literal.widths[value];
+                        if (predicted - header.literal.widths[256] + literal_bits < stored_bits) {
+                            predicted += literal_bits;
+                            cursor += 4;
+                            continue;
+                        }
+                    }
+                }
+                const length = try self.runLength(cursor, end, bounded, false, units, probes);
+                if (length >= 3) {
+                    const slot = lengthSlot(length);
+                    predicted += header.literal.widths[
+                        257 + @as(
+                            usize,
+                            slot,
+                        )
+                    ] + @as(usize, length_extra[slot]) + 1;
+                    cursor += length;
+                } else {
+                    predicted += header.literal.widths[workspace.data[cursor]];
+                    cursor += 1;
+                }
+            }
+            return predicted >= stored_bits;
+        }
+
+        // Prebuilt books favor byte residuals. Stored blocks bound expansion when the selected book
+        // does not fit; the strategy deliberately does not search other match distances.
+        noinline fn encodeFourByteRuns(self: *Self, final: bool) EncodeError!void {
+            // Fixed-book initialization is bounded and is not charged as input-dependent work.
+            const n: u64 = @intCast(self.buffered);
+            // Sample plus both preflight and emission scans, including rejected grouped attempts.
+            const book_work: u64 = if (n >= 8192) 32 * 258 + 4 else 0;
+            const book_probes: u64 = if (n >= 8192) 32 else 0;
+            const work_bound = 14 * n + 256 + book_work;
+            const probe_bound = 4 * n + 256 + book_probes;
+            if (self.options.limits.work_units -| self.stats.work_units >= work_bound and self.stats
+                .match_probes <= std.math.maxInt(
+                u64,
+            ) - probe_bound) {
+                return self.encodeRunsWithAccounting(final, false);
+            }
+            return self.encodeRunsWithAccounting(final, true);
+        }
+
+        noinline fn encodeRunsWithAccounting(
+            self: *Self,
+            final: bool,
+            comptime bounded: bool,
+        ) align(64) EncodeError!void {
+            const workspace = self.workspace;
+            var units: u64 = 0;
+            var probes: u64 = 0;
+            defer if (!bounded) {
+                self.stats.work_units += units;
+                self.stats.match_probes += probes;
+            };
+            var group_literals = false;
+            var choice: RunBookChoice = .original;
+            if (try self.preferStoredRuns(bounded, &units, &probes, &group_literals, &choice)) {
+                return self.stored(workspace.data[self.history..][0..self.buffered], final);
+            }
+            if (self.buffered >= 4096 and (group_literals or self.buffered >= 8192)) {
+                return self.emitRuns(choice.book(), final, bounded, true, &units, &probes);
+            }
+            return self.emitRuns(&run_book, final, bounded, false, &units, &probes);
+        }
+
+        inline fn emitRuns(
+            self: *Self,
+            book: *const RunBook,
+            final: bool,
+            comptime bounded: bool,
+            comptime grouped: bool,
+            units: *u64,
+            probes: *u64,
+        ) EncodeError!void {
+            const workspace = self.workspace;
+            const header = &book.header;
+            const start_pending = self.pending;
+            const start_bits = self.bits;
+            const start_count = self.bit_count;
+            // Blocks start after pending bytes have drained. The stored-cost guard keeps staged
+            // bits within the slab's byte length plus a small header; wire has 128 extra bytes for
+            // a final token, the end code and wide stores.
+            std.debug.assert(start_pending == 0 and self.buffered <= slab_bytes);
+            const padding = (8 - (@as(u32, start_count) + 3) % 8) % 8;
+            const stored_bits: usize = 3 + padding + 32 + self.buffered * 8;
+            const limit_bits = stored_bits + start_count;
+            const lookup = RunLiteralLookup.init(book);
+            var writer: RunBitWriter = .{
+                .book = book,
+                .wire = &workspace.wire,
+                .bits = self.bits,
+                .count = self.bit_count,
+                .pending = self.pending,
+            };
+            var publish_on_error = true;
+            errdefer if (publish_on_error) {
+                writer.flush();
+                self.bits = writer.bits;
+                self.bit_count = @intCast(writer.count);
+                self.pending = writer.pending;
+            };
+            if (writer.count == 0) {
+                std.debug.assert(writer.bits == 0);
+                @memcpy(writer.wire[0..book.header_bytes], book.header_wire[0..book.header_bytes]);
+                writer.wire[0] |= @intFromBool(final);
+                writer.pending = book.header_bytes;
+                writer.bits = book.header_tail;
+                writer.count = book.header_count;
+            } else {
+                writer.put(@intFromBool(final), 1);
+                writer.put(2, 2);
+                writer.put(header.literal_count - 257, 5);
+                writer.put(header.distance_count - 1, 5);
+                writer.put(header.precode_count - 4, 4);
+                for (
+                    precode_order[0..header.precode_count],
+                ) |symbol| writer.put(header.precode.widths[symbol], 3);
+                for (header.runs[0..header.run_count]) |run| {
+                    writer.symbol(&header.precode, run.symbol);
+                    writer.put(run.extra, runExtra(run.symbol));
+                }
+            }
+            if (grouped) writer.flush();
+            var position = self.history;
+            const end = self.history + self.buffered;
+            var fallback = false;
+            while (position < end) {
+                if (writer.pending * 8 + writer.count >= limit_bits) {
+                    fallback = true;
+                    break;
+                }
+                // Whole-span parser: reserve runs for complete repeated spans, otherwise emit the
+                // span as literals without per-quad match decisions.
+                if (grouped and position >= 4 and end - position >= 32 and writer.pending * 8 +
+                    writer.count + 448 < limit_bits)
+                {
+                    if (bounded) {
+                        try self.work(32);
+                        self.stats.match_probes = try addCount(self.stats.match_probes, 1);
+                    } else {
+                        units.* += 32;
+                        probes.* += 1;
+                    }
+                    const current: @Vector(32, u8) = workspace.data[position..][0..32].*;
+                    const prior: @Vector(32, u8) = workspace.data[position - 4 ..][0..32].*;
+                    if (@reduce(.And, current == prior)) {
+                        const length = try self.runLength(
+                            position,
+                            end,
+                            bounded,
+                            false,
+                            units,
+                            probes,
+                        );
+                        writer.runMatch(length);
+                        position += length;
+                    } else {
+                        writer.symbolSpan32(workspace.data[position..][0..32], lookup);
+                        position += 32;
+                    }
+                    continue;
+                }
+                // Loads may include later groups speculatively. Charge only groups whose
+                // comparisons are actually reached; each literal needs at most 14 bits, so four
+                // groups need 224.
+                if (grouped and !bounded and position >= 4 and end - position >= 16 and writer
+                    .pending * 8 + writer.count + 224 < limit_bits)
+                {
+                    const first = std.mem.readInt(
+                        u64,
+                        workspace.data[position..][0..8],
+                        .little,
+                    ) ^ std.mem.readInt(u64, workspace.data[position - 4 ..][0..8], .little);
+                    const second = std.mem.readInt(
+                        u64,
+                        workspace.data[position + 8 ..][0..8],
+                        .little,
+                    ) ^ std.mem.readInt(u64, workspace.data[position + 4 ..][0..8], .little);
+                    batch: {
+                        inline for (0..4) |i| {
+                            units.* += 4;
+                            probes.* += 1;
+                            const difference = if (i < 2) first else second;
+                            if (((difference >> (32 * (i % 2))) & 0x00ffffff) == 0) {
+                                const length = try self.runLength(
+                                    position,
+                                    end,
+                                    bounded,
+                                    false,
+                                    units,
+                                    probes,
+                                );
+                                writer.runMatch(length);
+                                position += length;
+                                break :batch;
+                            }
+                            writer.symbolQuad(workspace.data[position..][0..4]);
+                            position += 4;
+                        }
+                    }
+                    continue;
+                }
+                // If these three positions cannot begin a match, emit four literals together. A
+                // match beginning later in the group may be skipped, trading ratio for fewer parser
+                // steps.
+                if (grouped and position >= 4 and end - position >= 4) {
+                    // Admit the attempted four-byte comparison even if it cannot form a group.
+                    if (bounded) {
+                        try self.work(4);
+                        self.stats.match_probes = try addCount(self.stats.match_probes, 1);
+                    } else {
+                        units.* += 4;
+                        probes.* += 1;
+                    }
+                    const current = std.mem.readInt(u32, workspace.data[position..][0..4], .little);
+                    const prior = std.mem.readInt(
+                        u32,
+                        workspace.data[position - 4 ..][0..4],
+                        .little,
+                    );
+                    if (((current ^ prior) & 0x00ffffff) != 0) {
+                        const remaining = limit_bits - (writer.pending * 8 + writer.count);
+                        // The fixed run book has at most 14 bits per literal; four fit in 56 bits.
+                        const fits = if (remaining > 4 * 14) true else blk: {
+                            var literal_bits: usize = 0;
+                            for (workspace.data[position..][0..4]) |value| {
+                                literal_bits += header.literal.widths[value];
+                            }
+                            break :blk literal_bits < remaining;
+                        };
+                        if (fits) {
+                            const values = workspace.data[position..][0..4];
+                            writer.symbolQuad(values);
+                            position += 4;
+                            continue;
+                        }
+                    }
+                }
+                const length = try self.runLength(position, end, bounded, !grouped, units, probes);
+                if (length >= 3) {
+                    writer.runMatch(length);
+                    position += length;
+                } else {
+                    writer.symbol(&header.literal, workspace.data[position]);
+                    position += 1;
+                    if (grouped) writer.flush();
+                }
+            }
+            if (!fallback) {
+                writer.symbol(&header.literal, 256);
+                fallback = writer.pending * 8 + writer.count >= limit_bits;
+            }
+            if (fallback) {
+                self.pending = start_pending;
+                self.bits = start_bits;
+                self.bit_count = start_count;
+                publish_on_error = false;
+                return self.stored(workspace.data[self.history..][0..self.buffered], final);
+            }
+            writer.flush();
+            self.bits = writer.bits;
+            self.bit_count = @intCast(writer.count);
+            self.pending = writer.pending;
+            self.stats.blocks = try addCount(self.stats.blocks, 1);
+            self.stats.dynamic_blocks = try addCount(self.stats.dynamic_blocks, 1);
+        }
+
+        fn referenceParse(self: *Self, lazy: bool) usize {
+            const workspace = self.workspace;
+            var count: usize = 0;
+            var position: usize = 0;
+            while (position < self.buffered) {
+                const matches = &workspace.matches[position];
+                var length: usize = 0;
+                var distance: u16 = 0;
+                if (self.options.profile != .huffman and matches.count != 0) {
+                    const match = matches.items[matches.count - 1];
+                    length = match.length;
+                    distance = match.distance;
+                    if (lazy and position + 1 < self.buffered) {
+                        const next = &workspace.matches[position + 1];
+                        if (next.count != 0 and next.items[next.count - 1].length > length) length =
+                            0;
+                    }
+                }
+                const value: u16 = if (length == 0) workspace.data[
+                    self.history +
+                        position
+                ] else distance;
+                workspace.tokens[count] = .{ .length = @intCast(length), .value = value };
+                position += @max(1, length);
+                count += 1;
+            }
+            return count;
+        }
+
+        noinline fn priceParse(
+            self: *Self,
+            comptime reuse: bool,
+            comptime policy: Compression.OfflinePricing,
+            literal: *const Book,
+            distance: *const Book,
+        ) EncodeError!usize {
+            const workspace = self.workspace;
+            // Copy prices: header construction after this parse may replace books.
+            var literal_prices: [286]u32 = undefined;
+            var distance_prices: [30]u32 = undefined;
+            for (
+                &literal_prices,
+                literal.widths,
+            ) |*cost, width| cost.* = if (width == 0) 13 else width;
+            for (&distance_prices, distance.widths[0..30], 0..) |*cost, width, i| {
+                const code_price: u32 = if (width == 0) 10 else width;
+                cost.* = code_price + distance_extra[i];
+            }
+            var length_prices: [259]u32 = undefined;
+            for (3..259) |length| {
+                const slot = lengthSlot(length);
+                length_prices[length] = literal_prices[257 + @as(usize, slot)] + length_extra[slot];
+            }
+            workspace.costs[self.buffered] = 0;
+            var run: PriceRun = .{ .first = self.buffered };
+            var position = self.buffered;
+            while (position != 0) {
+                position -= 1;
+                if (reuse and position < run.first) run = PriceRun.find(
+                    self,
+                    position,
+                    &literal_prices,
+                );
+                const value = workspace.data[self.history + position];
+                var cost = literal_prices[value] + workspace.costs[position + 1];
+                var choice: Token = .{ .length = 0, .value = value };
+                const matches = &workspace.matches[position];
+                if (matches.count != 0) {
+                    const maximum = matches.items[matches.count - 1].length;
+                    // Charge the full logical length range even when a pricing choice skips
+                    // lengths.
+                    try self.work(maximum - 2);
+                    self.stats.parse_edges = try addCount(self.stats.parse_edges, maximum - 2);
+                    if (policy == .maximum_lengths) {
+                        // Only retained maximum lengths participate in this pruned parse.
+                        for (matches.items[0..matches.count]) |match| {
+                            const length: usize = match.length;
+                            const distance_price = distance_prices[distanceSlot(match.distance)];
                             const candidate = distance_price + length_prices[length] + workspace
                                 .costs[position + length];
                             if (candidate < cost) {
                                 cost = candidate;
-                                choice = .{ .length = @intCast(length), .value = match.distance };
+                                choice = .{ .length = match.length, .value = match.distance };
                             }
                         }
-                    }
-                } else {
-                    var suffix: [alternatives]u8 = undefined;
-                    var match_prices: [alternatives]u32 = undefined;
-                    for (matches.items[0..matches.count], 0..) |match, i| {
-                        match_prices[i] = distance_prices[distanceSlot(match.distance)];
-                    }
-                    var i: usize = matches.count;
-                    var cheapest: usize = i - 1;
-                    while (i != 0) {
-                        i -= 1;
-                        if (match_prices[i] < match_prices[cheapest] or (match_prices[i] ==
-                            match_prices[cheapest] and matches.items[i].distance < matches
-                            .items[cheapest].distance))
-                        {
-                            cheapest = i;
-                        }
-                        suffix[i] = @intCast(cheapest);
-                    }
-                    var index: usize = 0;
-                    // The first sixteen price bands contain at most four lengths each. Direct scans
-                    // avoid range/reduction overhead for short matches.
-                    if (maximum < 35) {
+                    } else if (reuse and matches.count == 1) {
+                        const match = matches.items[0];
+                        self.priceSingleMatch(
+                            position,
+                            match,
+                            &length_prices,
+                            distance_prices[distanceSlot(match.distance)],
+                            &cost,
+                            &choice,
+                        );
+                    } else if (policy == .reduced) {
                         var length: usize = 3;
-                        while (length <= maximum) {
-                            while (matches.items[index].length < length) index += 1;
-                            const selected = suffix[index];
-                            // The cheapest usable distance stays cheapest until its match ends.
-                            const match = matches.items[selected];
-                            const distance_price = match_prices[selected];
+                        for (matches.items[0..matches.count]) |match| {
+                            const distance_price = distance_prices[distanceSlot(match.distance)];
                             while (length <= match.length) : (length += 1) {
-                                const match_price = length_prices[length] + distance_price;
-                                const candidate = match_price + workspace.costs[position + length];
+                                const candidate = distance_price + length_prices[length] + workspace
+                                    .costs[position + length];
                                 if (candidate < cost) {
                                     cost = candidate;
                                     choice = .{
@@ -1311,457 +2687,712 @@ pub const Encoder = struct {
                             }
                         }
                     } else {
-                        var slot: usize = 0;
-                        var length: usize = 3;
-                        while (length <= maximum) {
-                            while (matches.items[index].length < length) index += 1;
-                            const selected = suffix[index];
-                            const match = matches.items[selected];
-                            // Length-code prices are constant within an RFC band. The cheapest
-                            // usable retained distance stays selected until that match ends,
-                            // including nearest ties among retained alternatives.
-                            const band_end = if (slot == 28) 258 else length_base[slot + 1] - 1;
-                            const end = @min(band_end, match.length);
-                            const first_cost = position + length;
-                            const suffix_costs = workspace.costs[first_cost .. position + end + 1];
-                            const take = if (end == length) length else length + minimumCostIndex(
-                                suffix_costs,
-                            );
-                            const match_price = length_prices[length] + match_prices[selected];
-                            const candidate = match_price + workspace.costs[position + take];
-                            if (candidate < cost) {
-                                cost = candidate;
-                                choice = .{ .length = @intCast(take), .value = match.distance };
+                        var suffix: [alternatives]u8 = undefined;
+                        var match_prices: [alternatives]u32 = undefined;
+                        for (matches.items[0..matches.count], 0..) |match, i| {
+                            match_prices[i] = distance_prices[distanceSlot(match.distance)];
+                        }
+                        var i: usize = matches.count;
+                        var cheapest: usize = i - 1;
+                        while (i != 0) {
+                            i -= 1;
+                            if (match_prices[i] < match_prices[cheapest] or (match_prices[i] ==
+                                match_prices[cheapest] and matches.items[i].distance < matches
+                                .items[cheapest].distance))
+                            {
+                                cheapest = i;
                             }
-                            length = end + 1;
-                            if (end == band_end) slot += 1;
+                            suffix[i] = @intCast(cheapest);
+                        }
+                        var index: usize = 0;
+                        // The first sixteen price bands contain at most four lengths each. Direct
+                        // scans avoid range/reduction overhead for short matches.
+                        if (maximum < 35) {
+                            var length: usize = 3;
+                            while (length <= maximum) {
+                                while (matches.items[index].length < length) index += 1;
+                                const selected = suffix[index];
+                                // The cheapest usable distance stays cheapest until its match ends.
+                                const match = matches.items[selected];
+                                const distance_price = match_prices[selected];
+                                while (length <= match.length) : (length += 1) {
+                                    const match_price = length_prices[length] + distance_price;
+                                    const candidate = match_price + workspace.costs[
+                                        position +
+                                            length
+                                    ];
+                                    if (candidate < cost) {
+                                        cost = candidate;
+                                        choice = .{
+                                            .length = @intCast(length),
+                                            .value = match.distance,
+                                        };
+                                    }
+                                }
+                            }
+                        } else {
+                            var slot: usize = 0;
+                            var length: usize = 3;
+                            while (length <= maximum) {
+                                while (matches.items[index].length < length) index += 1;
+                                const selected = suffix[index];
+                                const match = matches.items[selected];
+                                // Length-code prices are constant within an RFC band. The cheapest
+                                // usable retained distance stays selected until that match ends,
+                                // including nearest ties among retained alternatives.
+                                const band_end = if (slot == 28) 258 else length_base[slot + 1] - 1;
+                                const end = @min(band_end, match.length);
+                                const first_cost = position + length;
+                                const suffix_costs = workspace.costs[first_cost .. position + end +
+                                    1];
+                                const take = if (end == length) length else length +
+                                    minimumCostIndex(
+                                        suffix_costs,
+                                    );
+                                const match_price = length_prices[length] + match_prices[selected];
+                                const candidate = match_price + workspace.costs[position + take];
+                                if (candidate < cost) {
+                                    cost = candidate;
+                                    choice = .{ .length = @intCast(take), .value = match.distance };
+                                }
+                                length = end + 1;
+                                if (end == band_end) slot += 1;
+                            }
                         }
                     }
                 }
+                workspace.costs[position] = cost;
+                workspace.choices[position] = choice;
+                if (reuse) position = try run.reuse(self, position);
             }
-            workspace.costs[position] = cost;
-            workspace.choices[position] = choice;
-            if (reuse) position = try run.reuse(self, position);
+            position = 0;
+            var count: usize = 0;
+            while (position < self.buffered) {
+                const token = workspace.choices[position];
+                workspace.tokens[count] = token;
+                position += @max(1, token.length);
+                count += 1;
+            }
+            return count;
         }
-        position = 0;
-        var count: usize = 0;
-        while (position < self.buffered) {
-            const token = workspace.choices[position];
-            workspace.tokens[count] = token;
-            position += @max(1, token.length);
-            count += 1;
-        }
-        return count;
-    }
 
-    // A single retained distance needs neither suffix-price selection nor frontier-boundary checks.
-    // Keep this concrete path inline so each range shares that distance's price and choice.
-    inline fn priceSingleMatch(
-        self: *Encoder,
-        position: usize,
-        match: Match,
-        length_prices: *const [259]u32,
-        distance_price: u32,
-        cost: *u32,
-        choice: *Token,
-    ) void {
-        const costs = &self.workspace.costs;
-        if (match.length < 35) {
-            for (3..@as(usize, match.length) + 1) |length| {
-                const candidate = distance_price + length_prices[length] + costs[position + length];
+        // A single retained distance needs neither suffix-price selection nor frontier-boundary
+        // checks. Keep this concrete path inline so each range shares that distance's price and
+        // choice.
+        inline fn priceSingleMatch(
+            self: *Self,
+            position: usize,
+            match: Match,
+            length_prices: *const [259]u32,
+            distance_price: u32,
+            cost: *u32,
+            choice: *Token,
+        ) void {
+            const costs = &self.workspace.costs;
+            if (match.length < 35) {
+                for (3..@as(usize, match.length) + 1) |length| {
+                    const candidate = distance_price + length_prices[length] + costs[
+                        position +
+                            length
+                    ];
+                    if (candidate < cost.*) {
+                        cost.* = candidate;
+                        choice.* = .{ .length = @intCast(length), .value = match.distance };
+                    }
+                }
+                return;
+            }
+            var slot: usize = 0;
+            var length: usize = 3;
+            while (length <= match.length) {
+                const band_end = if (slot == 28) 258 else length_base[slot + 1] - 1;
+                const end = @min(band_end, match.length);
+                const suffix = costs[position + length .. position + end + 1];
+                const take = if (end == length) length else length + minimumCostIndex(suffix);
+                const candidate = distance_price + length_prices[length] + costs[position + take];
                 if (candidate < cost.*) {
                     cost.* = candidate;
-                    choice.* = .{ .length = @intCast(length), .value = match.distance };
+                    choice.* = .{ .length = @intCast(take), .value = match.distance };
                 }
-            }
-            return;
-        }
-        var slot: usize = 0;
-        var length: usize = 3;
-        while (length <= match.length) {
-            const band_end = if (slot == 28) 258 else length_base[slot + 1] - 1;
-            const end = @min(band_end, match.length);
-            const suffix = costs[position + length .. position + end + 1];
-            const take = if (end == length) length else length + minimumCostIndex(suffix);
-            const candidate = distance_price + length_prices[length] + costs[position + take];
-            if (candidate < cost.*) {
-                cost.* = candidate;
-                choice.* = .{ .length = @intCast(take), .value = match.distance };
-            }
-            length = end + 1;
-            slot += 1;
-        }
-    }
-
-    fn split(
-        self: *Encoder,
-        first: usize,
-        end: usize,
-        start: usize,
-        bytes: usize,
-        offset: u6,
-        depth: usize,
-        slot: usize,
-    ) EncodeError!usize {
-        const workspace = self.workspace;
-        workspace.segments[slot] = .{ .first = first, .end = end, .start = start, .bytes = bytes };
-        if (depth == 4 or bytes < 4096 or end - first < 2) return slot + 1;
-        const whole = try self.select(workspace.best[first..end], bytes, offset);
-        var middle = first;
-        var left_bytes: usize = 0;
-        while (middle + 1 < end and left_bytes < bytes / 2) : (middle += 1) {
-            left_bytes += @max(1, workspace.best[middle].length);
-        }
-        if (middle == first or middle == end) return slot + 1;
-        const left = try self.select(workspace.best[first..middle], left_bytes, offset);
-        const right_offset: u6 = @intCast((offset + @as(u32, left.bits)) % 8);
-        const right = try self.select(
-            workspace.best[middle..end],
-            bytes - left_bytes,
-            right_offset,
-        );
-        if (left.bits + right.bits >= whole.bits) return slot + 1;
-        const next = try self.split(first, middle, start, left_bytes, offset, depth + 1, slot);
-        // Child splits may alter alignment; recompute their exact cost.
-        var next_offset = offset;
-        for (workspace.segments[slot..next]) |segment| {
-            const choice = try self.select(
-                workspace.best[segment.first..segment.end],
-                segment.bytes,
-                next_offset,
-            );
-            next_offset = @intCast((next_offset + @as(u32, choice.bits)) % 8);
-        }
-        return self.split(
-            middle,
-            end,
-            start + left_bytes,
-            bytes - left_bytes,
-            next_offset,
-            depth + 1,
-            next,
-        );
-    }
-
-    fn select(
-        self: *Encoder,
-        tokens: []const Token,
-        bytes: usize,
-        offset: u6,
-    ) EncodeError!Selection {
-        var literal_frequencies: [286]u32 = @splat(0);
-        var distance_frequencies: [30]u32 = @splat(0);
-        literal_frequencies[256] = 1;
-        var extra_bits: u32 = 0;
-        for (tokens) |token| {
-            if (token.length == 0) {
-                literal_frequencies[token.value] += 1;
-            } else {
-                const length_slot = lengthSlot(token.length);
-                const distance_slot = distanceSlot(token.value);
-                literal_frequencies[257 + @as(usize, length_slot)] += 1;
-                distance_frequencies[distance_slot] += 1;
-                extra_bits += @as(u32, length_extra[length_slot]) + distance_extra[distance_slot];
+                length = end + 1;
+                slot += 1;
             }
         }
-        const header = &self.workspace.header;
-        try self.makeBook(&literal_frequencies, 15, &header.literal);
-        try self.makeBook(&distance_frequencies, 15, &header.distance);
-        try self.makeHeader();
-        var dynamic_bits: u32 = 3 + header.bits + extra_bits;
-        var fixed_bits: u32 = 3 + extra_bits;
-        for (literal_frequencies, 0..) |frequency, symbol| {
-            dynamic_bits += frequency * header.literal.widths[symbol];
-            fixed_bits += frequency * fixedWidth(symbol);
-        }
-        for (distance_frequencies, 0..) |frequency, symbol| {
-            dynamic_bits += frequency * header.distance.widths[symbol];
-            fixed_bits += frequency * 5;
-        }
-        const padding = (8 - (@as(u32, offset) + 3) % 8) % 8;
-        const stored_bits: u32 = @intCast(3 + padding + 32 + bytes * 8);
-        var best: Selection = .{ .bits = stored_bits, .kind = .stored };
-        if (fixed_bits < best.bits) best = .{ .bits = fixed_bits, .kind = .fixed };
-        if (dynamic_bits < best.bits) best = .{ .bits = dynamic_bits, .kind = .dynamic };
-        best.dynamic_bits = dynamic_bits;
-        try self.work(tokens.len + 1);
-        return best;
-    }
 
-    // Package-merge, Larmore and Hirschberg, JACM 37 (1990), pp. 464-473.
-    // https://web.cs.unlv.edu/larmore/Research/larHir90.pdf
-    fn makeBook(
-        self: *Encoder,
-        frequencies: []const u32,
-        maximum: u8,
-        book: *Book,
-    ) EncodeError!void {
-        const scratch = &self.workspace.huffman;
-        @memset(&book.widths, 0);
-        var count: usize = 0;
-        for (frequencies, 0..) |frequency, symbol| {
-            if (frequency == 0) continue;
-            scratch.nodes[count] = .{
-                .weight = frequency,
-                .left = 0,
-                .right = 0,
-                .symbol = @intCast(symbol),
+        fn split(
+            self: *Self,
+            first: usize,
+            end: usize,
+            start: usize,
+            bytes: usize,
+            offset: u6,
+            depth: usize,
+            slot: usize,
+        ) EncodeError!usize {
+            const workspace = self.workspace;
+            workspace.segments[slot] = .{
+                .first = first,
+                .end = end,
+                .start = start,
+                .bytes = bytes,
             };
-            scratch.leaves[count] = @intCast(count);
-            count += 1;
+            if (depth == 4 or bytes < 4096 or end - first < 2) return slot + 1;
+            const whole = try self.select(workspace.best[first..end], bytes, offset);
+            var middle = first;
+            var left_bytes: usize = 0;
+            while (middle + 1 < end and left_bytes < bytes / 2) : (middle += 1) {
+                left_bytes += @max(1, workspace.best[middle].length);
+            }
+            if (middle == first or middle == end) return slot + 1;
+            const left = try self.select(workspace.best[first..middle], left_bytes, offset);
+            const right_offset: u6 = @intCast((offset + @as(u32, left.bits)) % 8);
+            const right = try self.select(
+                workspace.best[middle..end],
+                bytes - left_bytes,
+                right_offset,
+            );
+            if (left.bits + right.bits >= whole.bits) return slot + 1;
+            const next = try self.split(first, middle, start, left_bytes, offset, depth + 1, slot);
+            // Child splits may alter alignment; recompute their exact cost.
+            var next_offset = offset;
+            for (workspace.segments[slot..next]) |segment| {
+                const choice = try self.select(
+                    workspace.best[segment.first..segment.end],
+                    segment.bytes,
+                    next_offset,
+                );
+                next_offset = @intCast((next_offset + @as(u32, choice.bits)) % 8);
+            }
+            return self.split(
+                middle,
+                end,
+                start + left_bytes,
+                bytes - left_bytes,
+                next_offset,
+                depth + 1,
+                next,
+            );
         }
-        if (count <= 1) {
-            book.widths[if (count == 0) 0 else scratch.nodes[0].symbol] = 1;
-            canonical(book);
-            return;
-        }
-        const Context = struct {
-            nodes: []const Package,
 
-            fn lessThan(context: @This(), left_index: u16, right_index: u16) bool {
-                const left = context.nodes[left_index];
-                const right = context.nodes[right_index];
-                if (left.weight != right.weight) return left.weight < right.weight;
-                return left.symbol < right.symbol;
+        // A dynamic header needs at least 44 bits: 29 for block/count/precode lengths and at least
+        // 15 to describe 258 code widths, even if every eight-bit run covers 138 widths.
+        fn selectProvablySmall(
+            self: *Self,
+            tokens: []const Token,
+            bytes: usize,
+            offset: u6,
+        ) EncodeError!?Selection {
+            var fixed_bits: u32 = 3 + fixedWidth(256);
+            var dynamic_lower: u32 = 44 + 1;
+            var symbols: [9]u16 = undefined;
+            var frequencies: [9]u8 = @splat(0);
+            symbols[0] = 256;
+            frequencies[0] = 1;
+            var distinct: usize = 1;
+            var maximum: u8 = 1;
+            for (tokens) |token| {
+                dynamic_lower += 1;
+                const symbol: u16 = if (token.length == 0) token.value else blk: {
+                    const length = lengthSlot(token.length);
+                    const distance = distanceSlot(token.value);
+                    const extra: u32 = @as(u32, length_extra[length]) + distance_extra[distance];
+                    fixed_bits += 5 + extra;
+                    dynamic_lower += 1 + extra;
+                    break :blk 257 + @as(u16, length);
+                };
+                fixed_bits += fixedWidth(symbol);
+                var index: usize = 0;
+                while (index < distinct and symbols[index] != symbol) : (index += 1) {}
+                if (index == distinct) {
+                    symbols[index] = symbol;
+                    distinct += 1;
+                }
+                frequencies[index] += 1;
+                maximum = @max(maximum, frequencies[index]);
             }
-        };
-        std.mem.sort(
-            u16,
-            scratch.leaves[0..count],
-            Context{ .nodes = &scratch.nodes },
-            Context.lessThan,
-        );
-        if (ordinaryBook(scratch, count, maximum, book)) {
-            // Preserve package-merge's existing logical work charge, including its exact refusal
-            // boundary. The ordinary-tree attempt is bounded by the fixed alphabet size.
-            var logical_nodes = count;
-            var logical_list_count = count;
-            for (1..maximum) |_| {
-                const packages = logical_list_count / 2;
-                logical_nodes += packages;
-                logical_list_count = @min(count * 2 - 2, count + packages);
-            }
-            try self.work(logical_nodes + @as(usize, maximum) * count);
-            canonical(book);
-            return;
+            // With at least three used symbols, only one can have a one-bit code.
+            if (distinct >= 3) dynamic_lower += @intCast(tokens.len + 1 - maximum);
+            const padding = (8 - (@as(u32, offset) + 3) % 8) % 8;
+            const stored_bits: u32 = @intCast(3 + padding + 32 + bytes * 8);
+            var best: Selection = .{ .bits = stored_bits, .kind = .stored };
+            if (fixed_bits < best.bits) best = .{ .bits = fixed_bits, .kind = .fixed };
+            if (best.bits > dynamic_lower) return null;
+            try self.work(tokens.len + 1);
+            return best;
         }
-        @memcpy(scratch.lists[0][0..count], scratch.leaves[0..count]);
-        var list_count = count;
-        var nodes = count;
-        var previous: usize = 0;
-        for (1..maximum) |_| {
-            const packages = list_count / 2;
-            for (0..packages) |i| {
-                const left = scratch.lists[previous][2 * i];
-                const right = scratch.lists[previous][2 * i + 1];
-                scratch.nodes[nodes] = .{
-                    .weight = scratch.nodes[left].weight + scratch.nodes[right].weight,
-                    .left = left,
-                    .right = right,
-                    .symbol = no_symbol,
-                };
-                scratch.packages[i] = @intCast(nodes);
-                nodes += 1;
+
+        // The header must contain the block and counts plus at least four precode widths: 29 bits.
+        // Each nonzero-width run needs at least one precode symbol, with repeats covering at most
+        // six entries. The zero-run table gives an optimistic cost even at the literal/distance
+        // boundary. Unrestricted Huffman merging also bounds the length-limited literal payload
+        // from below.
+        const SmallHuffmanBound = struct { best: Selection, lower: u32 };
+
+        // Keep this bounded proof out of the common large-block path.
+        noinline fn smallHuffmanBound(
+            tokens: []const Token,
+            bytes: usize,
+            offset: u6,
+        ) ?SmallHuffmanBound {
+            if (tokens.len > 32) {
+                var present: [5]u64 = @splat(0);
+                present[4] = 1; // End-of-block symbol.
+                for (tokens) |token| {
+                    const symbol: u16 = if (token.length == 0) token.value else blk: {
+                        const length = lengthSlot(token.length);
+                        break :blk 257 + @as(u16, length);
+                    };
+                    present[symbol / 64] |= @as(u64, 1) << @as(u6, @intCast(symbol % 64));
+                }
+                var distinct: usize = 0;
+                for (present) |bits| distinct += @popCount(bits);
+                // A small alphabet is unlikely to repay this proof; ordinary selection remains
+                // exact.
+                if (distinct <= 17) return null;
             }
-            const current = 1 - previous;
-            var leaf: usize = 0;
-            var package: usize = 0;
-            list_count = @min(count * 2 - 2, count + packages);
-            for (0..list_count) |i| {
-                // Leaves precede equal-weight packages; package creation order and symbol order
-                // make all construction ties deterministic.
-                const take_leaf = blk: {
-                    if (leaf == count) break :blk false;
-                    if (package == packages) break :blk true;
-                    const leaf_weight = scratch.nodes[scratch.leaves[leaf]].weight;
-                    const package_weight = scratch.nodes[scratch.packages[package]].weight;
-                    break :blk leaf_weight <= package_weight;
+            var fixed_bits: u32 = 3 + fixedWidth(256);
+            var dynamic_lower: u32 = 29;
+            var symbols: [65]u16 = undefined;
+            var frequencies: [65]u32 = @splat(0);
+            symbols[0] = 256;
+            frequencies[0] = 1;
+            var distinct: usize = 1;
+            for (tokens) |token| {
+                const symbol: u16 = if (token.length == 0) token.value else blk: {
+                    const length = lengthSlot(token.length);
+                    const distance = distanceSlot(token.value);
+                    const extra: u32 = @as(u32, length_extra[length]) + distance_extra[distance];
+                    fixed_bits += 5 + extra;
+                    dynamic_lower += 1 + extra;
+                    break :blk 257 + @as(u16, length);
                 };
-                if (take_leaf) {
-                    scratch.lists[current][i] = scratch.leaves[leaf];
-                    leaf += 1;
+                fixed_bits += fixedWidth(symbol);
+                var index: usize = 0;
+                while (index < distinct and symbols[index] != symbol) : (index += 1) {}
+                if (index == distinct) {
+                    symbols[index] = symbol;
+                    distinct += 1;
+                }
+                frequencies[index] += 1;
+            }
+            const padding = (8 - (@as(u32, offset) + 3) % 8) % 8;
+            const stored_bits: u32 = @intCast(3 + padding + 32 + bytes * 8);
+            var best: Selection = .{ .bits = stored_bits, .kind = .stored };
+            if (fixed_bits < best.bits) best = .{ .bits = fixed_bits, .kind = .fixed };
+            // Optimistic costs for zero-width runs, allowing each repeat to cover fewer entries
+            // than its actual minimum and assigning every precode a one-bit code.
+            const zero_cost = comptime blk: {
+                var costs: [287]u16 = @splat(0);
+                for (1..costs.len) |n| {
+                    costs[n] = @min(
+                        costs[n - 1] + 1,
+                        @min(costs[n -| 6] + 3, @min(costs[n -| 10] + 4, costs[n -| 138] + 8)),
+                    );
+                }
+                break :blk costs;
+            };
+            for (1..distinct) |i| {
+                const symbol = symbols[i];
+                var j = i;
+                while (j != 0 and symbols[j - 1] > symbol) : (j -= 1) {
+                    symbols[j] = symbols[j - 1];
+                }
+                symbols[j] = symbol;
+            }
+            var previous: usize = 0;
+            var run: usize = 0;
+            for (symbols[0..distinct]) |symbol| {
+                const gap = @as(usize, symbol) - previous;
+                if (gap != 0) {
+                    if (run != 0) {
+                        const remaining = run - 1;
+                        dynamic_lower += @intCast(1 + 3 * (remaining / 6) + @min(remaining % 6, 3));
+                        run = 0;
+                    }
+                    dynamic_lower += zero_cost[gap];
+                }
+                run += 1;
+                previous = @as(usize, symbol) + 1;
+            }
+            if (run != 0) {
+                const remaining = run - 1;
+                dynamic_lower += @intCast(1 + 3 * (remaining / 6) + @min(remaining % 6, 3));
+            }
+            dynamic_lower += smallHuffmanCost(frequencies[0..distinct]);
+            if (dynamic_lower < best.bits) {
+                // The first bound assumes every distance symbol costs one bit. If that is
+                // inconclusive, unrestricted merging gives a stronger distance cost.
+                var distance_freq: [30]u32 = @splat(0);
+                var matches: u32 = 0;
+                for (tokens) |token| if (token.length != 0) {
+                    distance_freq[distanceSlot(token.value)] += 1;
+                    matches += 1;
+                };
+                dynamic_lower += smallHuffmanCost(&distance_freq) - matches;
+            }
+            return .{ .best = best, .lower = dynamic_lower };
+        }
+
+        // Every weight is at most the number of tokens plus the end symbol, so a bounded histogram
+        // can merge the two smallest weights without a general-purpose heap.
+        fn smallHuffmanCost(frequencies: []const u32) u32 {
+            var buckets: [66]u8 = @splat(0);
+            var count: usize = 0;
+            var total: u32 = 0;
+            for (frequencies) |frequency| if (frequency != 0) {
+                buckets[frequency] += 1;
+                total += frequency;
+                count += 1;
+            };
+            if (count <= 1) return total;
+            var least: usize = 1;
+            var cost: u32 = 0;
+            while (count > 1) : (count -= 1) {
+                while (buckets[least] == 0) : (least += 1) {}
+                buckets[least] -= 1;
+                const first = least;
+                while (buckets[least] == 0) : (least += 1) {}
+                buckets[least] -= 1;
+                const merged = first + least;
+                buckets[merged] += 1;
+                cost += @intCast(merged);
+            }
+            return cost;
+        }
+
+        fn select(
+            self: *Self,
+            tokens: []const Token,
+            bytes: usize,
+            offset: u6,
+        ) EncodeError!Selection {
+            var literal_frequencies: [286]u32 = @splat(0);
+            var distance_frequencies: [30]u32 = @splat(0);
+            literal_frequencies[256] = 1;
+            var extra_bits: u32 = 0;
+            for (tokens) |token| {
+                if (token.length == 0) {
+                    literal_frequencies[token.value] += 1;
                 } else {
-                    scratch.lists[current][i] = scratch.packages[package];
-                    package += 1;
+                    const length_slot = lengthSlot(token.length);
+                    const distance_slot = distanceSlot(token.value);
+                    literal_frequencies[257 + @as(usize, length_slot)] += 1;
+                    distance_frequencies[distance_slot] += 1;
+                    extra_bits += @as(
+                        u32,
+                        length_extra[length_slot],
+                    ) + distance_extra[distance_slot];
                 }
             }
-            previous = current;
+            const header = &self.workspace.header;
+            try self.makeBook(&literal_frequencies, 15, &header.literal);
+            try self.makeBook(&distance_frequencies, 15, &header.distance);
+            try self.makeHeader();
+            var dynamic_bits: u32 = 3 + header.bits + extra_bits;
+            var fixed_bits: u32 = 3 + extra_bits;
+            for (literal_frequencies, 0..) |frequency, symbol| {
+                dynamic_bits += frequency * header.literal.widths[symbol];
+                fixed_bits += frequency * fixedWidth(symbol);
+            }
+            for (distance_frequencies, 0..) |frequency, symbol| {
+                dynamic_bits += frequency * header.distance.widths[symbol];
+                fixed_bits += frequency * 5;
+            }
+            const padding = (8 - (@as(u32, offset) + 3) % 8) % 8;
+            const stored_bits: u32 = @intCast(3 + padding + 32 + bytes * 8);
+            var best: Selection = .{ .bits = stored_bits, .kind = .stored };
+            if (fixed_bits < best.bits) best = .{ .bits = fixed_bits, .kind = .fixed };
+            if (dynamic_bits < best.bits) best = .{ .bits = dynamic_bits, .kind = .dynamic };
+            best.dynamic_bits = dynamic_bits;
+            try self.work(tokens.len + 1);
+            return best;
         }
-        for (scratch.lists[previous][0 .. count * 2 - 2]) |node| {
-            addLengths(scratch, node, &book.widths);
-        }
-        try self.work(nodes + @as(usize, maximum) * count);
-        canonical(book);
-    }
 
-    fn makeHeader(self: *Encoder) EncodeError!void {
-        const workspace = self.workspace;
-        const header = &workspace.header;
-        header.literal_count = 286;
-        while (header.literal_count > 257) {
-            if (header.literal.widths[header.literal_count - 1] != 0) break;
-            header.literal_count -= 1;
-        }
-        header.distance_count = 30;
-        while (header.distance_count > 1) {
-            if (header.distance.widths[header.distance_count - 1] != 0) break;
-            header.distance_count -= 1;
-        }
-        var widths: [316]u8 = undefined;
-        @memcpy(widths[0..header.literal_count], header.literal.widths[0..header.literal_count]);
-        @memcpy(
-            widths[header.literal_count..][0..header.distance_count],
-            header.distance.widths[0..header.distance_count],
-        );
-        const size = header.literal_count + header.distance_count;
-        var prices: [19]u16 = @splat(4);
-        var best_bits: u32 = std.math.maxInt(u32);
-        var previous_run_count: usize = 0;
-        var previous_work: u64 = 0;
-        // Reprice code-length runs with each trial precode, keeping the cheapest serialized header.
-        for (0..4) |pass| {
-            const work_before = self.stats.work_units;
-            var choices: [316]RunChoice = undefined;
-            _ = priceRuns(widths[0..size], &prices, choices[0..size]);
-            const trial = &workspace.header_trial;
-            var frequencies: [19]u32 = @splat(0);
-            var position: usize = 0;
-            var unchanged = pass != 0;
-            trial.run_count = 0;
-            while (position < size) {
-                const choice = choices[position];
-                const extra: u8 = switch (choice.symbol) {
-                    16, 17 => choice.take - 3,
-                    18 => choice.take - 11,
-                    else => 0,
+        // Package-merge, Larmore and Hirschberg, JACM 37 (1990), pp. 464-473.
+        // https://web.cs.unlv.edu/larmore/Research/larHir90.pdf
+        fn makeBook(
+            self: *Self,
+            frequencies: []const u32,
+            maximum: u8,
+            book: *Book,
+        ) EncodeError!void {
+            const scratch = &self.workspace.huffman;
+            @memset(&book.widths, 0);
+            var count: usize = 0;
+            for (frequencies, 0..) |frequency, symbol| {
+                if (frequency == 0) continue;
+                scratch.nodes[count] = .{
+                    .weight = frequency,
+                    .left = 0,
+                    .right = 0,
+                    .symbol = @intCast(symbol),
                 };
-                const run: Run = .{ .symbol = choice.symbol, .extra = extra };
-                if (unchanged and trial.run_count < previous_run_count) {
-                    const previous = trial.runs[trial.run_count];
-                    unchanged = run.symbol == previous.symbol and run.extra == previous.extra;
-                } else unchanged = false;
-                trial.runs[trial.run_count] = run;
-                frequencies[choice.symbol] += 1;
-                trial.run_count += 1;
-                position += choice.take;
+                scratch.leaves[count] = @intCast(count);
+                count += 1;
             }
-            // Identical runs produce the same precode and future prices. Reuse the remaining trials
-            // only when their exact logical charges fit; otherwise execute them to preserve partial
-            // failure counts. Each trial's work is bounded by 316 widths.
-            if (unchanged and trial.run_count == previous_run_count) {
-                const remaining: u64 = @intCast(4 - pass);
-                const units = previous_work * remaining;
-                if (units <= self.options.limits.work_units -| self.stats.work_units) {
-                    try self.work(units);
-                    return;
+            if (count <= 1) {
+                book.widths[if (count == 0) 0 else scratch.nodes[0].symbol] = 1;
+                // A single one-bit symbol has canonical code zero; unused codes are zero too.
+                @memset(&book.codes, 0);
+                return;
+            }
+            const Context = struct {
+                nodes: []const Package,
+
+                fn lessThan(context: @This(), left_index: u16, right_index: u16) bool {
+                    const left = context.nodes[left_index];
+                    const right = context.nodes[right_index];
+                    if (left.weight != right.weight) return left.weight < right.weight;
+                    return left.symbol < right.symbol;
+                }
+            };
+            std.mem.sort(
+                u16,
+                scratch.leaves[0..count],
+                Context{ .nodes = &scratch.nodes },
+                Context.lessThan,
+            );
+            if (ordinaryBook(scratch, count, maximum, book)) {
+                // Preserve package-merge's existing logical work charge, including its exact
+                // refusal boundary. The ordinary-tree attempt is bounded by the fixed alphabet
+                // size.
+                var logical_nodes = count;
+                var logical_list_count = count;
+                for (1..maximum) |_| {
+                    const packages = logical_list_count / 2;
+                    logical_nodes += packages;
+                    logical_list_count = @min(count * 2 - 2, count + packages);
+                }
+                try self.work(logical_nodes + @as(usize, maximum) * count);
+                canonical(book);
+                return;
+            }
+            @memcpy(scratch.lists[0][0..count], scratch.leaves[0..count]);
+            var list_count = count;
+            var nodes = count;
+            var previous: usize = 0;
+            for (1..maximum) |_| {
+                const packages = list_count / 2;
+                for (0..packages) |i| {
+                    const left = scratch.lists[previous][2 * i];
+                    const right = scratch.lists[previous][2 * i + 1];
+                    scratch.nodes[nodes] = .{
+                        .weight = scratch.nodes[left].weight + scratch.nodes[right].weight,
+                        .left = left,
+                        .right = right,
+                        .symbol = no_symbol,
+                    };
+                    scratch.packages[i] = @intCast(nodes);
+                    nodes += 1;
+                }
+                const current = 1 - previous;
+                var leaf: usize = 0;
+                var package: usize = 0;
+                list_count = @min(count * 2 - 2, count + packages);
+                for (0..list_count) |i| {
+                    // Leaves precede equal-weight packages; package creation order and symbol order
+                    // make all construction ties deterministic.
+                    const take_leaf = blk: {
+                        if (leaf == count) break :blk false;
+                        if (package == packages) break :blk true;
+                        const leaf_weight = scratch.nodes[scratch.leaves[leaf]].weight;
+                        const package_weight = scratch.nodes[scratch.packages[package]].weight;
+                        break :blk leaf_weight <= package_weight;
+                    };
+                    if (take_leaf) {
+                        scratch.lists[current][i] = scratch.leaves[leaf];
+                        leaf += 1;
+                    } else {
+                        scratch.lists[current][i] = scratch.packages[package];
+                        package += 1;
+                    }
+                }
+                previous = current;
+            }
+            for (scratch.lists[previous][0 .. count * 2 - 2]) |node| {
+                addLengths(scratch, node, &book.widths);
+            }
+            try self.work(nodes + @as(usize, maximum) * count);
+            canonical(book);
+        }
+
+        fn makeHeader(self: *Self) EncodeError!void {
+            const workspace = self.workspace;
+            const header = &workspace.header;
+            header.literal_count = 286;
+            while (header.literal_count > 257) {
+                if (header.literal.widths[header.literal_count - 1] != 0) break;
+                header.literal_count -= 1;
+            }
+            header.distance_count = 30;
+            while (header.distance_count > 1) {
+                if (header.distance.widths[header.distance_count - 1] != 0) break;
+                header.distance_count -= 1;
+            }
+            var widths: [316]u8 = undefined;
+            @memcpy(
+                widths[0..header.literal_count],
+                header.literal.widths[0..header.literal_count],
+            );
+            @memcpy(
+                widths[header.literal_count..][0..header.distance_count],
+                header.distance.widths[0..header.distance_count],
+            );
+            const size = header.literal_count + header.distance_count;
+            var prices: [19]u16 = @splat(4);
+            var best_bits: u32 = std.math.maxInt(u32);
+            var previous_run_count: usize = 0;
+            var previous_work: u64 = 0;
+            // Reprice code-length runs with each trial precode, keeping the cheapest serialized
+            // header.
+            for (0..4) |pass| {
+                const work_before = self.stats.work_units;
+                var choices: [316]RunChoice = undefined;
+                _ = priceRuns(widths[0..size], &prices, choices[0..size]);
+                const trial = &workspace.header_trial;
+                var frequencies: [19]u32 = @splat(0);
+                var position: usize = 0;
+                var unchanged = pass != 0;
+                trial.run_count = 0;
+                while (position < size) {
+                    const choice = choices[position];
+                    const extra: u8 = switch (choice.symbol) {
+                        16, 17 => choice.take - 3,
+                        18 => choice.take - 11,
+                        else => 0,
+                    };
+                    const run: Run = .{ .symbol = choice.symbol, .extra = extra };
+                    if (unchanged and trial.run_count < previous_run_count) {
+                        const previous = trial.runs[trial.run_count];
+                        unchanged = run.symbol == previous.symbol and run.extra == previous.extra;
+                    } else unchanged = false;
+                    trial.runs[trial.run_count] = run;
+                    frequencies[choice.symbol] += 1;
+                    trial.run_count += 1;
+                    position += choice.take;
+                }
+                // Identical runs produce the same precode and future prices. Reuse the remaining
+                // trials only when their exact logical charges fit; otherwise execute them to
+                // preserve partial failure counts. Each trial's work is bounded by 316 widths.
+                if (unchanged and trial.run_count == previous_run_count) {
+                    const remaining: u64 = @intCast(4 - pass);
+                    const units = previous_work * remaining;
+                    if (units <= self.options.limits.work_units -| self.stats.work_units) {
+                        try self.work(units);
+                        return;
+                    }
+                }
+                try self.makeBook(&frequencies, 7, &trial.precode);
+                trial.precode_count = 19;
+                while (trial.precode_count > 4) {
+                    const symbol = precode_order[trial.precode_count - 1];
+                    if (trial.precode.widths[symbol] != 0) break;
+                    trial.precode_count -= 1;
+                }
+                trial.bits = @intCast(14 + trial.precode_count * 3);
+                for (trial.runs[0..trial.run_count]) |run| {
+                    trial.bits += @as(u32, trial.precode.widths[run.symbol]) + runExtra(run.symbol);
+                }
+                if (trial.bits < best_bits) {
+                    best_bits = trial.bits;
+                    header.bits = trial.bits;
+                    header.precode = trial.precode;
+                    header.precode_count = trial.precode_count;
+                    header.run_count = trial.run_count;
+                    @memcpy(header.runs[0..header.run_count], trial.runs[0..header.run_count]);
+                }
+                for (&prices, trial.precode.widths[0..19]) |*price, width| {
+                    price.* = if (width == 0) 7 else width;
+                }
+                // Charge the same logical edge bound even when range minima avoid visiting each
+                // edge.
+                try self.work(size * 138);
+                previous_run_count = trial.run_count;
+                previous_work = self.stats.work_units - work_before;
+            }
+        }
+
+        fn emit(
+            self: *Self,
+            tokens: []const Token,
+            segment: Segment,
+            kind: Kind,
+            final: bool,
+        ) EncodeError!void {
+            const header = &self.workspace.header;
+            if (kind == .stored) {
+                const start = self.history + segment.start;
+                const bytes = self.workspace.data[start..][0..segment.bytes];
+                return self.stored(bytes, final);
+            }
+            self.put(@intFromBool(final), 1);
+            self.put(if (kind == .fixed) 1 else 2, 2);
+            if (kind == .fixed) {
+                fixedBook(&header.literal, false);
+                fixedBook(&header.distance, true);
+                self.stats.fixed_blocks = try addCount(self.stats.fixed_blocks, 1);
+            } else {
+                self.put(header.literal_count - 257, 5);
+                self.put(header.distance_count - 1, 5);
+                self.put(header.precode_count - 4, 4);
+                for (
+                    precode_order[0..header.precode_count],
+                ) |symbol| self.put(header.precode.widths[symbol], 3);
+                for (header.runs[0..header.run_count]) |run| {
+                    self.putSymbol(&header.precode, run.symbol);
+                    self.put(run.extra, runExtra(run.symbol));
+                }
+                self.stats.dynamic_blocks = try addCount(self.stats.dynamic_blocks, 1);
+            }
+            for (tokens) |token| {
+                if (token.length == 0) {
+                    self.putSymbol(&header.literal, token.value);
+                } else {
+                    const length = lengthSlot(token.length);
+                    const distance = distanceSlot(token.value);
+                    self.putSymbol(&header.literal, 257 + @as(usize, length));
+                    self.put(token.length - length_base[length], @intCast(length_extra[length]));
+                    self.putSymbol(&header.distance, distance);
+                    self.put(
+                        token.value - distance_base[distance],
+                        @intCast(distance_extra[distance]),
+                    );
                 }
             }
-            try self.makeBook(&frequencies, 7, &trial.precode);
-            trial.precode_count = 19;
-            while (trial.precode_count > 4) {
-                const symbol = precode_order[trial.precode_count - 1];
-                if (trial.precode.widths[symbol] != 0) break;
-                trial.precode_count -= 1;
-            }
-            trial.bits = @intCast(14 + trial.precode_count * 3);
-            for (trial.runs[0..trial.run_count]) |run| {
-                trial.bits += @as(u32, trial.precode.widths[run.symbol]) + runExtra(run.symbol);
-            }
-            if (trial.bits < best_bits) {
-                best_bits = trial.bits;
-                header.bits = trial.bits;
-                header.precode = trial.precode;
-                header.precode_count = trial.precode_count;
-                header.run_count = trial.run_count;
-                @memcpy(header.runs[0..header.run_count], trial.runs[0..header.run_count]);
-            }
-            for (&prices, trial.precode.widths[0..19]) |*price, width| {
-                price.* = if (width == 0) 7 else width;
-            }
-            // Charge the same logical edge bound even when range minima avoid visiting each edge.
-            try self.work(size * 138);
-            previous_run_count = trial.run_count;
-            previous_work = self.stats.work_units - work_before;
+            self.putSymbol(&header.literal, 256);
+            self.stats.blocks = try addCount(self.stats.blocks, 1);
         }
-    }
 
-    fn emit(
-        self: *Encoder,
-        tokens: []const Token,
-        segment: Segment,
-        kind: Kind,
-        final: bool,
-    ) EncodeError!void {
-        const header = &self.workspace.header;
-        if (kind == .stored) {
-            const start = self.history + segment.start;
-            const bytes = self.workspace.data[start..][0..segment.bytes];
-            return self.stored(bytes, final);
+        fn stored(self: *Self, bytes: []const u8, final: bool) EncodeError!void {
+            self.put(@intFromBool(final), 1);
+            self.put(0, 2);
+            self.alignBits();
+            writeStoredBody(bytes, self.workspace.wire[self.pending..][0 .. bytes.len + 4]);
+            self.pending += bytes.len + 4;
+            self.stats.blocks = try addCount(self.stats.blocks, 1);
+            self.stats.stored_blocks = try addCount(self.stats.stored_blocks, 1);
         }
-        self.put(@intFromBool(final), 1);
-        self.put(if (kind == .fixed) 1 else 2, 2);
-        if (kind == .fixed) {
-            fixedBook(&header.literal, false);
-            fixedBook(&header.distance, true);
-            self.stats.fixed_blocks = try addCount(self.stats.fixed_blocks, 1);
-        } else {
-            self.put(header.literal_count - 257, 5);
-            self.put(header.distance_count - 1, 5);
-            self.put(header.precode_count - 4, 4);
-            for (
-                precode_order[0..header.precode_count],
-            ) |symbol| self.put(header.precode.widths[symbol], 3);
-            for (header.runs[0..header.run_count]) |run| {
-                self.putSymbol(&header.precode, run.symbol);
-                self.put(run.extra, runExtra(run.symbol));
-            }
-            self.stats.dynamic_blocks = try addCount(self.stats.dynamic_blocks, 1);
+
+        fn putSymbol(self: *Self, book: *const Book, value: usize) void {
+            self.put(book.codes[value], @intCast(book.widths[value]));
         }
-        for (tokens) |token| {
-            if (token.length == 0) {
-                self.putSymbol(&header.literal, token.value);
-            } else {
-                const length = lengthSlot(token.length);
-                const distance = distanceSlot(token.value);
-                self.putSymbol(&header.literal, 257 + @as(usize, length));
-                self.put(token.length - length_base[length], @intCast(length_extra[length]));
-                self.putSymbol(&header.distance, distance);
-                self.put(token.value - distance_base[distance], @intCast(distance_extra[distance]));
+
+        fn put(self: *Self, value: usize, width: u6) void {
+            self.bits |= @as(u64, @intCast(value)) << self.bit_count;
+            self.bit_count += width;
+            while (self.bit_count >= 8) {
+                self.workspace.wire[self.pending] = @truncate(self.bits);
+                self.pending += 1;
+                self.bits >>= 8;
+                self.bit_count -= 8;
             }
         }
-        self.putSymbol(&header.literal, 256);
-        self.stats.blocks = try addCount(self.stats.blocks, 1);
-    }
 
-    fn stored(self: *Encoder, bytes: []const u8, final: bool) EncodeError!void {
-        self.put(@intFromBool(final), 1);
-        self.put(0, 2);
-        self.alignBits();
-        writeStoredBody(bytes, self.workspace.wire[self.pending..][0 .. bytes.len + 4]);
-        self.pending += bytes.len + 4;
-        self.stats.blocks = try addCount(self.stats.blocks, 1);
-        self.stats.stored_blocks = try addCount(self.stats.stored_blocks, 1);
-    }
-
-    fn putSymbol(self: *Encoder, book: *const Book, value: usize) void {
-        self.put(book.codes[value], @intCast(book.widths[value]));
-    }
-
-    fn put(self: *Encoder, value: usize, width: u6) void {
-        self.bits |= @as(u64, @intCast(value)) << self.bit_count;
-        self.bit_count += width;
-        while (self.bit_count >= 8) {
-            self.workspace.wire[self.pending] = @truncate(self.bits);
-            self.pending += 1;
-            self.bits >>= 8;
-            self.bit_count -= 8;
+        fn alignBits(self: *Self) void {
+            if (self.bit_count != 0) self.put(0, 8 - self.bit_count);
         }
-    }
-
-    fn alignBits(self: *Encoder) void {
-        if (self.bit_count != 0) self.put(0, 8 - self.bit_count);
-    }
-};
+    };
+}
 
 // RFC 1951 stored bodies are byte-aligned LEN/NLEN pairs followed by uncompressed bytes.
 fn writeStoredBody(source: []const u8, output: []u8) void {
@@ -2443,6 +4074,68 @@ test "reduced lazy lookahead changes search work on a collision-heavy input" {
     }
 }
 
+test "automatic lookahead matches reduced work and failures on collisions" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var source: [8192]u8 = undefined;
+    var state: u32 = 0x12a654cd;
+    for (&source) |*byte| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte.* = @truncate(state & 3);
+    }
+    var encoder: Encoder = undefined;
+    var full_output: [16384]u8 = undefined;
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .lazy_lookahead = .full } });
+    _ = try encoder.step(&source, &full_output, .finish);
+    const full = encoder.counts();
+    var reduced_output: [16384]u8 = undefined;
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .lazy_lookahead = .reduced } });
+    const reduced_progress = try encoder.step(&source, &reduced_output, .finish);
+    const reduced = encoder.counts();
+    try std.testing.expect(reduced.match_probes < full.match_probes);
+    var automatic_output: [16384]u8 = undefined;
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .lazy_lookahead = .automatic } });
+    const automatic_progress = try encoder.step(&source, &automatic_output, .finish);
+    try std.testing.expectEqualDeep(reduced_progress, automatic_progress);
+    try std.testing.expectEqualDeep(reduced, encoder.counts());
+    try std.testing.expectEqualSlices(
+        u8,
+        reduced_output[0..reduced_progress.produced],
+        automatic_output[0..automatic_progress.produced],
+    );
+    for ([_]u64{ 0, 1, reduced.work_units - 1, reduced.work_units }) |budget| {
+        @memset(&automatic_output, 0xa5);
+        @memset(&reduced_output, 0xa5);
+        try encoder.reset(
+            workspace,
+            .{
+                .compression = .{ .level = 6, .lazy_lookahead = .automatic },
+                .limits = .{ .work_units = budget },
+            },
+        );
+        const actual = encoder.step(&source, &automatic_output, .finish);
+        const actual_counts = encoder.counts();
+        try encoder.reset(
+            workspace,
+            .{
+                .compression = .{ .level = 6, .lazy_lookahead = .reduced },
+                .limits = .{ .work_units = budget },
+            },
+        );
+        const expected = encoder.step(&source, &reduced_output, .finish);
+        if (actual) |progress| {
+            try std.testing.expectEqualDeep(try expected, progress);
+        } else |err| {
+            try std.testing.expectError(err, expected);
+        }
+        try std.testing.expectEqualDeep(encoder.counts(), actual_counts);
+        try std.testing.expectEqualSlices(u8, &reduced_output, &automatic_output);
+    }
+}
+
 test "reduced lazy lookahead preserves fragmented encoding and dictionary recovery" {
     const decoding = @import("decode.zig");
     const allocator = std.testing.allocator;
@@ -2554,21 +4247,15 @@ test "stored finishes preserve independent RFC slab headers payloads and counter
         bytes: usize,
         full_prefixes: usize,
         final_header: [5]u8,
-    }{ .{ .bytes = 0, .full_prefixes = 0, .final_header = .{
-        1, 0, 0, 255, 255,
-    } }, .{ .bytes = 1, .full_prefixes = 0, .final_header = .{
-        1, 1, 0, 254, 255,
-    } }, .{ .bytes = 65534, .full_prefixes = 0, .final_header = .{
-        1, 254, 255, 1, 0,
-    } }, .{ .bytes = 65535, .full_prefixes = 0, .final_header = .{
-        1, 255, 255, 0, 0,
-    } }, .{ .bytes = 65536, .full_prefixes = 1, .final_header = .{
-        1, 1, 0, 254, 255,
-    } }, .{ .bytes = 131070, .full_prefixes = 1, .final_header = .{
-        1, 255, 255, 0, 0,
-    } }, .{ .bytes = 131071, .full_prefixes = 2, .final_header = .{
-        1, 1, 0, 254, 255,
-    } } };
+    }{
+        .{ .bytes = 0, .full_prefixes = 0, .final_header = .{ 1, 0, 0, 255, 255 } },
+        .{ .bytes = 1, .full_prefixes = 0, .final_header = .{ 1, 1, 0, 254, 255 } },
+        .{ .bytes = 65534, .full_prefixes = 0, .final_header = .{ 1, 254, 255, 1, 0 } },
+        .{ .bytes = 65535, .full_prefixes = 0, .final_header = .{ 1, 255, 255, 0, 0 } },
+        .{ .bytes = 65536, .full_prefixes = 1, .final_header = .{ 1, 1, 0, 254, 255 } },
+        .{ .bytes = 131070, .full_prefixes = 1, .final_header = .{ 1, 255, 255, 0, 0 } },
+        .{ .bytes = 131071, .full_prefixes = 2, .final_header = .{ 1, 1, 0, 254, 255 } },
+    };
     for (cases) |case| {
         const wire_bytes = case.bytes + (case.full_prefixes + 1) * 5;
         for ([_]usize{ 256, 32768 }) |window| {
@@ -2595,9 +4282,11 @@ test "stored finishes preserve independent RFC slab headers payloads and counter
             var read: usize = 0;
             var written: usize = 0;
             for (0..case.full_prefixes) |_| {
-                try std.testing.expectEqualSlices(u8, &.{
-                    0, 255, 255, 0, 0,
-                }, output[written..][0..5]);
+                try std.testing.expectEqualSlices(
+                    u8,
+                    &.{ 0, 255, 255, 0, 0 },
+                    output[written..][0..5],
+                );
                 try std.testing.expectEqualSlices(
                     u8,
                     source[read..][0..65535],
@@ -2914,9 +4603,11 @@ test "offline price ranges preserve exhaustive paths ties and logical edge budge
     const reduced_choices = try std.testing.allocator.alloc(Token, 65535);
     defer std.testing.allocator.free(reduced_choices);
     var differences: [3]bool = @splat(false);
-    for ([_]usize{
-        0, 1, 2, 3, 4, 8, 10, 11, 19, 33, 34, 35, 36, 67, 131, 257, 258, 259, 768, 65535,
-    }) |size| {
+    for (
+        [_]usize{
+            0, 1, 2, 3, 4, 8, 10, 11, 19, 33, 34, 35, 36, 67, 131, 257, 258, 259, 768, 65535,
+        },
+    ) |size| {
         const patterns: usize = if (size == 65535) 1 else 8;
         const pricings: usize = if (size == 65535) 1 else 5;
         for (0..patterns) |pattern| {
@@ -4152,36 +5843,64 @@ test "frequency selection equals direct token bit accounting" {
     }
 }
 
+test "empty and single-symbol books have zero codes without work charges" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    try encoder.reset(workspace, .{ .limits = .{ .work_units = 0 } });
+    var frequencies: [286]u32 = @splat(0);
+    var book: Book = undefined;
+    for ([_]u8{ 7, 15 }) |maximum| {
+        for (0..frequencies.len + 1) |selected| {
+            @memset(std.mem.asBytes(&book), 0xa5);
+            if (selected < frequencies.len) frequencies[selected] = 37;
+            try encoder.makeBook(&frequencies, maximum, &book);
+            const active = if (selected == frequencies.len) 0 else selected;
+            for (book.widths, book.codes, 0..) |width, code, symbol| {
+                try std.testing.expectEqual(@as(u8, if (symbol == active) 1 else 0), width);
+                try std.testing.expectEqual(@as(u16, 0), code);
+            }
+            try std.testing.expectEqual(@as(u64, 0), encoder.stats.work_units);
+            if (selected < frequencies.len) frequencies[selected] = 0;
+        }
+    }
+}
+
 test "bounded books retain widths and work with ordinary-tree fast path" {
     // Expected widths come from an independent package-list construction. Equal weights exercise
     // deterministic symbol ties; the Fibonacci cases exceed the 7- and 15-bit bounds respectively.
     const Case = struct { frequencies: []const u32, widths: []const u8, maximum: u8 };
-    const cases = [_]Case{ .{ .frequencies = &.{
-        1, 1,
-    }, .widths = &.{
-        1, 1,
-    }, .maximum = 7 }, .{ .frequencies = &.{
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    }, .widths = &.{
-        4, 4, 4, 4, 3, 3, 3, 3, 3, 3,
-    }, .maximum = 7 }, .{ .frequencies = &.{
-        1, 1, 1, 2, 2, 3, 3, 5, 8,
-    }, .widths = &.{
-        5, 5, 4, 4, 4, 3, 3, 2, 2,
-    }, .maximum = 7 }, .{ .frequencies = &.{
-        0, 1, 1, 2, 0, 3, 5, 8, 13,
-    }, .widths = &.{
-        0, 6, 6, 5, 0, 4, 3, 2, 1,
-    }, .maximum = 7 }, .{ .frequencies = &.{
-        1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610,
-    }, .widths = &.{
-        7, 7, 7, 7, 7, 7, 6, 5, 5, 4, 4, 3, 3, 2, 2,
-    }, .maximum = 7 }, .{ .frequencies = &.{
-        1,     1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181, 6765,
-        10946,
-    }, .widths = &.{
-        15, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2,
-    }, .maximum = 15 } };
+    const cases = [_]Case{
+        .{ .frequencies = &.{ 1, 1 }, .widths = &.{ 1, 1 }, .maximum = 7 },
+        .{
+            .frequencies = &.{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+            .widths = &.{ 4, 4, 4, 4, 3, 3, 3, 3, 3, 3 },
+            .maximum = 7,
+        },
+        .{
+            .frequencies = &.{ 1, 1, 1, 2, 2, 3, 3, 5, 8 },
+            .widths = &.{ 5, 5, 4, 4, 4, 3, 3, 2, 2 },
+            .maximum = 7,
+        },
+        .{
+            .frequencies = &.{ 0, 1, 1, 2, 0, 3, 5, 8, 13 },
+            .widths = &.{ 0, 6, 6, 5, 0, 4, 3, 2, 1 },
+            .maximum = 7,
+        },
+        .{
+            .frequencies = &.{ 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610 },
+            .widths = &.{ 7, 7, 7, 7, 7, 7, 6, 5, 5, 4, 4, 3, 3, 2, 2 },
+            .maximum = 7,
+        },
+        .{
+            .frequencies = &.{
+                1,    1,    2,     3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584,
+                4181, 6765, 10946,
+            },
+            .widths = &.{ 15, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2 },
+            .maximum = 15,
+        },
+    };
     const workspace = try EncoderWorkspace.create(std.testing.allocator);
     defer workspace.destroy(std.testing.allocator);
     var encoder: Encoder = undefined;
@@ -4292,12 +6011,16 @@ test "offline tree retains correct matches across slab tails" {
     }
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
-    try std.testing.expectEqualSlices(u8, &.{
-        0x76, 0x0b, 0xda, 0xae, 0x3d, 0x16, 0x6b, 0xeb,
-        0x0f, 0x64, 0xd9, 0x52, 0x30, 0xe5, 0x36, 0x19,
-        0x36, 0x5c, 0xf7, 0x23, 0xe7, 0xba, 0x9f, 0x07,
-        0x8e, 0x1c, 0x03, 0x1a, 0x7c, 0x84, 0xaf, 0xed,
-    }, &digest);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{
+            0x76, 0x0b, 0xda, 0xae, 0x3d, 0x16, 0x6b, 0xeb,
+            0x0f, 0x64, 0xd9, 0x52, 0x30, 0xe5, 0x36, 0x19,
+            0x36, 0x5c, 0xf7, 0x23, 0xe7, 0xba, 0x9f, 0x07,
+            0x8e, 0x1c, 0x03, 0x1a, 0x7c, 0x84, 0xaf, 0xed,
+        },
+        &digest,
+    );
 
     const encoding = try EncoderWorkspace.create(allocator);
     defer encoding.destroy(allocator);
@@ -4512,5 +6235,2114 @@ test "retained search protects guarded poisoned workspace across failure and reu
         try std.testing.expectEqualSlices(u8, input, restored);
         try std.testing.expectEqualSlices(u8, &guards, bytes[0..margin]);
         try std.testing.expectEqualSlices(u8, &guards, bytes[margin + size ..]);
+    }
+}
+
+test "proven small block selection agrees with complete dynamic pricing" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var encoder: Encoder = undefined;
+    const alphabet = [_]Token{
+        .{ .length = 0, .value = 0 },
+        .{ .length = 0, .value = 127 },
+        .{ .length = 0, .value = 255 },
+        .{ .length = 3, .value = 1 },
+        .{ .length = 258, .value = 32768 },
+    };
+    var checked: usize = 0;
+    var skipped: usize = 0;
+    for (0..6) |len| {
+        var combinations: usize = 1;
+        for (0..len) |_| combinations *= alphabet.len;
+        for (0..combinations) |encoded| {
+            var digits = encoded;
+            var tokens: [8]Token = undefined;
+            var bytes: usize = 0;
+            for (tokens[0..len]) |*token| {
+                token.* = alphabet[digits % alphabet.len];
+                digits /= alphabet.len;
+                bytes += @max(1, token.length);
+            }
+            for (0..8) |offset| {
+                try encoder.reset(workspace, .{});
+                const proposed = try encoder.selectProvablySmall(
+                    tokens[0..len],
+                    bytes,
+                    @intCast(offset),
+                );
+                if (proposed) |choice| {
+                    skipped += 1;
+                    try std.testing.expectEqual(
+                        @as(u64, @intCast(len + 1)),
+                        encoder.stats.work_units,
+                    );
+                    try encoder.reset(workspace, .{});
+                    const complete = try encoder.select(tokens[0..len], bytes, @intCast(offset));
+                    try std.testing.expectEqual(complete.kind, choice.kind);
+                    try std.testing.expectEqual(complete.bits, choice.bits);
+                    try encoder.reset(workspace, .{ .limits = .{ .work_units = len } });
+                    try std.testing.expectError(
+                        error.LimitExceeded,
+                        encoder.selectProvablySmall(tokens[0..len], bytes, @intCast(offset)),
+                    );
+                    try std.testing.expectEqual(@as(u64, 0), encoder.stats.work_units);
+                    try encoder.reset(workspace, .{ .limits = .{ .work_units = len + 1 } });
+                    const exact = (try encoder.selectProvablySmall(
+                        tokens[0..len],
+                        bytes,
+                        @intCast(offset),
+                    )).?;
+                    try std.testing.expectEqual(choice.kind, exact.kind);
+                    try std.testing.expectEqual(choice.bits, exact.bits);
+                }
+                checked += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 31248), checked);
+    try std.testing.expect(skipped > 1000);
+}
+
+test "small block bound falls back for six through eight tokens" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var encoder: Encoder = undefined;
+    const alphabet = [_]Token{
+        .{ .length = 0, .value = 0 },
+        .{ .length = 0, .value = 127 },
+        .{ .length = 0, .value = 144 },
+        .{ .length = 0, .value = 255 },
+        .{ .length = 3, .value = 1 },
+        .{ .length = 10, .value = 4 },
+        .{ .length = 11, .value = 5 },
+        .{ .length = 258, .value = 32768 },
+    };
+    var random: std.Random.DefaultPrng = .init(0xd3f1a7e);
+    for (6..9) |len| {
+        for (0..3000) |case| {
+            var tokens: [8]Token = undefined;
+            var bytes: usize = 0;
+            for (tokens[0..len]) |*token| {
+                token.* = alphabet[
+                    if (case < alphabet.len) case else random.random().uintLessThan(
+                        usize,
+                        alphabet.len,
+                    )
+                ];
+                bytes += @max(1, token.length);
+            }
+            for (0..8) |offset| {
+                try encoder.reset(workspace, .{});
+                try std.testing.expectEqual(
+                    null,
+                    try encoder.selectProvablySmall(tokens[0..len], bytes, @intCast(offset)),
+                );
+            }
+        }
+    }
+}
+
+test "small block bound accepts equality without changing fixed selection" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    const tokens = [_]Token{
+        .{ .length = 0, .value = 0 },
+        .{ .length = 3, .value = 1 },
+        .{ .length = 3, .value = 1 },
+        .{ .length = 3, .value = 1 },
+    };
+    for (0..8) |offset| {
+        try encoder.reset(workspace, .{});
+        const chosen = (try encoder.selectProvablySmall(&tokens, 10, @intCast(offset))).?;
+        try std.testing.expectEqual(Kind.fixed, chosen.kind);
+        // Independent bound: 44 header + (2*5-3) literal/length + 3 distance bits.
+        try std.testing.expectEqual(@as(u32, 54), chosen.bits);
+        try encoder.reset(workspace, .{});
+        const complete = try encoder.select(&tokens, 10, @intCast(offset));
+        try std.testing.expectEqual(complete.kind, chosen.kind);
+        try std.testing.expectEqual(complete.bits, chosen.bits);
+    }
+}
+
+test "small block proof preserves bounded work and overflow state" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var encoder: Encoder = undefined;
+    const tokens = [_]Token{.{ .length = 0, .value = 42 }};
+    try encoder.reset(workspace, .{});
+    encoder.stats.work_units = std.math.maxInt(u64) - 1;
+    try std.testing.expectError(error.LimitExceeded, encoder.selectProvablySmall(&tokens, 1, 0));
+    try std.testing.expectEqual(std.math.maxInt(u64) - 1, encoder.stats.work_units);
+    try encoder.reset(workspace, .{});
+    encoder.stats.work_units = std.math.maxInt(u64) - 2;
+    const selected = (try encoder.selectProvablySmall(&tokens, 1, 0)).?;
+    try std.testing.expectEqual(Kind.fixed, selected.kind);
+    try std.testing.expectEqual(std.math.maxInt(u64), encoder.stats.work_units);
+
+    try encoder.reset(workspace, .{ .compression = .{ .strategy = .huffman_only } });
+    encoder.stats.fixed_blocks = std.math.maxInt(u64);
+    var output: [32]u8 = @splat(0xa5);
+    try std.testing.expectError(error.CounterOverflow, encoder.step(&.{42}, &output, .finish));
+    try std.testing.expectEqual(std.math.maxInt(u64), encoder.stats.fixed_blocks);
+    try std.testing.expectEqual(@as(u64, 0), encoder.stats.blocks);
+    try std.testing.expectEqual(@as(usize, 0), encoder.pending);
+    try std.testing.expectEqual(@as(u6, 3), encoder.bit_count);
+    try std.testing.expectEqual(@as(u64, 3), encoder.bits);
+    for (output) |value| try std.testing.expectEqual(@as(u8, 0xa5), value);
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, &output, .finish));
+}
+
+test "sparse small-block bound agrees with full dynamic selection" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var encoder: Encoder = undefined;
+    var random: std.Random.DefaultPrng = .init(0xa195e42);
+    const alphabet = [_]Token{
+        .{ .length = 0, .value = 0 },
+        .{ .length = 0, .value = 43 },
+        .{ .length = 0, .value = 90 },
+        .{ .length = 0, .value = 137 },
+        .{ .length = 0, .value = 184 },
+        .{ .length = 0, .value = 255 },
+        .{ .length = 3, .value = 1 },
+        .{ .length = 10, .value = 4 },
+        .{ .length = 11, .value = 5 },
+        .{ .length = 258, .value = 32768 },
+    };
+    var shortcuts: usize = 0;
+    for (6..33) |len| {
+        for (0..120) |case| {
+            var tokens: [32]Token = undefined;
+            var bytes: usize = 0;
+            for (tokens[0..len]) |*token| {
+                token.* = if (case % 3 == 0) .{
+                    .length = 0,
+                    .value = random.random().int(u8),
+                } else alphabet[random.random().uintLessThan(usize, alphabet.len)];
+                bytes += @max(1, token.length);
+            }
+            for (0..8) |offset| {
+                const proof = Encoder.smallHuffmanBound(
+                    tokens[0..len],
+                    bytes,
+                    @intCast(offset),
+                ) orelse continue;
+                try encoder.reset(workspace, .{});
+                const complete = try encoder.select(tokens[0..len], bytes, @intCast(offset));
+                try std.testing.expect(proof.lower <= complete.dynamic_bits);
+                if (proof.best.bits <= proof.lower) {
+                    shortcuts += 1;
+                    try std.testing.expectEqual(complete.kind, proof.best.kind);
+                    try std.testing.expectEqual(complete.bits, proof.best.bits);
+                }
+            }
+        }
+    }
+    try std.testing.expect(shortcuts > 100);
+}
+
+test "sparse bound covers run boundaries and repeated symbols" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    const values = [_]u8{ 0, 1, 5, 6, 9, 10, 11, 137, 138, 139, 143, 144, 254, 255 };
+    for (values) |value| {
+        for (6..33) |len| {
+            var tokens: [32]Token = undefined;
+            for (tokens[0..len]) |*token| token.* = .{ .length = 0, .value = value };
+            for (0..8) |offset| {
+                const proof = Encoder.smallHuffmanBound(
+                    tokens[0..len],
+                    len,
+                    @intCast(offset),
+                ) orelse continue;
+                try encoder.reset(workspace, .{});
+                const full = try encoder.select(tokens[0..len], len, @intCast(offset));
+                try std.testing.expect(proof.lower <= full.dynamic_bits);
+                if (proof.best.bits <= proof.lower) {
+                    try std.testing.expectEqual(full.kind, proof.best.kind);
+                    try std.testing.expectEqual(full.bits, proof.best.bits);
+                }
+            }
+        }
+    }
+}
+
+test "sparse bound handles strict, equal and rejected selection" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    const cases = [_]struct {
+        bytes: []const u8,
+        relation: std.math.Order,
+    }{
+        .{
+            .bytes = &.{
+                232, 131, 200, 214, 52, 246, 4, 0, 0, 117, 183, 123, 191, 180, 100, 18, 50,
+            },
+            .relation = .lt,
+        },
+        .{
+            .bytes = &.{
+                0, 0,   0,   22, 6,   0,   229, 76,  0, 96, 146, 194, 100, 247, 101, 103, 198, 248,
+                0, 158, 248, 30, 203, 198, 198, 193, 0,
+            },
+            .relation = .eq,
+        },
+        .{
+            .bytes = &.{ 129, 116, 0, 0, 56, 0, 146, 0, 0, 0, 0, 20, 202, 113, 106, 129, 0 },
+            .relation = .gt,
+        },
+    };
+    for (cases) |case| {
+        var tokens: [32]Token = undefined;
+        for (case.bytes, 0..) |byte, i| tokens[i] = .{ .length = 0, .value = byte };
+        for (0..8) |offset| {
+            const proof = Encoder.smallHuffmanBound(
+                tokens[0..case.bytes.len],
+                case.bytes.len,
+                @intCast(offset),
+            ).?;
+            try std.testing.expectEqual(
+                case.relation,
+                std.math.order(proof.best.bits, proof.lower),
+            );
+            try encoder.reset(workspace, .{});
+            const full = try encoder.select(
+                tokens[0..case.bytes.len],
+                case.bytes.len,
+                @intCast(offset),
+            );
+            try std.testing.expect(proof.lower <= full.dynamic_bits);
+            if (case.relation != .gt) {
+                try std.testing.expectEqual(full.kind, proof.best.kind);
+                try std.testing.expectEqual(full.bits, proof.best.bits);
+            }
+        }
+    }
+}
+
+test "sparse bound covers a repeat crossing the book boundary" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    const tokens = [_]Token{
+        .{ .length = 0, .value = 166 },
+        .{ .length = 241, .value = 6 },
+        .{ .length = 0, .value = 65 },
+        .{ .length = 59, .value = 3 },
+        .{ .length = 251, .value = 22 },
+        .{ .length = 0, .value = 99 },
+        .{ .length = 0, .value = 56 },
+        .{ .length = 207, .value = 28 },
+        .{ .length = 0, .value = 19 },
+        .{ .length = 0, .value = 119 },
+        .{ .length = 250, .value = 22 },
+        .{ .length = 136, .value = 28 },
+        .{ .length = 62, .value = 7 },
+        .{ .length = 0, .value = 165 },
+        .{ .length = 121, .value = 1 },
+        .{ .length = 86, .value = 22 },
+        .{ .length = 0, .value = 124 },
+        .{ .length = 161, .value = 30 },
+        .{ .length = 0, .value = 44 },
+        .{ .length = 130, .value = 15 },
+        .{ .length = 0, .value = 98 },
+        .{ .length = 215, .value = 3 },
+        .{ .length = 82, .value = 29 },
+        .{ .length = 188, .value = 25 },
+        .{ .length = 0, .value = 163 },
+        .{ .length = 181, .value = 26 },
+        .{ .length = 0, .value = 239 },
+        .{ .length = 0, .value = 61 },
+        .{ .length = 0, .value = 200 },
+        .{ .length = 0, .value = 103 },
+        .{ .length = 149, .value = 7 },
+        .{ .length = 91, .value = 17 },
+    };
+    var bytes: usize = 0;
+    for (tokens) |token| bytes += @max(1, token.length);
+    try encoder.reset(workspace, .{});
+    const full = try encoder.select(&tokens, bytes, 0);
+    const proof = Encoder.smallHuffmanBound(&tokens, bytes, 0).?;
+    try std.testing.expect(proof.lower <= full.dynamic_bits);
+    var position: usize = 0;
+    var crossing = false;
+    for (workspace.header.runs[0..workspace.header.run_count]) |run| {
+        const count: usize = switch (run.symbol) {
+            16, 17 => 3 + @as(usize, run.extra),
+            18 => 11 + @as(usize, run.extra),
+            else => 1,
+        };
+        crossing = crossing or (run.symbol == 16 and position < workspace.header.literal_count and
+            position + count > workspace.header.literal_count);
+        position += count;
+    }
+    try std.testing.expect(crossing);
+}
+
+test "sparse shortcut preserves work overflow and reset behavior" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    const bytes = [_]u8{
+        232, 131, 200, 214, 52, 246, 4, 0, 0, 117, 183, 123, 191, 180, 100, 18, 50,
+    };
+    var output: [128]u8 = undefined;
+    try encoder.reset(workspace, .{ .compression = .{ .strategy = .huffman_only } });
+    encoder.stats.work_units = std.math.maxInt(u64) - @as(u64, bytes.len);
+    try std.testing.expectError(error.LimitExceeded, encoder.step(&bytes, &output, .finish));
+    try std.testing.expectEqual(
+        std.math.maxInt(u64) - @as(u64, bytes.len),
+        encoder.stats.work_units,
+    );
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, &output, .finish));
+    try encoder.reset(workspace, .{ .compression = .{ .strategy = .huffman_only } });
+    encoder.stats.work_units = std.math.maxInt(u64) - @as(u64, bytes.len) - 1;
+    const result = try encoder.step(&bytes, &output, .finish);
+    try std.testing.expectEqual(EncodeStatus.complete, result.status);
+    try std.testing.expectEqual(std.math.maxInt(u64), encoder.stats.work_units);
+}
+
+test "small Huffman histogram agrees with independent merging" {
+    const Oracle = struct {
+        fn cost(input: []const u32) u32 {
+            var weights: [65]u32 = undefined;
+            var n: usize = 0;
+            var total: u32 = 0;
+            for (input) |weight| if (weight != 0) {
+                weights[n] = weight;
+                n += 1;
+                total += weight;
+            };
+            if (n <= 1) return total;
+            var result: u32 = 0;
+            while (n > 1) : (n -= 1) {
+                var low: usize = 0;
+                for (1..n) |i| if (weights[i] < weights[low]) {
+                    low = i;
+                };
+                const first = weights[low];
+                weights[low] = weights[n - 1];
+                low = 0;
+                for (1..n - 1) |i| if (weights[i] < weights[low]) {
+                    low = i;
+                };
+                weights[low] += first;
+                result += weights[low];
+            }
+            return result;
+        }
+    };
+    var random: std.Random.DefaultPrng = .init(0x6c51e);
+    var weights: [65]u32 = @splat(0);
+    try std.testing.expectEqual(@as(u32, 0), Encoder.smallHuffmanCost(&weights));
+    for (1..66) |total| {
+        for (1..66) |symbols| {
+            for (0..10) |_| {
+                @memset(&weights, 0);
+                for (0..total) |_| weights[random.random().uintLessThan(usize, symbols)] += 1;
+                try std.testing.expectEqual(
+                    Oracle.cost(&weights),
+                    Encoder.smallHuffmanCost(&weights),
+                );
+            }
+        }
+    }
+    @memset(&weights, 1);
+    try std.testing.expectEqual(Oracle.cost(&weights), Encoder.smallHuffmanCost(&weights));
+    @memset(&weights, 0);
+    weights[0] = 65;
+    try std.testing.expectEqual(@as(u32, 65), Encoder.smallHuffmanCost(&weights));
+}
+
+test "sparse bound covers 33 through 64 tokens" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    var random: std.Random.DefaultPrng = .init(0x6d15ca);
+    var shortcuts: usize = 0;
+    for (33..65) |len| {
+        for (0..100) |_| {
+            var tokens: [64]Token = undefined;
+            var bytes: usize = 0;
+            for (tokens[0..len]) |*token| {
+                token.* = if (random.random().boolean()) .{
+                    .length = 0,
+                    .value = random.random().int(u8),
+                } else .{
+                    .length = random.random().intRangeAtMost(u16, 3, 258),
+                    .value = random.random().intRangeAtMost(u16, 1, 32768),
+                };
+                bytes += @max(1, token.length);
+            }
+            for (0..8) |offset| {
+                const proof = Encoder.smallHuffmanBound(
+                    tokens[0..len],
+                    bytes,
+                    @intCast(offset),
+                ) orelse continue;
+                try encoder.reset(workspace, .{});
+                const full = try encoder.select(tokens[0..len], bytes, @intCast(offset));
+                try std.testing.expect(proof.lower <= full.dynamic_bits);
+                if (proof.best.bits <= proof.lower) {
+                    shortcuts += 1;
+                    try std.testing.expectEqual(full.kind, proof.best.kind);
+                    try std.testing.expectEqual(full.bits, proof.best.bits);
+                }
+            }
+        }
+    }
+    try std.testing.expect(shortcuts > 100);
+}
+
+test "distance bound proves the 8 by 8 fixed block" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    const tokens = [_]Token{
+        .{ .length = 0, .value = 1 },
+        .{ .length = 0, .value = 43 },
+        .{ .length = 0, .value = 90 },
+        .{ .length = 0, .value = 137 },
+        .{ .length = 0, .value = 184 },
+        .{ .length = 0, .value = 23 },
+        .{ .length = 27, .value = 1 },
+        .{ .length = 0, .value = 4 },
+        .{ .length = 0, .value = 49 },
+        .{ .length = 3, .value = 1 },
+        .{ .length = 15, .value = 20 },
+        .{ .length = 0, .value = 49 },
+        .{ .length = 12, .value = 7 },
+        .{ .length = 0, .value = 1 },
+        .{ .length = 0, .value = 141 },
+        .{ .length = 0, .value = 188 },
+        .{ .length = 0, .value = 235 },
+        .{ .length = 0, .value = 26 },
+        .{ .length = 28, .value = 66 },
+        .{ .length = 0, .value = 1 },
+        .{ .length = 0, .value = 190 },
+        .{ .length = 0, .value = 237 },
+        .{ .length = 0, .value = 28 },
+        .{ .length = 0, .value = 75 },
+        .{ .length = 29, .value = 33 },
+        .{ .length = 0, .value = 239 },
+        .{ .length = 0, .value = 30 },
+        .{ .length = 0, .value = 77 },
+        .{ .length = 0, .value = 124 },
+        .{ .length = 33, .value = 132 },
+        .{ .length = 0, .value = 49 },
+        .{ .length = 22, .value = 28 },
+        .{ .length = 0, .value = 49 },
+        .{ .length = 38, .value = 165 },
+        .{ .length = 0, .value = 130 },
+        .{ .length = 0, .value = 177 },
+        .{ .length = 0, .value = 224 },
+        .{ .length = 0, .value = 15 },
+        .{ .length = 28, .value = 99 },
+    };
+    const proof = Encoder.smallHuffmanBound(&tokens, 264, 0).?;
+    try std.testing.expectEqual(Kind.fixed, proof.best.kind);
+    try std.testing.expectEqual(@as(u32, 420), proof.best.bits);
+    try std.testing.expect(proof.lower >= proof.best.bits);
+    try encoder.reset(workspace, .{});
+    const full = try encoder.select(&tokens, 264, 0);
+    try std.testing.expect(proof.lower <= full.dynamic_bits);
+    try std.testing.expectEqual(proof.best.kind, full.kind);
+    try std.testing.expectEqual(proof.best.bits, full.bits);
+}
+
+test "wide sparse shortcut respects work overflow and reset" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    var bytes: [40]u8 = undefined;
+    var tokens: [40]Token = undefined;
+    for (&bytes, 0..) |*byte, i| {
+        byte.* = @intCast(i * 6);
+        tokens[i] = .{ .length = 0, .value = byte.* };
+    }
+    const proof = Encoder.smallHuffmanBound(&tokens, bytes.len, 0).?;
+    try std.testing.expect(proof.best.bits <= proof.lower);
+    var output: [512]u8 = undefined;
+    try encoder.reset(workspace, .{ .compression = .{ .strategy = .huffman_only } });
+    encoder.stats.work_units = std.math.maxInt(u64) - @as(u64, bytes.len);
+    try std.testing.expectError(error.LimitExceeded, encoder.step(&bytes, &output, .finish));
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, &output, .finish));
+    try encoder.reset(workspace, .{ .compression = .{ .strategy = .huffman_only } });
+    encoder.stats.work_units = std.math.maxInt(u64) - @as(u64, bytes.len) - 1;
+    const result = try encoder.step(&bytes, &output, .finish);
+    try std.testing.expectEqual(EncodeStatus.complete, result.status);
+    try std.testing.expectEqual(std.math.maxInt(u64), encoder.stats.work_units);
+}
+
+test "wide bound covers all distance slots and 65 literal symbols" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    var tokens: [64]Token = undefined;
+    for (0..2) |mode| {
+        var bytes: usize = 0;
+        for (&tokens, 0..) |*token, i| {
+            token.* = if (mode == 0 and i < 30) .{
+                .length = 3,
+                .value = distance_base[i],
+            } else .{ .length = 0, .value = @intCast(i * 3) };
+            bytes += @max(1, token.length);
+        }
+        for (0..8) |offset| {
+            const proof = Encoder.smallHuffmanBound(&tokens, bytes, @intCast(offset)).?;
+            try encoder.reset(workspace, .{});
+            const full = try encoder.select(&tokens, bytes, @intCast(offset));
+            try std.testing.expect(proof.lower <= full.dynamic_bits);
+            if (proof.best.bits <= proof.lower) {
+                try std.testing.expectEqual(full.kind, proof.best.kind);
+                try std.testing.expectEqual(full.bits, proof.best.bits);
+            }
+        }
+    }
+}
+
+test "wide proof preflight leaves concentrated blocks to ordinary selection" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    var tokens: [64]Token = undefined;
+    for ([_]usize{ 32, 33, 64 }) |len| {
+        for ([_]usize{ 15, 16, 17 }) |literal_symbols| {
+            for (
+                tokens[0..len],
+                0..,
+            ) |*token, i| token.* = .{ .length = 0, .value = @intCast(i % literal_symbols) };
+            const proof = Encoder.smallHuffmanBound(tokens[0..len], len, 0);
+            if (len > 32 and literal_symbols <= 16) {
+                try std.testing.expect(proof == null);
+            } else {
+                const bound = proof.?;
+                try encoder.reset(workspace, .{});
+                const full = try encoder.select(tokens[0..len], len, 0);
+                try std.testing.expect(bound.lower <= full.dynamic_bits);
+            }
+        }
+    }
+}
+
+test "wide preflight counts symbol extremes" {
+    var tokens: [64]Token = @splat(.{ .length = 0, .value = 0 });
+    for ([_]usize{ 32, 33, 64 }) |len| {
+        for ([_]usize{ 12, 13 }) |interior| {
+            @memset(&tokens, .{ .length = 0, .value = 0 });
+            tokens[1] = .{ .length = 0, .value = 255 };
+            tokens[2] = .{ .length = 3, .value = 1 };
+            tokens[3] = .{ .length = 258, .value = 1 };
+            for (0..interior) |i| tokens[i + 4] = .{ .length = 0, .value = @intCast(i + 1) };
+            var bytes: usize = 0;
+            for (tokens[0..len]) |token| bytes += @max(1, token.length);
+            // With EOB, 0, 255, length codes 257/285, and 12 or 13 interior literals, the alphabet
+            // has 17 or 18 symbols.
+            const proof = Encoder.smallHuffmanBound(tokens[0..len], bytes, 0);
+            try std.testing.expectEqual(len <= 32 or interior == 13, proof != null);
+        }
+    }
+}
+
+test "wide preflight fallback keeps complete selection work limits" {
+    const workspace = try EncoderWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var encoder: Encoder = undefined;
+    var bytes: [40]u8 = undefined;
+    var tokens: [40]Token = undefined;
+    for (&bytes, 0..) |*byte, i| {
+        byte.* = @intCast(i % 4);
+        tokens[i] = .{ .length = 0, .value = byte.* };
+    }
+    try std.testing.expect(Encoder.smallHuffmanBound(&tokens, bytes.len, 0) == null);
+    try encoder.reset(workspace, .{});
+    _ = try encoder.select(&tokens, bytes.len, 0);
+    const work = encoder.stats.work_units;
+    try std.testing.expect(work > 0);
+    var output: [512]u8 = undefined;
+    try encoder.reset(
+        workspace,
+        .{ .compression = .{ .strategy = .huffman_only }, .limits = .{ .work_units = work - 1 } },
+    );
+    try std.testing.expectError(error.LimitExceeded, encoder.step(&bytes, &output, .finish));
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, &output, .finish));
+    try encoder.reset(
+        workspace,
+        .{ .compression = .{ .strategy = .huffman_only }, .limits = .{ .work_units = work } },
+    );
+    const result = try encoder.step(&bytes, &output, .finish);
+    try std.testing.expectEqual(EncodeStatus.complete, result.status);
+    try std.testing.expectEqual(work, encoder.stats.work_units);
+}
+
+test "four-byte run strategy produces a readable stream" {
+    const decoding = @import("decode.zig");
+    const allocator = std.testing.allocator;
+    const encoder = try EncoderWorkspace.create(allocator);
+    defer encoder.destroy(allocator);
+    const decoder = try decoding.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+    const input = "aabb aabb aabb aabb !@#$ !@#$ !@#$ !@#$";
+    var output: [256]u8 = undefined;
+    var restored: [input.len]u8 = undefined;
+    const wire = try encode(
+        input,
+        &output,
+        encoder,
+        .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } },
+    );
+    const result = try decoding.decode(
+        wire,
+        &restored,
+        .{ .workspace = decoder },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(input.len, result.produced);
+    try std.testing.expectEqualSlices(u8, input, &restored);
+}
+
+test "four-byte run probe overflow preserves admitted work" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var encoder: Encoder = undefined;
+    var input: [8192]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @intCast((i * 7 + i / 7) % 16);
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } });
+    @memcpy(workspace.data[0..input.len], &input);
+    encoder.buffered = input.len;
+    var book_work: u64 = 0;
+    var book_probes: u64 = 0;
+    _ = try encoder.sampleRunBook(false, &book_work, &book_probes);
+    const sample_work = 256 + book_work;
+    const sample_probes = 255 + book_probes;
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } });
+    encoder.stats.match_probes = std.math.maxInt(u64) - sample_probes;
+    var output: [16384]u8 = @splat(0xa5);
+    try std.testing.expectError(error.CounterOverflow, encoder.step(&input, &output, .finish));
+    try std.testing.expectEqual(std.math.maxInt(u64), encoder.stats.match_probes);
+    try std.testing.expectEqual(sample_work + 32, encoder.stats.work_units);
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, &output, .finish));
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } });
+    encoder.stats.work_units = std.math.maxInt(u64) - (sample_work + 31);
+    try std.testing.expectError(error.LimitExceeded, encoder.step(&input, &output, .finish));
+    try std.testing.expectEqual(std.math.maxInt(u64) - 31, encoder.stats.work_units);
+    try std.testing.expectEqual(sample_probes, encoder.stats.match_probes);
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, &output, .finish));
+}
+
+test "four-byte run preflight overflow preserves admitted work" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var encoder: Encoder = undefined;
+    var input: [8192]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @intCast(100 + (i * 37 + i / 13) % 100);
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } });
+    @memcpy(workspace.data[0..input.len], &input);
+    encoder.buffered = input.len;
+    var book_work: u64 = 0;
+    var book_probes: u64 = 0;
+    _ = try encoder.sampleRunBook(false, &book_work, &book_probes);
+    const sample_work = 256 + book_work;
+    const sample_probes = 255 + book_probes;
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } });
+    encoder.stats.match_probes = std.math.maxInt(u64) - sample_probes;
+    var output: [16384]u8 = @splat(0xa5);
+    try std.testing.expectError(error.CounterOverflow, encoder.step(&input, &output, .finish));
+    try std.testing.expectEqual(std.math.maxInt(u64), encoder.stats.match_probes);
+    try std.testing.expectEqual(sample_work + 32, encoder.stats.work_units);
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, &output, .finish));
+    try encoder.reset(workspace, .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } });
+    encoder.stats.work_units = std.math.maxInt(u64) - (sample_work + 31);
+    try std.testing.expectError(error.LimitExceeded, encoder.step(&input, &output, .finish));
+    try std.testing.expectEqual(std.math.maxInt(u64) - 31, encoder.stats.work_units);
+    try std.testing.expectEqual(sample_probes, encoder.stats.match_probes);
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, &output, .finish));
+}
+
+test "four-byte run stream round trips on target" {
+    const decoding = @import("decode.zig");
+    const allocator = std.testing.allocator;
+    const encoder = try EncoderWorkspace.create(allocator);
+    defer encoder.destroy(allocator);
+    const decoder = try decoding.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+    const input = try allocator.alloc(u8, 16384);
+    defer allocator.free(input);
+    const output = try allocator.alloc(u8, 32768);
+    defer allocator.free(output);
+    const restored = try allocator.alloc(u8, input.len);
+    defer allocator.free(restored);
+    for (input, 0..) |*byte, i| {
+        byte.* = if (i % 67 < 20) 0 else @intCast(100 + (i * 37 + i / 13) % 100);
+    }
+    const wire = try encode(
+        input,
+        output,
+        encoder,
+        .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } },
+    );
+    const result = try decoding.decode(
+        wire,
+        restored,
+        .{ .workspace = decoder },
+        .{ .output_size = .exact, .trailing_data = .reject },
+    );
+    try std.testing.expectEqual(input.len, result.produced);
+    try std.testing.expectEqualSlices(u8, input, restored);
+}
+
+test "four-byte run short blocks preserve every starting bit offset" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var encoder: Encoder = undefined;
+    for (0..36) |length| {
+        for (0..8) |offset| {
+            for ([_]bool{ false, true }) |final| {
+                try encoder.reset(
+                    workspace,
+                    .{ .compression = .{ .level = 6, .strategy = .four_byte_runs } },
+                );
+                for (workspace.data[0..length], 0..) |*byte, i| byte.* = @truncate(i * 73 + 19);
+                encoder.buffered = length;
+                encoder.bit_count = @intCast(offset);
+                encoder.bits = (@as(u64, 1) << @intCast(offset)) - 1;
+                try encoder.compressedBlock(final);
+                const prefix_len = (offset + 3 + 7) / 8;
+                const prefix = ((@as(
+                    u64,
+                    1,
+                ) << @intCast(offset)) - 1) | (@as(u64, @intFromBool(final)) << @intCast(offset));
+                for (0..prefix_len) |i| {
+                    try std.testing.expectEqual(
+                        @as(u8, @truncate(prefix >> @intCast(8 * i))),
+                        workspace.wire[i],
+                    );
+                }
+                const body = workspace.wire[prefix_len..encoder.pending];
+                try std.testing.expectEqual(length + 4, body.len);
+                try std.testing.expectEqual(
+                    @as(u16, @intCast(length)),
+                    std.mem.readInt(u16, body[0..2], .little),
+                );
+                try std.testing.expectEqual(
+                    ~@as(u16, @intCast(length)),
+                    std.mem.readInt(u16, body[2..4], .little),
+                );
+                try std.testing.expectEqualSlices(u8, workspace.data[0..length], body[4..]);
+                try std.testing.expectEqual(@as(u64, 0), encoder.stats.work_units);
+                try std.testing.expectEqual(@as(u64, 0), encoder.stats.match_probes);
+            }
+        }
+    }
+}
+
+test "copied run header matches independent bit serialization" {
+    const Reference = struct {
+        bytes: [128]u8 = @splat(0),
+        count: usize = 0,
+        fn append(self: *@This(), value: usize, width: usize) void {
+            for (0..width) |i| {
+                const bit: u8 = @intCast((value >> @as(std.math.Log2Int(usize), @intCast(i))) & 1);
+                self.bytes[self.count / 8] |= bit << @as(u3, @intCast(self.count % 8));
+                self.count += 1;
+            }
+        }
+    };
+    for (run_books) |book| {
+        for ([_]bool{ false, true }) |final| {
+            var expected: Reference = .{};
+            expected.append(@intFromBool(final), 1);
+            expected.append(2, 2);
+            expected.append(book.header.literal_count - 257, 5);
+            expected.append(book.header.distance_count - 1, 5);
+            expected.append(book.header.precode_count - 4, 4);
+            for (precode_order[0..book.header.precode_count]) |symbol| {
+                expected.append(book.header.precode.widths[symbol], 3);
+            }
+            for (book.header.runs[0..book.header.run_count]) |run| {
+                expected.append(
+                    book.header.precode.codes[run.symbol],
+                    book.header.precode.widths[run.symbol],
+                );
+                expected.append(run.extra, runExtra(run.symbol));
+            }
+            try std.testing.expectEqual(@as(usize, (3 + book.header.bits)), expected.count);
+            var actual = book.header_wire;
+            actual[0] |= @intFromBool(final);
+            try std.testing.expectEqual(expected.count % 8, book.header_count);
+            try std.testing.expectEqualSlices(
+                u8,
+                expected.bytes[0..book.header_bytes],
+                actual[0..book.header_bytes],
+            );
+            try std.testing.expectEqual(
+                @as(u64, expected.bytes[book.header_bytes]),
+                book.header_tail,
+            );
+        }
+    }
+}
+
+test "run header widths and accounting agree" {
+    for (run_books) |book| {
+        var expanded: [290]u8 = undefined;
+        var position: usize = 0;
+        var bits: u32 = 14 + @as(u32, @intCast(book.header.precode_count)) * 3;
+        for (book.header.runs[0..book.header.run_count]) |run| {
+            bits += @as(u32, book.header.precode.widths[run.symbol]) + runExtra(run.symbol);
+            if (run.symbol <= 15) {
+                expanded[position] = run.symbol;
+                position += 1;
+            } else {
+                try std.testing.expectEqual(@as(u8, 16), run.symbol);
+                try std.testing.expect(position > 0);
+                const repeat = @as(usize, run.extra) + 3;
+                @memset(expanded[position..][0..repeat], expanded[position - 1]);
+                position += repeat;
+            }
+        }
+        try std.testing.expectEqual(expanded.len, position);
+        try std.testing.expectEqualSlices(u8, &book.header.literal.widths, expanded[0..286]);
+        try std.testing.expectEqualSlices(
+            u8,
+            book.header.distance.widths[0..4],
+            expanded[286..290],
+        );
+        try std.testing.expectEqual(book.header.bits, bits);
+        var literal_kraft: u32 = 0;
+        for (book.header.literal.widths) |width| {
+            try std.testing.expect(width > 0 and width <= 14);
+            literal_kraft += @as(u32, 1) << @as(u5, @intCast(14 - width));
+        }
+        try std.testing.expectEqual(@as(u32, 1 << 14), literal_kraft);
+        var precode_kraft: u32 = 0;
+        for (book.header.precode.widths[0..19]) |width| if (width != 0) {
+            try std.testing.expect(width <= 7);
+            precode_kraft += @as(u32, 1) << @as(u5, @intCast(7 - width));
+        };
+        try std.testing.expectEqual(@as(u32, 1 << 7), precode_kraft);
+    }
+}
+
+test "prepacked run matches preserve every length and bit offset" {
+    for (3..259) |length| {
+        for (0..32) |initial_count| {
+            var expected_wire: [16]u8 = @splat(0xa5);
+            var actual_wire = expected_wire;
+            const initial_bits = (@as(u64, 1) << @intCast(initial_count)) - 1;
+            var expected: RunBitWriter = .{
+                .book = &run_book,
+                .wire = &expected_wire,
+                .bits = initial_bits,
+                .count = @intCast(initial_count),
+                .pending = 0,
+            };
+            var actual: RunBitWriter = .{
+                .book = &run_book,
+                .wire = &actual_wire,
+                .bits = initial_bits,
+                .count = @intCast(initial_count),
+                .pending = 0,
+            };
+            const slot = lengthSlot(length);
+            expected.symbol(&run_book.header.literal, 257 + @as(usize, slot));
+            expected.put(length - length_base[slot], @intCast(length_extra[slot]));
+            expected.symbol(&run_book.header.distance, 3);
+            const token = run_book.match_tokens[length];
+            actual.put(token & 0x00ffffff, @intCast(token >> 24));
+            try std.testing.expectEqual(expected.pending, actual.pending);
+            try std.testing.expectEqual(expected.bits, actual.bits);
+            try std.testing.expectEqual(expected.count, actual.count);
+            try std.testing.expectEqualSlices(u8, &expected_wire, &actual_wire);
+        }
+    }
+}
+
+test "four run literals preserve bits and staging guards" {
+    const book = &run_book.header.literal;
+    // Every distinct literal width, including the shortest and longest codes.
+    const representatives = [_]u8{ 0, 1, 2, 253, 3, 4, 6, 8, 11, 16, 24, 32, 43 };
+    for (0..8) |count| {
+        const initial = (@as(u64, 1) << @intCast(count)) - 1;
+        for (0..8) |alignment| {
+            for (
+                representatives,
+            ) |a| for (representatives) |b| for (representatives) |c| for (representatives) |d| {
+                const values = [4]u8{ a, b, c, d };
+                var expected_bytes: [24]u8 = @splat(0xa5);
+                var actual_bytes: [24]u8 = @splat(0xa5);
+                var expected: RunBitWriter = .{
+                    .book = &run_book,
+                    .wire = expected_bytes[alignment..],
+                    .bits = initial,
+                    .count = @intCast(count),
+                    .pending = 0,
+                };
+                var actual: RunBitWriter = .{
+                    .book = &run_book,
+                    .wire = actual_bytes[alignment..],
+                    .bits = initial,
+                    .count = @intCast(count),
+                    .pending = 0,
+                };
+                for (values) |value| expected.symbol(book, value);
+                expected.flush();
+                actual.symbolQuad(&values);
+                try std.testing.expectEqual(expected.bits, actual.bits);
+                try std.testing.expectEqual(expected.count, actual.count);
+                try std.testing.expectEqual(expected.pending, actual.pending);
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected.wire[0..expected.pending],
+                    actual.wire[0..actual.pending],
+                );
+                for (
+                    actual_bytes[0..alignment],
+                ) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+                for (
+                    actual_bytes[alignment + 8 ..],
+                ) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+            };
+        }
+    }
+}
+
+test "four run literals satisfy the stored bound for every code width" {
+    const book = &run_book.header.literal;
+    for (book.widths[0..256]) |width| try std.testing.expect(width <= 14);
+    const representatives = [_]u8{ 0, 1, 2, 253, 3, 4, 6, 8, 11, 16, 24, 32, 43 };
+    for (
+        representatives,
+    ) |a| for (representatives) |b| for (representatives) |c| for (representatives) |d| {
+        const exact = @as(usize, book.widths[a]) + book.widths[b] + book.widths[c] + book.widths[d];
+        for (0..59) |slack| {
+            const shortcut = slack > 4 * 14 or exact < slack;
+            try std.testing.expectEqual(exact < slack, shortcut);
+        }
+    };
+}
+
+test "decisive sample retains bounded decisions and logical accounting" {
+    const allocator = std.testing.allocator;
+    const fast_workspace = try EncoderWorkspace.create(allocator);
+    defer fast_workspace.destroy(allocator);
+    const checked_workspace = try EncoderWorkspace.create(allocator);
+    defer checked_workspace.destroy(allocator);
+    var fast: Encoder = undefined;
+    var checked: Encoder = undefined;
+    const targets = [_]usize{
+        0, 7, 8, 31, 32, 95, 96, 111, 112, 127, 128, 159, 160, 191, 192, 223, 224, 225, 255, 256,
+    };
+    for ([_]usize{ 0, 1, 3, 4, 8 }) |history| for (targets) |target| for (0..3) |distribution| {
+        try fast.reset(fast_workspace, .{ .compression = .{ .strategy = .four_byte_runs } });
+        try checked.reset(checked_workspace, .{ .compression = .{ .strategy = .four_byte_runs } });
+        fast.history = history;
+        checked.history = history;
+        fast.buffered = 4096;
+        checked.buffered = 4096;
+        for (
+            fast_workspace.data[0 .. history + 4096],
+            0..,
+        ) |*byte, i| byte.* = @truncate(i *% 37 +% i / 13);
+        const eligible = 256 - @as(usize, @intFromBool(history < 4));
+        const selected = @min(target, eligible);
+        var rank: usize = 0;
+        for (0..256) |i| {
+            const position = history + i * 4095 / 255;
+            if (position < 4) continue;
+            const is_match = switch (distribution) {
+                0 => rank < selected,
+                1 => rank >= eligible - selected,
+                else => (rank * 73) % eligible < selected,
+            };
+            const prior = fast_workspace.data[position - 4];
+            fast_workspace.data[position] = if (is_match) prior else prior +% 1;
+            rank += 1;
+        }
+        @memcpy(
+            checked_workspace.data[0 .. history + 4096],
+            fast_workspace.data[0 .. history + 4096],
+        );
+        var fast_units: u64 = 0;
+        var fast_probes: u64 = 0;
+        var checked_units: u64 = 0;
+        var checked_probes: u64 = 0;
+        var fast_group = false;
+        var fast_choice: RunBookChoice = .original;
+        var checked_group = false;
+        var checked_choice: RunBookChoice = .original;
+        const fast_stored = try fast.preferStoredRuns(
+            false,
+            &fast_units,
+            &fast_probes,
+            &fast_group,
+            &fast_choice,
+        );
+        const checked_stored = try checked.preferStoredRuns(
+            true,
+            &checked_units,
+            &checked_probes,
+            &checked_group,
+            &checked_choice,
+        );
+        try std.testing.expectEqual(checked_stored, fast_stored);
+        try std.testing.expectEqual(checked_group, fast_group);
+        try std.testing.expectEqual(checked_choice, fast_choice);
+        try std.testing.expectEqual(checked.stats.work_units, fast_units);
+        try std.testing.expectEqual(checked.stats.match_probes, fast_probes);
+    };
+}
+
+test "batched run groups match bounded parsing at offsets and boundaries" {
+    const allocator = std.testing.allocator;
+    const fast_workspace = try EncoderWorkspace.create(allocator);
+    defer fast_workspace.destroy(allocator);
+    const checked_workspace = try EncoderWorkspace.create(allocator);
+    defer checked_workspace.destroy(allocator);
+    var fast: Encoder = undefined;
+    var checked: Encoder = undefined;
+    const lengths = [_]usize{ 36, 37, 79, 80, 81, 112, 113, 114, 4095, 4096, 65535 };
+    for (lengths) |length| for ([_]usize{ 0, 8 }) |history| for (0..8) |offset| {
+        for (0..5) |pattern| {
+            try fast.reset(fast_workspace, .{ .compression = .{ .strategy = .four_byte_runs } });
+            try checked.reset(
+                checked_workspace,
+                .{ .compression = .{ .strategy = .four_byte_runs } },
+            );
+            for (fast_workspace.data[0 .. history + length], 0..) |*byte, i| {
+                byte.* = switch (pattern) {
+                    0 => 0,
+                    1 => @intCast(i % 4),
+                    2 => @truncate(i *% 73 +% i / 11),
+                    3 => @intCast((i / 4 + i / 23) % 8),
+                    else => @intCast(if ((i / 4) % 5 == 0) i % 4 else (i / 4) % 11),
+                };
+            }
+            @memcpy(
+                checked_workspace.data[0 .. history + length],
+                fast_workspace.data[0 .. history + length],
+            );
+            @memset(std.mem.asBytes(&fast_workspace.huffman), 0xa5);
+            @memset(std.mem.asBytes(&checked_workspace.huffman), 0xa5);
+            fast.history = history;
+            checked.history = history;
+            fast.buffered = length;
+            checked.buffered = length;
+            fast.bit_count = @intCast(offset);
+            checked.bit_count = @intCast(offset);
+            fast.bits = (@as(u64, 1) << @intCast(offset)) - 1;
+            checked.bits = fast.bits;
+            var fast_units: u64 = 0;
+            var fast_probes: u64 = 0;
+            var checked_units: u64 = 0;
+            var checked_probes: u64 = 0;
+            try fast.emitRuns(&run_book, true, false, true, &fast_units, &fast_probes);
+            try checked.emitRuns(&run_book, true, true, true, &checked_units, &checked_probes);
+            try std.testing.expectEqual(checked.stats.work_units, fast_units);
+            try std.testing.expectEqual(checked.stats.match_probes, fast_probes);
+            try std.testing.expectEqual(checked.pending, fast.pending);
+            try std.testing.expectEqual(checked.bits, fast.bits);
+            try std.testing.expectEqual(checked.bit_count, fast.bit_count);
+            try std.testing.expectEqualSlices(
+                u8,
+                checked_workspace.wire[0..checked.pending],
+                fast_workspace.wire[0..fast.pending],
+            );
+            for (
+                std.mem.asBytes(&fast_workspace.huffman),
+            ) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+        }
+    };
+}
+
+test "four-byte run staging stays inside its workspace at block boundaries" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var encoder: Encoder = undefined;
+    const lengths = [_]usize{ 35, 36, 37, 8191, 8192, slab_bytes - 1, slab_bytes };
+    for (lengths) |length| {
+        for (0..8) |offset| {
+            for (0..4) |pattern| {
+                try encoder.reset(workspace, .{ .compression = .{ .strategy = .four_byte_runs } });
+                for (workspace.data[0..length], 0..) |*byte, i| {
+                    byte.* = switch (pattern) {
+                        0 => 0,
+                        1 => @intCast(i % 4),
+                        2 => @truncate(i * 73 + i / 11),
+                        else => @intCast(100 + (i * 37 + i / 13) % 100),
+                    };
+                }
+                @memset(std.mem.asBytes(&workspace.huffman), 0xa5);
+                encoder.buffered = length;
+                encoder.bit_count = @intCast(offset);
+                encoder.bits = (@as(u64, 1) << @intCast(offset)) - 1;
+                try encoder.compressedBlock(true);
+                try std.testing.expect(encoder.pending <= length + 16);
+                try std.testing.expectEqual(@as(u64, 1), encoder.stats.blocks);
+                for (std.mem.asBytes(&workspace.huffman)) |byte| {
+                    try std.testing.expectEqual(@as(u8, 0xa5), byte);
+                }
+            }
+        }
+    }
+}
+
+test "compact run workspace matches full streaming encoder" {
+    const Helper = struct {
+        fn run(encoder: anytype, input: []const u8, output: []u8) !usize {
+            var consumed: usize = 0;
+            var written: usize = 0;
+            while (true) {
+                const end = @min(input.len, consumed + 131);
+                const action: EncodeAction = if (end == input.len) .finish else .process;
+                const progress = try encoder.step(
+                    input[consumed..end],
+                    output[written..][0..@min(79, output.len - written)],
+                    action,
+                );
+                consumed += progress.consumed;
+                written += progress.produced;
+                if (progress.status == .complete) return written;
+            }
+        }
+    };
+    const allocator = std.testing.allocator;
+    const full_workspace = try allocator.create(EncoderWorkspace);
+    defer allocator.destroy(full_workspace);
+    const compact_workspace = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(compact_workspace);
+    const data = try allocator.alloc(u8, 65536);
+    defer allocator.free(data);
+    var random: std.Random.DefaultPrng = .init(0x9f77);
+    random.random().bytes(data);
+    const a = try allocator.alloc(u8, 140000);
+    defer allocator.free(a);
+    const b = try allocator.alloc(u8, 140000);
+    defer allocator.free(b);
+    for ([_]usize{ 0, 35, 76, 4096, 65535, 65536 }) |length| {
+        for ([_]u4{ 0, 6 }) |level| {
+            for ([_]bool{ false, true }) |dictionary| {
+                const options: EncodeOptions = .{
+                    .compression = .{ .level = level, .strategy = .four_byte_runs },
+                    .dictionary = if (dictionary) "prior data history" else null,
+                };
+                var full: Encoder = undefined;
+                var compact: FourByteRunEncoder = undefined;
+                try full.reset(full_workspace, options);
+                try compact.reset(compact_workspace, options);
+                const n = try Helper.run(&full, data[0..length], a);
+                const m = try Helper.run(&compact, data[0..length], b);
+                try std.testing.expectEqualSlices(u8, a[0..n], b[0..m]);
+                try std.testing.expectEqualDeep(full.counts(), compact.counts());
+            }
+        }
+    }
+    var rejected: FourByteRunEncoder = undefined;
+    try std.testing.expectError(error.InvalidOptions, rejected.reset(compact_workspace, .{}));
+}
+
+test "long run scan matches bounded comparison at every mismatch" {
+    const allocator = std.testing.allocator;
+    const fast_workspace = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(fast_workspace);
+    const checked_workspace = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(checked_workspace);
+    for (4..12) |position| for (1..259) |length| {
+        for (0..length + 1) |mismatch| inline for (.{ false, true }) |long_runs| {
+            for (fast_workspace.data[0 .. position + length], 0..) |*byte, index| {
+                byte.* = @intCast((index % 4) * 53 + 11);
+            }
+            if (mismatch < length) fast_workspace.data[position + mismatch] ^= 0x80;
+            @memcpy(
+                checked_workspace.data[0 .. position + length],
+                fast_workspace.data[0 .. position + length],
+            );
+            var fast: FourByteRunEncoder = undefined;
+            var checked: FourByteRunEncoder = undefined;
+            const options: EncodeOptions = .{ .compression = .{ .strategy = .four_byte_runs } };
+            try fast.reset(fast_workspace, options);
+            try checked.reset(checked_workspace, options);
+            var units: u64 = 0;
+            var probes: u64 = 0;
+            const actual = try fast.runLength(
+                position,
+                position + length,
+                false,
+                long_runs,
+                &units,
+                &probes,
+            );
+            var checked_units: u64 = 0;
+            var checked_probes: u64 = 0;
+            const expected = try checked.runLength(
+                position,
+                position + length,
+                true,
+                false,
+                &checked_units,
+                &checked_probes,
+            );
+            try std.testing.expectEqual(expected, actual);
+            try std.testing.expectEqual(checked.counts().work_units, units);
+            try std.testing.expectEqual(checked.counts().match_probes, probes);
+        };
+    };
+}
+
+test "batched decisive sampling matches bounded decisions across histories" {
+    const allocator = std.testing.allocator;
+    const fast_workspace = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(fast_workspace);
+    const checked_workspace = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(checked_workspace);
+    const targets = [_]usize{
+        0, 7, 8, 31, 32, 63, 64, 95, 96, 127, 128, 159, 160, 191, 192, 223, 224, 225, 255, 256,
+    };
+    for ([_]usize{ 4096, 4097, 4128, 8192, 65535 }) |length| {
+        for ([_]usize{ 0, 1, 3, 4, 8, 32768 }) |history| {
+            const eligible = 256 - @as(usize, @intFromBool(history < 4));
+            for (targets) |target| for (0..3) |distribution| {
+                var fast: FourByteRunEncoder = undefined;
+                var checked: FourByteRunEncoder = undefined;
+                const options: EncodeOptions = .{ .compression = .{ .strategy = .four_byte_runs } };
+                try fast.reset(fast_workspace, options);
+                try checked.reset(checked_workspace, options);
+                fast.history = history;
+                checked.history = history;
+                fast.buffered = length;
+                checked.buffered = length;
+                @memset(fast_workspace.data[0 .. history + length], 0);
+                const selected = @min(target, eligible);
+                var rank: usize = 0;
+                for (0..256) |i| {
+                    const position = history + i * (length - 1) / 255;
+                    if (position < 4) continue;
+                    const matches = switch (distribution) {
+                        0 => rank < selected,
+                        1 => rank >= eligible - selected,
+                        else => (rank * 73) % eligible < selected,
+                    };
+                    fast_workspace.data[position] = if (matches) 0 else 0x80;
+                    rank += 1;
+                }
+                @memcpy(
+                    checked_workspace.data[0 .. history + length],
+                    fast_workspace.data[0 .. history + length],
+                );
+                var fast_units: u64 = 0;
+                var fast_probes: u64 = 0;
+                var checked_units: u64 = 0;
+                var checked_probes: u64 = 0;
+                var fast_group = false;
+                var fast_choice: RunBookChoice = .original;
+                var checked_group = false;
+                var checked_choice: RunBookChoice = .original;
+                const fast_stored = try fast.preferStoredRuns(
+                    false,
+                    &fast_units,
+                    &fast_probes,
+                    &fast_group,
+                    &fast_choice,
+                );
+                const checked_stored = try checked.preferStoredRuns(
+                    true,
+                    &checked_units,
+                    &checked_probes,
+                    &checked_group,
+                    &checked_choice,
+                );
+                try std.testing.expectEqual(checked_stored, fast_stored);
+                try std.testing.expectEqual(checked_group, fast_group);
+                try std.testing.expectEqual(checked_choice, fast_choice);
+                try std.testing.expectEqual(checked.counts().work_units, fast_units);
+                try std.testing.expectEqual(checked.counts().match_probes, fast_probes);
+            };
+        }
+    }
+}
+
+test "final blocks survive fragmented input and output with retained history" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const input = try allocator.alloc(u8, 65537);
+    defer allocator.free(input);
+    for (input, 0..) |*byte, i| byte.* = @truncate((i *% 73 +% i / 11) ^ (i / 17));
+    const capacity = try encodeBound(input.len);
+    const expected = try allocator.alloc(u8, capacity);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(u8, capacity);
+    defer allocator.free(actual);
+    const dictionary = "retained history across a compressed stream boundary";
+    const profiles = [_]Compression{
+        .{ .level = 0 },
+        .{ .level = 1 },
+        .{ .level = 6 },
+        .{ .level = 9 },
+        .{ .strategy = .four_byte_runs },
+    };
+    for (profiles) |compression| {
+        for ([_]usize{ 256, 32768 }) |window| {
+            var encoder: Encoder = undefined;
+            const options: EncodeOptions = .{
+                .dictionary = dictionary,
+                .window_bytes = window,
+                .compression = compression,
+            };
+            try encoder.reset(workspace, options);
+            const whole = try encoder.step(input, expected, .finish);
+            try std.testing.expectEqual(EncodeStatus.complete, whole.status);
+            try std.testing.expectEqual(input.len, whole.consumed);
+            const expected_counts = encoder.counts();
+            try encoder.reset(workspace, options);
+            var read: usize = 0;
+            var written: usize = 0;
+            while (true) {
+                const end = @min(input.len, read + 4093);
+                const out_end = @min(actual.len, written + 7);
+                const action: EncodeAction = if (end == input.len) .finish else .process;
+                const progress = try encoder.step(
+                    input[read..end],
+                    actual[written..out_end],
+                    action,
+                );
+                read += progress.consumed;
+                written += progress.produced;
+                if (progress.status == .complete) break;
+                try std.testing.expect(progress.consumed + progress.produced != 0);
+            }
+            try std.testing.expectEqual(input.len, read);
+            try std.testing.expectEqualSlices(u8, expected[0..whole.produced], actual[0..written]);
+            try std.testing.expectEqualDeep(expected_counts, encoder.counts());
+        }
+    }
+}
+
+test "short run oversized input leaves source and padded output unchanged" {
+    var source: [short_four_byte_run_max_input_bytes + 1]u8 = undefined;
+    for (&source, 0..) |*byte, i| byte.* = @truncate(i *% 73 +% i / 5);
+    const before = source;
+    var destination: [short_four_byte_run_output_capacity]u8 = @splat(0xa5);
+    try std.testing.expectError(
+        error.LimitExceeded,
+        encodeShortFourByteRuns(&source, &destination),
+    );
+    try std.testing.expectEqual(before, source);
+    try std.testing.expect(std.mem.allEqual(u8, &destination, 0xa5));
+}
+
+test "short run output stays inside padded caller storage" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    var source: [short_four_byte_run_max_input_bytes]u8 = undefined;
+    for (0..3) |pattern| {
+        for (&source, 0..) |*byte, i| byte.* = switch (pattern) {
+            0 => 0,
+            1 => @truncate(i *% 73 +% i / 11),
+            else => @truncate(if (i % 43 < 36) i % 4 else i *% 53),
+        };
+        for (
+            [_]usize{ 0, 1, 35, 36, 75, 76, 127, 128, 257, 264, 511, 1023, 1024, 1025, 2047, 2048 },
+        ) |length| {
+            var expected_bytes: [short_four_byte_run_max_input_bytes + 5]u8 = undefined;
+            const expected = try encode(
+                source[0..length],
+                &expected_bytes,
+                workspace,
+                .{ .compression = .{ .strategy = .four_byte_runs } },
+            );
+            var guarded: [short_four_byte_run_output_capacity + 2]u8 = @splat(0xa5);
+            const before = source;
+            const actual = try encodeShortFourByteRuns(
+                source[0..length],
+                guarded[1..][0..short_four_byte_run_output_capacity],
+            );
+            try std.testing.expectEqualSlices(u8, expected, actual);
+            try std.testing.expectEqual(before, source);
+            try std.testing.expectEqual(@as(u8, 0xa5), guarded[0]);
+            try std.testing.expectEqual(@as(u8, 0xa5), guarded[guarded.len - 1]);
+        }
+    }
+}
+
+test "stream bound admits process followed by finish at slab boundaries" {
+    const allocator = std.testing.allocator;
+    const workspace = try EncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const decoding = @import("decode.zig");
+    const decoder = try decoding.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const source = try allocator.alloc(u8, 2 * slab_bytes + 1);
+    defer allocator.free(source);
+    var random: std.Random.DefaultPrng = .init(0x7c51);
+    random.random().bytes(source);
+    const restored = try allocator.alloc(u8, source.len);
+    defer allocator.free(restored);
+    for (
+        [_]usize{
+            0,
+            1,
+            slab_bytes - 1,
+            slab_bytes,
+            slab_bytes + 1,
+            2 * slab_bytes,
+            2 * slab_bytes + 1,
+        },
+    ) |length| {
+        const capacity = try encodeBound(length);
+        const guarded = try allocator.alloc(u8, capacity + 2);
+        defer allocator.free(guarded);
+        for (
+            [_]Compression{
+                .{ .level = 0 },
+                .{ .strategy = .four_byte_runs },
+                .{ .strategy = .huffman_only },
+            },
+        ) |compression| {
+            for ([_]usize{ 257, slab_bytes }) |fragment| {
+                @memset(guarded, 0xa5);
+                const wire = guarded[1..][0..capacity];
+                var encoder: Encoder = undefined;
+                try encoder.reset(workspace, .{ .compression = compression });
+                var read: usize = 0;
+                var written: usize = 0;
+                while (read < length) {
+                    const end = @min(length, read + fragment);
+                    const progress = try encoder.step(source[read..end], wire[written..], .process);
+                    read += progress.consumed;
+                    written += progress.produced;
+                    try std.testing.expect(progress.consumed != 0 or progress.produced != 0);
+                }
+                while (true) {
+                    const progress = try encoder.step(&.{}, wire[written..], .finish);
+                    written += progress.produced;
+                    if (progress.status == .complete) break;
+                    try std.testing.expect(progress.produced != 0);
+                }
+                const recovered = try decoding.decode(
+                    wire[0..written],
+                    restored[0..length],
+                    .{ .workspace = decoder, .history = history },
+                    .{ .output_size = .exact, .trailing_data = .reject },
+                );
+                try std.testing.expectEqual(length, recovered.produced);
+                try std.testing.expectEqualSlices(u8, source[0..length], restored[0..length]);
+                try std.testing.expectEqual(@as(u8, 0xa5), guarded[0]);
+                try std.testing.expectEqual(@as(u8, 0xa5), guarded[guarded.len - 1]);
+            }
+        }
+    }
+}
+test "four run literals retain every byte code and pending bit offset" {
+    for (0..256) |value| {
+        const values = [4]u8{
+            @truncate(value),
+            @truncate(value + 1),
+            @truncate(value + 71),
+            @truncate(value + 193),
+        };
+        for (0..8) |offset| {
+            const initial = (@as(u64, 1) << @intCast(offset)) - 1;
+            var expected_bytes: [24]u8 = @splat(0xa5);
+            var actual_bytes: [24]u8 = @splat(0xa5);
+            var expected: RunBitWriter = .{
+                .book = &run_book,
+                .wire = expected_bytes[3..],
+                .bits = initial,
+                .count = @intCast(offset),
+                .pending = 0,
+            };
+            var actual: RunBitWriter = .{
+                .book = &run_book,
+                .wire = actual_bytes[3..],
+                .bits = initial,
+                .count = @intCast(offset),
+                .pending = 0,
+            };
+            for (values) |literal| expected.symbol(&run_book.header.literal, literal);
+            expected.flush();
+            actual.symbolQuad(&values);
+            try std.testing.expectEqual(expected.bits, actual.bits);
+            try std.testing.expectEqual(expected.count, actual.count);
+            try std.testing.expectEqual(expected.pending, actual.pending);
+            try std.testing.expectEqualSlices(
+                u8,
+                expected.wire[0..expected.pending],
+                actual.wire[0..actual.pending],
+            );
+            for (actual_bytes[0..3]) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+            for (actual_bytes[11..]) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+        }
+    }
+}
+
+test "four byte run dictionary suffix survives block and flush boundaries" {
+    const allocator = std.testing.allocator;
+    const full = try EncoderWorkspace.create(allocator);
+    defer full.destroy(allocator);
+    const compact = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(compact);
+    const source = try allocator.alloc(u8, 2 * slab_bytes + 37);
+    defer allocator.free(source);
+    for (
+        source,
+        0..,
+    ) |*byte, i| byte.* = if (i % 1024 < 992) "ABCD"[i % 4] else @truncate(i *% 73 +% i / 11);
+    const dictionary = try allocator.alloc(u8, 65539);
+    defer allocator.free(dictionary);
+    for (dictionary, 0..) |*byte, i| byte.* = @truncate(i *% 53 +% i / 7);
+    @memcpy(dictionary[dictionary.len - 4 ..], "ABCD");
+    const suffix = dictionary[dictionary.len - 4 ..];
+    const capacity = try encodeBound(source.len) + 20;
+    const expected = try allocator.alloc(u8, capacity);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(u8, capacity);
+    defer allocator.free(actual);
+    const restored = try allocator.alloc(u8, source.len);
+    defer allocator.free(restored);
+    const decoding = @import("decode.zig");
+    const decoder = try decoding.DecoderWorkspace.create(allocator);
+    defer decoder.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const Helper = struct {
+        fn run(encoder: anytype, input: []const u8, output: []u8) !usize {
+            const ends = [_]usize{ slab_bytes + 1, slab_bytes + 5, input.len };
+            const actions = [_]EncodeAction{ .flush, .full_flush, .finish };
+            var read: usize = 0;
+            var written: usize = 0;
+            for (ends, actions) |segment_end, boundary| while (true) {
+                const end = @min(segment_end, read + 4093);
+                const out_end = @min(output.len, written + 13);
+                const progress = try encoder.step(
+                    input[read..end],
+                    output[written..out_end],
+                    if (end == segment_end) boundary else .process,
+                );
+                read += progress.consumed;
+                written += progress.produced;
+                if (progress.status == .flushed or progress.status == .complete) break;
+                try std.testing.expect(progress.consumed != 0 or progress.produced != 0);
+            };
+            try std.testing.expectEqual(input.len, read);
+            return written;
+        }
+    };
+    inline for (.{ full, compact }) |workspace| {
+        for ([_]usize{ 256, 32768 }) |window| {
+            var encoder: EncoderImpl(@TypeOf(workspace.*)) = undefined;
+            var options: EncodeOptions = .{
+                .dictionary = suffix,
+                .window_bytes = window,
+                .compression = .{ .strategy = .four_byte_runs },
+            };
+            try encoder.reset(workspace, options);
+            const n = try Helper.run(&encoder, source, expected);
+            const counts = encoder.counts();
+            options.dictionary = dictionary;
+            try encoder.reset(workspace, options);
+            const m = try Helper.run(&encoder, source, actual);
+            try std.testing.expectEqualSlices(u8, expected[0..n], actual[0..m]);
+            try std.testing.expectEqualDeep(counts, encoder.counts());
+            const result = try decoding.decode(
+                actual[0..m],
+                restored,
+                .{ .workspace = decoder, .history = history },
+                .{ .dictionary = dictionary, .output_size = .exact, .trailing_data = .reject },
+            );
+            try std.testing.expectEqual(source.len, result.produced);
+            try std.testing.expectEqualSlices(u8, source, restored);
+        }
+    }
+}
+
+test "run match byte flushing preserves pending prefixes and staging guards" {
+    for (run_books) |book| {
+        for (3..259) |length| for (0..32) |count| for (0..8) |alignment| {
+            for ([_]usize{ 0, 3 }) |pending| {
+                const initial = (@as(u64, 1) << @intCast(count)) - 1;
+                var expected_bytes: [40]u8 = @splat(0xa5);
+                var actual_bytes: [40]u8 = @splat(0xa5);
+                var expected: RunBitWriter = .{
+                    .book = book,
+                    .wire = expected_bytes[alignment..],
+                    .bits = initial,
+                    .count = @intCast(count),
+                    .pending = pending,
+                };
+                var actual: RunBitWriter = .{
+                    .book = book,
+                    .wire = actual_bytes[alignment..],
+                    .bits = initial,
+                    .count = @intCast(count),
+                    .pending = pending,
+                };
+                const token = book.match_tokens[length];
+                expected.put(token & 0x00ffffff, @intCast(token >> 24));
+                expected.flush();
+                actual.runMatch(length);
+                try std.testing.expectEqual(expected.bits, actual.bits);
+                try std.testing.expectEqual(expected.count, actual.count);
+                try std.testing.expectEqual(expected.pending, actual.pending);
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected.wire[0..expected.pending],
+                    actual.wire[0..actual.pending],
+                );
+                try std.testing.expect(
+                    std.mem.allEqual(u8, actual_bytes[0 .. alignment + pending], 0xa5),
+                );
+                try std.testing.expect(
+                    std.mem.allEqual(u8, actual_bytes[alignment + pending + 8 ..], 0xa5),
+                );
+            }
+        };
+    }
+}
+
+test "whole-span literal packing matches scalar codes and padded guards" {
+    var state: u64 = 0x2173a8f0;
+    for (0..512) |pattern| {
+        var values: [32]u8 = undefined;
+        for (&values, 0..) |*value, i| {
+            state = state *% 6364136223846793005 +% 1;
+            value.* = switch (pattern % 5) {
+                0 => @intCast(((i + pattern) % 14 + 250) % 256),
+                1 => @intCast(((state >> 32) % 14 + 250) % 256),
+                2 => @truncate(state >> 32),
+                3 => 7,
+                else => if (i == pattern % 32) 249 else 0,
+            };
+        }
+        for (0..8) |count| for (0..8) |alignment| {
+            var expected_bytes: [144]u8 = @splat(0xa5);
+            var actual_bytes: [144]u8 = @splat(0xa5);
+            var expected: RunBitWriter = .{
+                .book = &run_book,
+                .wire = expected_bytes[alignment..][0..128],
+                .bits = (@as(u64, 1) << @intCast(count)) - 1,
+                .count = @intCast(count),
+                .pending = 3,
+            };
+            var actual = expected;
+            actual.wire = actual_bytes[alignment..][0..128];
+            for (values) |value| expected.symbol(&run_book.header.literal, value);
+            expected.flush();
+            actual.symbolSpan32(&values, RunLiteralLookup.init(actual.book));
+            try std.testing.expectEqual(expected.pending, actual.pending);
+            try std.testing.expectEqual(expected.bits, actual.bits);
+            try std.testing.expectEqual(expected.count, actual.count);
+            try std.testing.expectEqualSlices(
+                u8,
+                expected.wire[0..expected.pending],
+                actual.wire[0..actual.pending],
+            );
+            for (
+                actual_bytes[0..alignment],
+            ) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+            for (
+                actual_bytes[alignment + actual.pending + 8 ..],
+            ) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+        };
+    }
+}
+
+test "span preflight agrees with emission across cutoff and tail boundaries" {
+    for (run_books) |book| {
+        const allocator = std.testing.allocator;
+        const fast_workspace = try EncoderWorkspace.create(allocator);
+        defer fast_workspace.destroy(allocator);
+        const checked_workspace = try EncoderWorkspace.create(allocator);
+        defer checked_workspace.destroy(allocator);
+        var fast: Encoder = undefined;
+        var checked: Encoder = undefined;
+        var saw_448 = false;
+        var saw_449 = false;
+        var saw_stored = false;
+        var saw_dynamic = false;
+        for (32..193) |length| for (0..8) |offset| for (0..6) |pattern| {
+            try fast.reset(fast_workspace, .{ .compression = .{ .strategy = .four_byte_runs } });
+            try checked.reset(
+                checked_workspace,
+                .{ .compression = .{ .strategy = .four_byte_runs } },
+            );
+            for (fast_workspace.data[0 .. length + 4], 0..) |*byte, i| {
+                byte.* = switch (pattern) {
+                    0 => 0,
+                    1 => @truncate(i * 73 + i / 13),
+                    2 => @intCast((i / 4 + i / 23) % 8),
+                    3 => @intCast(if (i % 32 < 28) 0 else (i / 32) % 8),
+                    4 => @intCast(if (i % 64 < 32) 7 else 100 + (i * 37) % 100),
+                    else => @intCast((i / 4 + i / 5) % 14),
+                };
+            }
+            @memcpy(checked_workspace.data[0 .. length + 4], fast_workspace.data[0 .. length + 4]);
+            fast.history = 4;
+            checked.history = 4;
+            fast.buffered = length;
+            checked.buffered = length;
+            fast.bit_count = @intCast(offset);
+            checked.bit_count = @intCast(offset);
+            fast.bits = (@as(u64, 1) << @intCast(offset)) - 1;
+            checked.bits = fast.bits;
+            const padding = (8 - (offset + 3) % 8) % 8;
+            const stored_bits = 3 + padding + 32 + length * 8;
+            const initial_slack = stored_bits -| (3 + book.header.bits);
+            saw_448 = saw_448 or initial_slack == 448;
+            saw_449 = saw_449 or initial_slack == 449;
+            var units: u64 = 0;
+            var probes: u64 = 0;
+            const predicted = try fast.groupedRunsPreferStored(
+                book,
+                false,
+                &units,
+                &probes,
+                stored_bits,
+            );
+            var unused_units: u64 = 0;
+            var unused_probes: u64 = 0;
+            const checked_predicted = try checked.groupedRunsPreferStored(
+                book,
+                true,
+                &unused_units,
+                &unused_probes,
+                stored_bits,
+            );
+            try std.testing.expectEqual(predicted, checked_predicted);
+            try std.testing.expectEqual(units, checked.stats.work_units);
+            try std.testing.expectEqual(probes, checked.stats.match_probes);
+            fast.stats = .{};
+            checked.stats = .{};
+            units = 0;
+            probes = 0;
+            try fast.emitRuns(book, true, false, true, &units, &probes);
+            try checked.emitRuns(book, true, true, true, &unused_units, &unused_probes);
+            try std.testing.expectEqual(predicted, fast.stats.stored_blocks != 0);
+            try std.testing.expectEqual(predicted, checked.stats.stored_blocks != 0);
+            try std.testing.expectEqual(units, checked.stats.work_units);
+            try std.testing.expectEqual(probes, checked.stats.match_probes);
+            try std.testing.expectEqual(fast.pending, checked.pending);
+            try std.testing.expectEqual(fast.bits, checked.bits);
+            try std.testing.expectEqual(fast.bit_count, checked.bit_count);
+            try std.testing.expectEqualSlices(
+                u8,
+                fast_workspace.wire[0..fast.pending],
+                checked_workspace.wire[0..checked.pending],
+            );
+            saw_stored = saw_stored or predicted;
+            saw_dynamic = saw_dynamic or !predicted;
+        };
+        try std.testing.expect(saw_448 and saw_449 and saw_stored and saw_dynamic);
+    }
+}
+
+test "all run books pack every byte and mixed edge lanes with padded guards" {
+    for (run_books) |book| {
+        for (0..512) |pattern| {
+            var values: [32]u8 = undefined;
+            for (&values, 0..) |*value, i| {
+                value.* = if (pattern < 256) @intCast(
+                    pattern,
+                ) else @intCast(((i * 7 + pattern) % 32 + 240) % 256);
+            }
+            if (pattern >= 256 and pattern % 3 == 0) values[pattern % 32] = 16;
+            if (pattern >= 256 and pattern % 3 == 1) values[pattern % 32] = 239;
+            for (0..8) |count| for (0..8) |alignment| {
+                var expected_bytes: [144]u8 = @splat(0xa5);
+                var actual_bytes: [144]u8 = @splat(0xa5);
+                var expected: RunBitWriter = .{
+                    .book = book,
+                    .wire = expected_bytes[alignment..][0..128],
+                    .bits = (@as(u64, 1) << @intCast(count)) - 1,
+                    .count = @intCast(count),
+                    .pending = 3,
+                };
+                var actual = expected;
+                actual.wire = actual_bytes[alignment..][0..128];
+                for (values) |value| expected.symbol(&book.header.literal, value);
+                expected.flush();
+                actual.symbolSpan32(&values, RunLiteralLookup.init(actual.book));
+                try std.testing.expectEqual(expected.pending, actual.pending);
+                try std.testing.expectEqual(expected.bits, actual.bits);
+                try std.testing.expectEqual(expected.count, actual.count);
+                try std.testing.expectEqualSlices(
+                    u8,
+                    expected.wire[0..expected.pending],
+                    actual.wire[0..actual.pending],
+                );
+                for (
+                    actual_bytes[0..alignment],
+                ) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+                for (
+                    actual_bytes[alignment + actual.pending + 8 ..],
+                ) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+            };
+        }
+    }
+}
+
+test "run book selection covers block thresholds history and both accounting paths" {
+    const allocator = std.testing.allocator;
+    const workspace = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(workspace);
+    var encoder: FourByteRunEncoder = undefined;
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 256, 32768 }) |history| {
+        for ([_]usize{ 8191, 8192, 65535 }) |length| inline for (.{ false, true }) |bounded| {
+            try encoder.reset(workspace, .{ .compression = .{ .strategy = .four_byte_runs } });
+            @memset(workspace.data[0 .. history + length], 0);
+            encoder.history = history;
+            encoder.buffered = length;
+            var units: u64 = 0;
+            var probes: u64 = 0;
+            var grouped = false;
+            var selected_choice: RunBookChoice = .original;
+            const stored = try encoder.preferStoredRuns(
+                bounded,
+                &units,
+                &probes,
+                &grouped,
+                &selected_choice,
+            );
+            try std.testing.expect(!stored and !grouped);
+            try std.testing.expectEqual(
+                if (length >= 8192) RunBookChoice.balanced else .original,
+                selected_choice,
+            );
+            const prefix = 4 -| history;
+            const book_work: u64 = if (length >= 8192) prefix + 32 * 258 else 0;
+            const book_probes: u64 = if (length >= 8192) 32 else 0;
+            try std.testing.expectEqual(
+                256 + book_work,
+                if (bounded) encoder.stats.work_units else units,
+            );
+            try std.testing.expectEqual(
+                256 - @as(u64, @intFromBool(history < 4)) + book_probes,
+                if (bounded) encoder.stats.match_probes else probes,
+            );
+        };
+    }
+}
+
+test "run book sampling preserves ties and prefix run window refusals" {
+    const allocator = std.testing.allocator;
+    const workspace = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(workspace);
+    var encoder: FourByteRunEncoder = undefined;
+    const length = 8192;
+    const original_header = 3 + run_book.header.bits + run_book.header.literal.widths[256];
+    const balanced_header = 3 + balanced_run_book.header.bits + balanced_run_book.header.literal
+        .widths[256];
+    const header_delta = original_header - balanced_header;
+    try std.testing.expectEqual(@as(u32, 0), header_delta % 8);
+    const tie: usize = header_delta / 8;
+    try std.testing.expect(tie > 0 and tie < 32);
+    try std.testing.expectEqual(
+        run_book.header.literal.widths[1],
+        balanced_run_book.header.literal.widths[1],
+    );
+    try std.testing.expectEqual(
+        run_book.header.literal.widths[2],
+        balanced_run_book.header.literal.widths[2],
+    );
+    try std.testing.expectEqual(
+        run_book.header.literal.widths[0] + 1,
+        balanced_run_book.header.literal.widths[0],
+    );
+
+    // Every distance-four candidate immediately mismatches. Equal-width 1/2 literals make each
+    // inserted zero add exactly eight units to the fixed-point sample-price difference.
+    for ([_]usize{ tie - 1, tie, tie + 1 }) |zeros| inline for (.{ false, true }) |bounded| {
+        try encoder.reset(workspace, .{ .compression = .{ .strategy = .four_byte_runs } });
+        for (workspace.data[0 .. length + 4], 0..) |*byte, i| byte.* = @intCast((i / 4) % 2 + 1);
+        for (0..zeros) |i| workspace.data[4 + i * (length - 258) / 31] = 0;
+        encoder.history = 4;
+        encoder.buffered = length;
+        var units: u64 = 0;
+        var probes: u64 = 0;
+        const selected_book = try encoder.sampleRunBook(bounded, &units, &probes);
+        try std.testing.expectEqual(
+            if (zeros < tie) RunBookChoice.balanced else .original,
+            selected_book,
+        );
+        try std.testing.expectEqual(
+            @as(u64, 32 * 33),
+            if (bounded) encoder.stats.work_units else units,
+        );
+        try std.testing.expectEqual(
+            @as(u64, 32),
+            if (bounded) encoder.stats.match_probes else probes,
+        );
+    };
+
+    const Case = struct { limit: u64, work: u64, probes: u64 };
+    for (
+        [_]Case{
+            .{ .limit = 0, .work = 0, .probes = 0 },
+            .{ .limit = 1, .work = 1, .probes = 1 },
+            .{ .limit = 32, .work = 1, .probes = 1 },
+            .{ .limit = 33, .work = 33, .probes = 1 },
+            .{ .limit = 1055, .work = 1024, .probes = 32 },
+            .{ .limit = 1056, .work = 1056, .probes = 32 },
+        },
+    ) |case| {
+        try encoder.reset(
+            workspace,
+            .{
+                .compression = .{ .strategy = .four_byte_runs },
+                .limits = .{ .work_units = case.limit },
+            },
+        );
+        encoder.history = 4;
+        encoder.buffered = length;
+        var units: u64 = 0;
+        var probes: u64 = 0;
+        if (case.limit == 1056) {
+            try std.testing.expectEqual(
+                RunBookChoice.original,
+                try encoder.sampleRunBook(true, &units, &probes),
+            );
+        } else {
+            try std.testing.expectError(
+                error.LimitExceeded,
+                encoder.sampleRunBook(true, &units, &probes),
+            );
+        }
+        try std.testing.expectEqual(case.work, encoder.stats.work_units);
+        try std.testing.expectEqual(case.probes, encoder.stats.match_probes);
+    }
+    for (
+        [_]Case{
+            .{ .limit = 3, .work = 0, .probes = 0 },
+            .{ .limit = 4, .work = 4, .probes = 0 },
+            .{ .limit = 5, .work = 5, .probes = 1 },
+        },
+    ) |case| {
+        try encoder.reset(
+            workspace,
+            .{
+                .compression = .{ .strategy = .four_byte_runs },
+                .limits = .{ .work_units = case.limit },
+            },
+        );
+        encoder.buffered = length;
+        var units: u64 = 0;
+        var probes: u64 = 0;
+        try std.testing.expectError(
+            error.LimitExceeded,
+            encoder.sampleRunBook(true, &units, &probes),
+        );
+        try std.testing.expectEqual(case.work, encoder.stats.work_units);
+        try std.testing.expectEqual(case.probes, encoder.stats.match_probes);
+    }
+    try encoder.reset(workspace, .{ .compression = .{ .strategy = .four_byte_runs } });
+    encoder.history = 4;
+    encoder.buffered = length;
+    encoder.stats.match_probes = std.math.maxInt(u64) - 31;
+    var units: u64 = 0;
+    var probes: u64 = 0;
+    try std.testing.expectError(
+        error.CounterOverflow,
+        encoder.sampleRunBook(true, &units, &probes),
+    );
+    try std.testing.expectEqual(@as(u64, 1024), encoder.stats.work_units);
+    try std.testing.expectEqual(std.math.maxInt(u64), encoder.stats.match_probes);
+}
+
+test "run book sampling chooses original balanced and negative-heavy costs" {
+    const allocator = std.testing.allocator;
+    const workspace = try allocator.create(FourByteRunEncoderWorkspace);
+    defer allocator.destroy(workspace);
+    var encoder: FourByteRunEncoder = undefined;
+    try std.testing.expectEqual(@as(u8, 1), negative_run_book.header.literal.widths[0]);
+    try std.testing.expectEqual(@as(u8, 2), negative_run_book.header.literal.widths[255]);
+    try std.testing.expect(negative_run_book.wide_edges);
+    for (
+        16..240,
+    ) |symbol| try std.testing.expectEqual(
+        @as(u8, 12),
+        negative_run_book.header.literal.widths[symbol],
+    );
+    for ([_]usize{ 8192, 65535 }) |length| {
+        for ([_]usize{ 0, 4, 256 }) |history| {
+            for ([_]u8{ 0, 1, 2, 255 }) |step| {
+                var fast_units: u64 = 0;
+                var fast_probes: u64 = 0;
+                inline for (.{ false, true }) |bounded| {
+                    try encoder.reset(
+                        workspace,
+                        .{ .compression = .{ .strategy = .four_byte_runs } },
+                    );
+                    for (workspace.data[0 .. history + length], 0..) |*byte, i| {
+                        byte.* = if ((i / 4) % 2 == 0) 0 else step;
+                    }
+                    encoder.history = history;
+                    encoder.buffered = length;
+                    var units: u64 = 0;
+                    var probes: u64 = 0;
+                    const book = try encoder.sampleRunBook(bounded, &units, &probes);
+                    const expected: RunBookChoice = switch (step) {
+                        0 => .balanced,
+                        255 => .negative,
+                        else => .original,
+                    };
+                    try std.testing.expectEqual(expected, book);
+                    if (bounded) {
+                        try std.testing.expectEqual(fast_units, encoder.stats.work_units);
+                        try std.testing.expectEqual(fast_probes, encoder.stats.match_probes);
+                    } else {
+                        fast_units = units;
+                        fast_probes = probes;
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "run price deltas retain signed literal costs and individually rounded matches" {
+    try std.testing.expectEqual(@as(i8, 1), run_literal_price_deltas[0].balanced);
+    try std.testing.expectEqual(@as(i8, 0), run_literal_price_deltas[0].negative);
+    try std.testing.expectEqual(@as(i8, -1), run_literal_price_deltas[255].balanced);
+    try std.testing.expectEqual(@as(i8, -2), run_literal_price_deltas[255].negative);
+    try std.testing.expectEqual(@as(i8, 2), run_literal_price_deltas[1].negative);
+    try std.testing.expectEqual(@as(i16, -9), run_match_price_deltas[258].balanced);
+    try std.testing.expectEqual(@as(i16, -7), run_match_price_deltas[258].negative);
+    for (run_literal_price_deltas, 0..) |delta, symbol| {
+        const original: i16 = run_book.header.literal.widths[symbol];
+        try std.testing.expectEqual(
+            @as(i16, balanced_run_book.header.literal.widths[symbol]),
+            original + delta.balanced,
+        );
+        try std.testing.expectEqual(
+            @as(i16, negative_run_book.header.literal.widths[symbol]),
+            original + delta.negative,
+        );
+    }
+    for (3..259) |length| {
+        const original: i32 = @intCast(
+            ((run_book.match_tokens[length] >> 24) * 256 + length / 2) / length,
+        );
+        const balanced: i32 = @intCast(
+            ((balanced_run_book.match_tokens[length] >> 24) * 256 + length / 2) / length,
+        );
+        const negative: i32 = @intCast(
+            ((negative_run_book.match_tokens[length] >> 24) * 256 + length / 2) / length,
+        );
+        try std.testing.expectEqual(balanced, original + run_match_price_deltas[length].balanced);
+        try std.testing.expectEqual(negative, original + run_match_price_deltas[length].negative);
     }
 }

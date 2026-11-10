@@ -151,8 +151,8 @@ pub const Encoder = struct {
         bytes[3] = flags;
         std.mem.writeInt(u32, bytes[4..8], options.modification_time, .little);
         const compression = options.deflate.compression;
-        // XFL is an informational hint; level zero and literal-only coding have no speed hint.
-        bytes[8] = if (compression.level == 0 or compression.strategy == .huffman_only)
+        // XFL is an informational hint; stored and restricted strategies leave it unspecified.
+        bytes[8] = if (compression.level == 0 or compression.strategy != .default)
             0
         else if (compression.level == 1) 4 else if (compression.level == 9) 2 else 0;
         bytes[9] = options.operating_system;
@@ -338,9 +338,16 @@ test "gzip encoding copies metadata emits deterministic members and resets histo
     defer decode_workspace.destroy(allocator);
     var encoder: Encoder = undefined;
     var metadata = [_]u8{ 'n', 'a', 'm', 'e' };
-    try encoder.reset(encode_workspace, .{ .name = &metadata, .comment = "comment", .extra = &.{
-        1, 2, 3,
-    }, .header_crc = true, .modification_time = 123 });
+    try encoder.reset(
+        encode_workspace,
+        .{
+            .name = &metadata,
+            .comment = "comment",
+            .extra = &.{ 1, 2, 3 },
+            .header_crc = true,
+            .modification_time = 123,
+        },
+    );
     @memset(&metadata, 0xa5);
     var wire: [512]u8 = undefined;
     const first = try encoder.step("member data", &wire, .finish);
@@ -491,32 +498,41 @@ test "compression levels write gzip hints and verified trailers" {
     var wire: [512]u8 = undefined;
     var restored: [source.len]u8 = undefined;
     for (0..10) |level| {
-        const encoded = try encode(
-            source,
-            &wire,
-            encoder_workspace,
-            .{ .deflate = .{ .compression = .{ .level = @intCast(level) } } },
-        );
-        // RFC 1952 reserves these hints for the slowest and fastest compressor choices. The trailer
-        // still covers the decoded payload, independently of that informational byte.
-        const hint: u8 = if (level == 1) 4 else if (level == 9) 2 else 0;
-        try std.testing.expectEqual(hint, encoded[8]);
-        try std.testing.expectEqual(
-            Crc32IsoHdlc.hash(source),
-            std.mem.readInt(u32, encoded[encoded.len - 8 ..][0..4], .little),
-        );
-        try std.testing.expectEqual(
-            @as(u32, source.len),
-            std.mem.readInt(u32, encoded[encoded.len - 4 ..][0..4], .little),
-        );
-        const result = try decode(
-            encoded,
-            &restored,
-            .{ .workspace = decoder_workspace },
-            .{ .output_size = .exact, .trailing_data = .reject },
-        );
-        try std.testing.expectEqual(source.len, result.produced);
-        try std.testing.expectEqualSlices(u8, source, &restored);
+        for ([_]deflate.Compression.Strategy{ .default, .four_byte_runs }) |strategy| {
+            const encoded = try encode(
+                source,
+                &wire,
+                encoder_workspace,
+                .{
+                    .deflate = .{
+                        .compression = .{ .level = @intCast(level), .strategy = strategy },
+                    },
+                },
+            );
+            // RFC 1952 reserves these hints for the slowest and fastest compressor choices. The
+            // trailer still covers the decoded payload, independently of that informational byte.
+            const hint: u8 = if (strategy != .default) 0 else if (level == 1) 4 else if (level == 9)
+                2
+            else
+                0;
+            try std.testing.expectEqual(hint, encoded[8]);
+            try std.testing.expectEqual(
+                Crc32IsoHdlc.hash(source),
+                std.mem.readInt(u32, encoded[encoded.len - 8 ..][0..4], .little),
+            );
+            try std.testing.expectEqual(
+                @as(u32, source.len),
+                std.mem.readInt(u32, encoded[encoded.len - 4 ..][0..4], .little),
+            );
+            const result = try decode(
+                encoded,
+                &restored,
+                .{ .workspace = decoder_workspace },
+                .{ .output_size = .exact, .trailing_data = .reject },
+            );
+            try std.testing.expectEqual(source.len, result.produced);
+            try std.testing.expectEqualSlices(u8, source, &restored);
+        }
     }
     const literal_only = try encode(
         source,

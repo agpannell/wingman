@@ -15,6 +15,7 @@
 //! generic chunk framing. lpcm, g711 and adpcm convert raw sample representations or complete codec
 //! blocks when the layout is already known; playback and resampling stay with callers.
 //!
+//! png reads and writes PNG images and APNG animations with explicit storage and sample policy.
 //! exif borrows classic TIFF attributes and thumbnail storage, including supported RGB/YCbCr
 //! thumbnail samples. icc inspects bounded uncompressed color-profile headers and opaque tag
 //! bodies. Orientation, complete profile validation and color transforms stay with callers.
@@ -53,6 +54,9 @@ pub const lpcm = @import("lpcm.zig");
 pub const g711 = @import("g711.zig");
 pub const adpcm = @import("adpcm.zig");
 
+pub const png = @import("png.zig");
+pub const ImageRegion = @import("common/ImageRegion.zig");
+
 pub const exif = @import("exif.zig");
 pub const icc = @import("icc.zig");
 
@@ -84,6 +88,8 @@ test {
     _ = g711;
     _ = adpcm;
 
+    _ = png;
+    _ = ImageRegion;
     _ = exif;
     _ = icc;
 

@@ -72,6 +72,18 @@ pub fn build(b: *std.Build) void {
             .description = "Encode and verify a gzip member",
         },
         .{
+            .step = "png-example",
+            .source = "examples/png.zig",
+            .executable = "png-roundtrip",
+            .description = "Write and recover a PNG image",
+        },
+        .{
+            .step = "png-animation-example",
+            .source = "examples/png_animation.zig",
+            .executable = "png-animation",
+            .description = "Write, decode and compose two APNG frames",
+        },
+        .{
             .step = "wav-example",
             .source = "examples/wav.zig",
             .executable = "wave-audio",

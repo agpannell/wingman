@@ -87,3 +87,26 @@ the reader. Transport failures remain `ReadFailed`. `decodeStoredReader` is a se
 workspace-free operation for stored blocks only. It returns null for compressed blocks, possibly
 after consuming input and writing a prefix; rewind or recreate the reader before a general decode.
 Errors may also change reader and output state. Neither Reader API performs I/O scheduling itself.
+
+`Reader` offers a pull interface when the consumer expects a `std.Io.Reader`. Construct it at its
+final address, supply `Reader.history_bytes` of separate caller-owned history and call `init` with
+the compressed input reader. Its `reader` field yields decompressed bytes. Keep the adapter, input
+reader and history stable and disjoint through use. Drain to `EndOfStream` to verify the checksum;
+reading only the expected payload length can leave the trailer unchecked. Following input remains
+available in the compressed reader. Malformed streams, dictionary requests and transport failures
+become `ReadFailed`; reinitialize before reuse. Use `Decoder` when dictionary handling or explicit
+work limits are required.
+
+For small complete streams, `encodeShortStored` accepts up to `short_stored_max_input_bytes`
+and needs input length plus 11 output bytes. `encodeShortFourByteRuns` accepts up to
+`short_four_byte_run_max_input_bytes` and requires `short_four_byte_run_output_capacity` bytes,
+including padding that may change after the returned prefix. Both use a 32 KiB window, no
+dictionary or work limit, disjoint source and output, and allocate nothing. Oversized input returns
+`LimitExceeded`; length, capacity and overlap refusals leave output unchanged.
+
+`FourByteRunEncoder` uses a smaller workspace for stored and four-byte-run streaming. Set
+`.deflate.compression.strategy = .four_byte_runs` or `.deflate.compression.level = 0`; default
+options are invalid. Its workspace supports `create`, `clear` and `destroy` like the full workspace.
+Its `inputBuffer` and `commitInput` methods also exist on `Encoder`: drain the zlib header first, fill
+the borrowed slice, then immediately commit its initialized prefix without another operation.
+The borrow ends at commit, which may produce output and poisons the encoder on error.

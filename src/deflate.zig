@@ -21,16 +21,21 @@
 //! supports fragmented input with `process`, `flush`, `full_flush` and `finish` actions. The
 //! default compression level 6 balances search effort and size; levels 7–9 use offline parsing.
 //! Level 0 stores data without compression, and the optional Huffman-only strategy skips matches.
-//! Complete stored finishes write directly to the destination when it fits; fragmented calls use
-//! the same bounded workspace. Every level and strategy still requires an `EncoderWorkspace`.
+//! The four-byte-run strategy only matches patterns at distance four, selecting among prebuilt
+//! dynamic codebooks and stored blocks. It can be faster on four-byte residuals but much larger on
+//! other inputs; it does not apply filtering. Levels 1–9 select the same run strategy, while level
+//! 0 still stores. Complete stored finishes write directly to the destination when it fits;
+//! fragmented calls use the same bounded workspace. Every level and strategy still requires an
+//! `EncoderWorkspace`.
 //!
-//! Compressed levels and the Huffman-only strategy compare exact stored, fixed and dynamic block
-//! sizes. Dynamic codebooks use an optimal length-limited Huffman construction with deterministic
-//! equal-cost choices. Dynamic headers describe code widths with literals and repeat codes; each
-//! trial price table selects a cheapest legal sequence with deterministic ties. Work allowances
-//! retain their algorithmic charges when range minima accelerate the repeat search. Identical
-//! consecutive trials reuse the remaining trials within that header computation, charging their
-//! full work. A smaller allowance executes the trials to preserve partial counters and refusal.
+//! Ordinary compressed levels and the Huffman-only strategy compare exact stored, fixed and dynamic
+//! block sizes. Dynamic codebooks use an optimal length-limited Huffman construction with
+//! deterministic equal-cost choices. Dynamic headers describe code widths with literals and repeat
+//! codes; each trial price table selects a cheapest legal sequence with deterministic ties. Work
+//! allowances retain their algorithmic charges when range minima accelerate the repeat search.
+//! Identical consecutive trials reuse the remaining trials within that header computation, charging
+//! their full work. A smaller allowance executes the trials to preserve partial counters and
+//! refusal.
 //!
 //! Offline parsing prices paths through literals and matches, trying up to eight codebook updates.
 //! After the first priced pass, it stops when the dynamic block cost no longer improves. The pass
@@ -99,6 +104,11 @@ pub const EncodeProgress = encoding.EncodeProgress;
 pub const EncodeStats = encoding.EncodeStats;
 pub const EncoderWorkspace = encoding.EncoderWorkspace;
 pub const Encoder = encoding.Encoder;
+pub const FourByteRunEncoder = encoding.FourByteRunEncoder;
+pub const FourByteRunEncoderWorkspace = encoding.FourByteRunEncoderWorkspace;
+pub const short_four_byte_run_max_input_bytes = encoding.short_four_byte_run_max_input_bytes;
+pub const short_four_byte_run_output_capacity = encoding.short_four_byte_run_output_capacity;
+pub const encodeShortFourByteRuns = encoding.encodeShortFourByteRuns;
 pub const encodeBound = encoding.encodeBound;
 pub const encode = encoding.encode;
 
@@ -293,7 +303,7 @@ test "encoder bounds limits overlap failure reset and clearing are explicit" {
 test {
     _ = @import("deflate/bits.zig");
     _ = encoding;
-    _ = @import("deflate/fixtures.zig");
+    _ = @import("common/deflate_test_data.zig");
     _ = @import("deflate/huffman.zig");
     _ = @import("deflate/match.zig");
     _ = decoding;
@@ -361,10 +371,28 @@ test "complete decode separates extent trailing data limits and dictionary stora
     );
     dictionary[0] = 'Z';
     // Independent fixed block: a length-three/distance-one match using the copied preset A.
-    const restored = try decoder.step(.{ .bytes = &.{
-        0x03, 0x02,
-        0x00,
-    }, .final = true }, output[0..3]);
+    const restored = try decoder.step(
+        .{ .bytes = &.{ 0x03, 0x02, 0x00 }, .final = true },
+        output[0..3],
+    );
     try std.testing.expectEqual(.complete, restored.status);
     try std.testing.expectEqualStrings("AAA", output[0..3]);
+}
+
+test "public short stream buffer refusals preserve destination" {
+    var source: [short_four_byte_run_max_input_bytes + 1]u8 = @splat(42);
+    var output: [short_four_byte_run_output_capacity]u8 = @splat(0xa5);
+    try std.testing.expectError(error.LimitExceeded, encodeShortFourByteRuns(&source, &output));
+    try std.testing.expect(std.mem.allEqual(u8, &output, 0xa5));
+    try std.testing.expectError(
+        error.OutputTooSmall,
+        encodeShortFourByteRuns(source[0..16], output[0 .. output.len - 1]),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &output, 0xa5));
+    const before = output;
+    try std.testing.expectError(
+        error.StorageOverlap,
+        encodeShortFourByteRuns(output[0..16], &output),
+    );
+    try std.testing.expectEqualSlices(u8, &before, &output);
 }

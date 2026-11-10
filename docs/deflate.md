@@ -53,14 +53,24 @@ are not equivalent to another encoder's settings.
 
 Use `.{ .compression = .{ .level = 9 } }` when more encoding work is appropriate, or set
 `compression.strategy = .huffman_only` to skip match search. Level 0 always stores bytes, even
-with the Huffman-only strategy. Every level and strategy currently uses an `EncoderWorkspace`.
+with the Huffman-only strategy. The `four_byte_runs` strategy searches only for patterns repeated
+at distance four, then selects among prebuilt dynamic codebooks and stored blocks. It can reduce
+work for four-byte residual data, but other input can expand substantially compared with general
+matching.
+Levels 1–9 select the same run policy; level 0 still stores. The strategy operates on bytes and does
+not choose PNG filtering. The streaming `FourByteRunEncoder` uses a smaller
+`FourByteRunEncoderWorkspace`. Set `.compression.strategy = .four_byte_runs` or
+`.compression.level = 0` for stored encoding; default options are invalid for this encoder. Its
+workspace supports the same `create`, `clear` and `destroy` lifecycle as `EncoderWorkspace`.
 The options also bound input, output and algorithmic work. Work units are not elapsed time or
 instruction counts; some bounded pricing scans and dictionary or wrapper metadata work are not
 charged. Bound input and metadata separately when those costs matter.
 
 The default compression settings perform full lazy lookahead and full offline pricing with
 standard refinement. For ordinary matching at levels 4–6, `lazy_lookahead = .reduced` spends less
-search effort on the position after a candidate match. At levels 7–9, `offline_pricing = .reduced`
+search effort on the position after a candidate match. `lazy_lookahead = .automatic` selects
+reduced lookahead for ordinary level 6 and full lookahead for other valid combinations. At levels
+7–9, `offline_pricing = .reduced`
 prices the first retained match supporting each length; that match need not be the nearest.
 `offline_pricing = .maximum_lengths` prices only each retained match's longest length. Both can
 exclude choices considered by full pricing. `offline_refinement = .early` can stop after the second
@@ -69,9 +79,10 @@ in compressed size. Standard refinement continues until costs stop improving or 
 reached.
 
 These choices can change encoded bytes, work used and whether a finite work allowance is exhausted;
-they do not guarantee faster encoding or smaller output for every input. Nondefault lookahead is
-valid only for ordinary matching at levels 4–6; nondefault offline pricing or refinement requires
-ordinary matching at levels 7–9. Other combinations return `InvalidOptions`. The input and output
+they do not guarantee faster encoding or smaller output for every input. Explicit reduced
+lookahead is valid only for ordinary matching at levels 4–6; automatic is valid for any otherwise
+valid combination. Nondefault offline pricing or refinement requires ordinary matching at levels
+7–9. Other combinations return `InvalidOptions`. The input and output
 limits remain independent of these settings.
 
 Decoding defaults to bounded output and allows following input. On success, copied `consumed` and
@@ -107,3 +118,14 @@ that fragment reaches the actual end of the raw stream; retain the flag with any
 Consumed fragments may retire immediately because history is retained in caller storage. Stream
 limits are cumulative. An error requires reset before reusing a streaming owner; previously returned
 output can be incomplete and must not be treated as a validated complete stream.
+
+For a complete input of at most `short_four_byte_run_max_input_bytes`,
+`encodeShortFourByteRuns` writes directly to caller output without a workspace. Reserve
+`short_four_byte_run_output_capacity` bytes, including temporary padding; bytes beyond the returned
+prefix may change. It uses no dictionary or work limit. Source and output must be disjoint.
+Oversized input returns `LimitExceeded`; length, capacity and overlap refusals leave output unchanged.
+
+A streaming encoder's `inputBuffer` lends workspace for an immediate fill and `commitInput` call.
+Do not call another encoder operation while holding the slice. The commit consumes its initialized
+prefix with process semantics and may produce output; drain that output before continuing. A null
+borrow means input cannot currently be accepted. Commit failures require reset.
