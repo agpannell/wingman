@@ -26,9 +26,14 @@ pub const HcDecoderCost = enum {
     throughput,
 };
 
-/// Per-block search/parser admission. Work counts insertions, chain probes, compared words/bytes
-/// and parser edges, including dictionary priming.
-pub const HcEncodeLimits = struct { work_units: u64 = std.math.maxInt(u64) };
+/// Per-block search/parser admission, including dictionary priming. Each insertion, eligible chain
+/// probe and parser edge costs one unit. A probe includes its initial four-byte prefix check; each
+/// additional endpoint-word, extension-word or byte comparison costs one, even on a mismatch.
+/// Hashing, table clearing, path reconstruction and wire writing are outside this unit model.
+pub const HcEncodeLimits = struct {
+    /// Maximum admitted units; exhaustion returns LimitExceeded before the next charged operation.
+    work_units: u64 = std.math.maxInt(u64),
+};
 
 /// Dictionary and bounded search policy for a complete high-compression block.
 pub const HcEncodeOptions = struct {
@@ -236,6 +241,112 @@ pub fn encodeBlockHc(
     return output[0..writer.cursor];
 }
 
+test "LZ4 HC independent block costs include comparisons and dictionary priming" {
+    const allocator = std.testing.allocator;
+    const workspace = try HcEncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+
+    // These totals count the operations in each tiny parse, independently of reported statistics.
+    // Only the repeated ABCD prefix shares a searched hash slot in the mismatch case.
+    const cases = [_]struct {
+        source: []const u8,
+        dictionary: []const u8 = &.{},
+        wire: []const u8,
+        work: u64,
+        probes: u64 = 0,
+        sequences: u64 = 0,
+    }{
+        .{ .source = "", .wire = "\x00", .work = 0 },
+        // Six insertions and seven literal edges; only position zero is eligible for search.
+        .{ .source = "ABCDEFGHIJKL", .wire = "\xc0ABCDEFGHIJKL", .work = 6 + 7 },
+        // Seven insertions, eight literal edges, one probe, three compared bytes and four match
+        // edges.
+        .{
+            .source = "AAAAAAAAAAAAA",
+            .wire = "\x13A\x01\x00\x50AAAAA",
+            .work = 7 + 8 + 1 + 3 + 4,
+            .probes = 1,
+            .sequences = 1,
+        },
+        // Eleven insertions, twelve literal edges, one probe, one mismatch and one match edge.
+        .{
+            .source = "ABCDxABCDy1234567",
+            .wire = "\x50ABCDx\x05\x00\x80y1234567",
+            .work = 11 + 12 + 1 + 1 + 1,
+            .probes = 1,
+            .sequences = 1,
+        },
+        // Only one complete dictionary word can be inserted without source bytes.
+        .{ .source = "", .dictionary = "abcd", .wire = "\x00", .work = 1 },
+        // Three source bytes permit all four dictionary starts, including boundary words.
+        .{ .source = "xyz", .dictionary = "abcd", .wire = "\x30xyz", .work = 4 },
+    };
+    var output: [66]u8 = undefined;
+    var restored: [32]u8 = undefined;
+    for (cases) |case| {
+        for ([_]HcProfile{ .balanced, .offline }) |profile| {
+            var budget: u64 = 0;
+            while (budget <= case.work) : (budget += 1) {
+                @memset(&output, 0xa7);
+                const encoded = encodeBlockHc(
+                    case.source,
+                    output[1 .. output.len - 1],
+                    workspace,
+                    .{
+                        .dictionary = case.dictionary,
+                        .profile = profile,
+                        .limits = .{ .work_units = budget },
+                    },
+                );
+                if (budget < case.work) {
+                    try std.testing.expectError(error.LimitExceeded, encoded);
+                    try std.testing.expectEqual(budget, workspace.stats.work_units);
+                } else {
+                    const wire = try encoded;
+                    try std.testing.expectEqualSlices(u8, case.wire, wire);
+                    try std.testing.expectEqualDeep(
+                        HcStats{
+                            .work_units = case.work,
+                            .probes = case.probes,
+                            .sequences = case.sequences,
+                        },
+                        workspace.stats,
+                    );
+                    try std.testing.expect(std.mem.allEqual(u8, output[1 + wire.len ..], 0xa7));
+                    _ = try lz4.decodeBlock(
+                        wire,
+                        restored[0..case.source.len],
+                        .{ .dictionary = .{ .newer = case.dictionary } },
+                    );
+                    try std.testing.expectEqualSlices(
+                        u8,
+                        case.source,
+                        restored[0..case.source.len],
+                    );
+                }
+                try std.testing.expectEqual(@as(u8, 0xa7), output[0]);
+                try std.testing.expectEqual(@as(u8, 0xa7), output[output.len - 1]);
+            }
+            // An ample allowance also exercises locally aggregated search charges.
+            const wire = try encodeBlockHc(
+                case.source,
+                &output,
+                workspace,
+                .{ .dictionary = case.dictionary, .profile = profile },
+            );
+            try std.testing.expectEqualSlices(u8, case.wire, wire);
+            try std.testing.expectEqualDeep(
+                HcStats{
+                    .work_units = case.work,
+                    .probes = case.probes,
+                    .sequences = case.sequences,
+                },
+                workspace.stats,
+            );
+        }
+    }
+}
+
 const Match = struct { length: usize = 0, distance: u16 = 0 };
 
 // Read the dictionary and source as one chronological history without copying either span.
@@ -351,39 +462,43 @@ fn findCounted(
         }
 
         if (data.word(candidate_position) == current_word) {
-            var length: usize = 4;
-            // Word comparisons start once the candidate reaches source history. Earlier bytes may
-            // straddle the dictionary boundary and use Data.byte below.
-            while (length + 8 <= maximum and candidate_position + length >= data.dictionary.len) {
-                if (bounded) {
-                    try workspace.charge(1, options.limits.work_units);
-                } else {
-                    work_units += 1;
+            const length = extend: {
+                const dictionary_end = data.dictionary.len;
+                var matched: usize = 4;
+                // Extensions already in source history use whole words. Dictionary-spanning
+                // extensions use Data.byte below.
+                while (matched + 8 <= maximum and candidate_position + matched >= dictionary_end) {
+                    if (bounded) {
+                        try workspace.charge(1, options.limits.work_units);
+                    } else {
+                        work_units += 1;
+                    }
+                    const current_source_position = position + matched - dictionary_end;
+                    const candidate_source_position = candidate_position + matched - dictionary_end;
+                    const current_bytes = data.source[current_source_position..][0..8];
+                    const prior_bytes = data.source[candidate_source_position..][0..8];
+                    const current_chunk = std.mem.readInt(u64, current_bytes, .little);
+                    const candidate_chunk = std.mem.readInt(u64, prior_bytes, .little);
+                    const unequal = current_chunk ^ candidate_chunk;
+                    if (unequal != 0) {
+                        // This comparison already found the first mismatch; do not read it again in
+                        // the scalar tail. Little-endian XOR puts it in the low set bits.
+                        break :extend matched + @ctz(unequal) / 8;
+                    }
+                    matched += 8;
                 }
-                const current_source_position = position + length - data.dictionary.len;
-                const candidate_source_position = candidate_position + length - data.dictionary.len;
-                const current_bytes = data.source[current_source_position..][0..8];
-                const prior_bytes = data.source[candidate_source_position..][0..8];
-                const current_chunk = std.mem.readInt(u64, current_bytes, .little);
-                const candidate_chunk = std.mem.readInt(u64, prior_bytes, .little);
-                const unequal = current_chunk ^ candidate_chunk;
-                if (unequal != 0) {
-                    // Little-endian XOR puts the first differing byte in the low set bits.
-                    length += @ctz(unequal) / 8;
-                    break;
+                while (matched < maximum) : (matched += 1) {
+                    if (bounded) {
+                        try workspace.charge(1, options.limits.work_units);
+                    } else {
+                        work_units += 1;
+                    }
+                    const current_byte = data.byte(position + matched);
+                    const candidate_byte = data.byte(candidate_position + matched);
+                    if (current_byte != candidate_byte) break;
                 }
-                length += 8;
-            }
-            while (length < maximum) : (length += 1) {
-                const current_byte = data.byte(position + length);
-                const candidate_byte = data.byte(candidate_position + length);
-                if (current_byte != candidate_byte) break;
-                if (bounded) {
-                    try workspace.charge(1, options.limits.work_units);
-                } else {
-                    work_units += 1;
-                }
-            }
+                break :extend matched;
+            };
             if (length > result.length) {
                 result = .{ .length = length, .distance = @intCast(position - candidate_position) };
             }
@@ -392,6 +507,122 @@ fn findCounted(
         link = workspace.chains[candidate_position & 65535];
     }
     return result;
+}
+
+test "LZ4 HC independent search costs cover tails words and endpoint rejection" {
+    const allocator = std.testing.allocator;
+    const workspace = try HcEncoderWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const cases = [_]struct {
+        source: []const u8,
+        dictionary: []const u8 = &.{},
+        position: usize,
+        maximum: usize,
+        candidates: []const usize = &.{0},
+        match: Match,
+        work: u64,
+    }{
+        // A probe includes the first four bytes; the failed fifth-byte check is another unit.
+        .{
+            .source = "ABCDx---ABCDy",
+            .position = 8,
+            .maximum = 5,
+            .match = .{ .length = 4, .distance = 8 },
+            .work = 1 + 1,
+        },
+        .{
+            .source = "ABCDEFG-ABCDEFG",
+            .position = 8,
+            .maximum = 7,
+            .match = .{ .length = 7, .distance = 8 },
+            .work = 1 + 3,
+        },
+        // A failed eight-byte comparison already identifies the mismatch; no scalar recheck.
+        .{
+            .source = "ABCDabcdEfgh----ABCDabcdXfgh",
+            .position = 16,
+            .maximum = 12,
+            .match = .{ .length = 8, .distance = 16 },
+            .work = 1 + 1,
+        },
+        .{
+            .source = "ABCDabcdefghx---ABCDabcdefghy",
+            .position = 16,
+            .maximum = 13,
+            .match = .{ .length = 12, .distance = 16 },
+            .work = 1 + 1 + 1,
+        },
+        // The prefix straddles the dictionary boundary, then two bytes match before failure.
+        .{
+            .dictionary = "ABC",
+            .source = "ABCABCx",
+            .position = 3,
+            .maximum = 7,
+            .match = .{ .length = 6, .distance = 3 },
+            .work = 1 + 3,
+        },
+        // The second probe fails its endpoint word check without rescanning the prefix.
+        .{
+            .source = "ABCDx---ABCDy---ABCDz",
+            .position = 16,
+            .maximum = 5,
+            .candidates = &.{ 8, 0 },
+            .match = .{ .length = 4, .distance = 8 },
+            .work = (1 + 1) + (1 + 1),
+        },
+        // The second endpoint passes and one more byte comparison improves the match.
+        .{
+            .source = "ABCDz---ABCDy---ABCDz",
+            .position = 16,
+            .maximum = 5,
+            .candidates = &.{ 8, 0 },
+            .match = .{ .length = 5, .distance = 16 },
+            .work = (1 + 1) + (1 + 1 + 1),
+        },
+    };
+    for (cases) |case| {
+        const data: Data = .{ .dictionary = case.dictionary, .source = case.source };
+        @memset(&workspace.heads, 0);
+        const slot = (data.word(case.position) *% 0x9e3779b1) >> 17;
+        workspace.heads[slot] = @intCast(case.candidates[0] + 1);
+        for (case.candidates, 0..) |position, index| {
+            workspace.chains[position & 65535] = if (index + 1 < case.candidates.len) @intCast(
+                case.candidates[index + 1] + 1,
+            ) else 0;
+        }
+        var budget: u64 = 0;
+        while (budget <= case.work) : (budget += 1) {
+            workspace.stats = .{};
+            const result = find(
+                &data,
+                workspace,
+                case.position,
+                case.maximum,
+                case.candidates.len,
+                .{ .limits = .{ .work_units = budget } },
+            );
+            if (budget < case.work) {
+                try std.testing.expectError(error.LimitExceeded, result);
+                try std.testing.expectEqual(budget, workspace.stats.work_units);
+            } else {
+                try std.testing.expectEqualDeep(case.match, try result);
+                try std.testing.expectEqual(case.work, workspace.stats.work_units);
+                try std.testing.expectEqual(case.candidates.len, workspace.stats.probes);
+            }
+        }
+        workspace.stats = .{};
+        const aggregate = try find(
+            &data,
+            workspace,
+            case.position,
+            case.maximum,
+            case.candidates.len,
+            .{},
+        );
+        try std.testing.expectEqualDeep(case.match, aggregate);
+        try std.testing.expectEqual(case.work, workspace.stats.work_units);
+        try std.testing.expectEqual(case.candidates.len, workspace.stats.probes);
+    }
 }
 
 fn extension(length: usize, threshold: usize) usize {

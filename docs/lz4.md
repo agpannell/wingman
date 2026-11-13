@@ -189,8 +189,11 @@ may be supplied with fast policy without being borrowed.
 Raw/frame decode limits bound accepted input, decoded output and byte work. Frames also bound
 frame count and advertised block size. Frame encoding bounds accepted input and produced wire
 bytes. Byte work counts input plus output once, excluding copied initial dictionaries; it is not
-a wall-clock or complete CPU-instruction budget. HC separately counts insertions, probes,
-comparisons and parser edges. Defaults are permissive: choose finite limits before decoding
+a wall-clock or complete CPU-instruction budget. HC separately charges one unit per insertion,
+eligible chain probe, additional comparison and parser edge. A probe includes its initial four-byte
+prefix check; each later endpoint-word, extension-word or scalar comparison counts even when it
+finds a mismatch. The HC frame allowance covers all its blocks, including search that ultimately
+stores a block verbatim. Defaults are permissive: choose finite limits before decoding
 untrusted input or allocating from an untrusted size. Exhaustion is not successful partial output.
 
 ## Mechanisms and validation

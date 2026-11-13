@@ -1923,6 +1923,83 @@ test "LZ4 HC frames reuse dictionaries linked blocks and fragmented finish" {
     }
 }
 
+test "LZ4 HC independent frame costs include a stored fallback block" {
+    const allocator = std.testing.allocator;
+    const workspace = try FrameEncoderWorkspace.create(allocator, .k64);
+    defer workspace.destroy(allocator);
+    const hc = try high_compression.HcEncoderWorkspace.create(allocator);
+    defer hc.destroy(allocator);
+    const block_bytes = 65536;
+    const tail = "ABCDxABCDy1234567";
+    const source = try allocator.alloc(u8, block_bytes + tail.len);
+    defer allocator.free(source);
+    @memset(source[0..block_bytes], 'A');
+    @memcpy(source[block_bytes..], tail);
+
+    // The first block takes the long-match shortcut after one literal edge, insertion and probe.
+    // Extending its 65,530-byte match compares 8,190 words and six tail bytes. The second block
+    // spends 26 units even though its 17-byte HC result is stored verbatim, without a size win.
+    const first_work = 1 + 1 + 1 + 8190 + 6;
+    const second_work = 11 + 12 + 1 + 1 + 1;
+    const expected_work = first_work + second_work;
+    const options: FrameEncodeOptions = .{
+        .independent = true,
+        .block_checksum = true,
+        .content_size = source.len,
+        .compression = .{ .hc = .{} },
+    };
+    const capacity = try frameEncodeBound(source.len, options);
+    const output = try allocator.alloc(u8, capacity);
+    defer allocator.free(output);
+    const streamed = try allocator.alloc(u8, capacity);
+    defer allocator.free(streamed);
+    const restored = try allocator.alloc(u8, source.len);
+    defer allocator.free(restored);
+    const storage: FrameEncodeStorage = .{ .workspace = workspace, .hc_workspace = hc };
+    const wire = try encodeFrame(source, output, storage, options);
+    _ = try decodeFrame(wire, restored, .{});
+    try std.testing.expectEqualSlices(u8, source, restored);
+
+    var exact = options;
+    exact.compression.hc.limits.work_units = expected_work;
+    const exact_wire = try encodeFrame(source, streamed, storage, exact);
+    try std.testing.expectEqualSlices(u8, wire, exact_wire);
+    var encoder: FrameEncoder = undefined;
+    try encoder.reset(storage, exact);
+    var read: usize = 0;
+    var written: usize = 0;
+    while (true) {
+        const end = @min(read + 127, source.len);
+        const progress = try encoder.step(
+            source[read..end],
+            streamed[written..][0..113],
+            if (end == source.len) .finish else .process,
+        );
+        read += progress.consumed;
+        written += progress.produced;
+        try std.testing.expect(
+            progress.consumed != 0 or progress.produced != 0 or progress.status == .complete,
+        );
+        if (progress.status == .complete) break;
+    }
+    try std.testing.expectEqual(source.len, read);
+    try std.testing.expectEqualSlices(u8, wire, streamed[0..written]);
+    try std.testing.expectEqual(@as(u64, expected_work), encoder.hc_work);
+
+    var short = exact;
+    short.compression.hc.limits.work_units -= 1;
+    try encoder.reset(storage, short);
+    try std.testing.expectError(error.LimitExceeded, encoder.step(source, streamed, .finish));
+    try std.testing.expectEqual(@as(u64, first_work), encoder.hc_work);
+    try std.testing.expectEqual(@as(u64, second_work - 1), hc.stats.work_units);
+    try std.testing.expectError(error.NeedReset, encoder.step(&.{}, streamed, .finish));
+    try encoder.reset(storage, exact);
+    const reused = try encoder.step(source, streamed, .finish);
+    try std.testing.expectEqual(FrameEncodeStatus.complete, reused.status);
+    try std.testing.expectEqualSlices(u8, wire, streamed[0..reused.produced]);
+    try std.testing.expectEqual(@as(u64, expected_work), encoder.hc_work);
+}
+
 test "LZ4 frame complete extent trailing and descriptor admission are independent" {
     const allocator = std.testing.allocator;
     const workspace = try FrameEncoderWorkspace.create(allocator, .k64);

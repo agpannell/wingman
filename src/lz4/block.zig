@@ -639,8 +639,8 @@ noinline fn encodePreparedRaw(
 
 /// Encode an independent block of at most 64 KiB after searching its source once. The preliminary
 /// scan lets frame encoding avoid a second full pass and the encoded-output copy for incompressible
-/// input. A null result means no match exists and a frame can store the original caller-owned
-/// bytes.
+/// input. A null result means the heuristic found no usable match; a frame can store the original
+/// caller-owned bytes.
 pub fn encodeBlockWithInitialProbe(
     source: []const u8,
     output: []u8,
