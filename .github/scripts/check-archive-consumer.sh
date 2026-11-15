@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the package from the exact checked-out commit, then consume only its archive.
+# Consume only an archive of the supplied commit/tree, or HEAD when no revision is given.
+candidate_tree="$(git rev-parse --verify "${1:-HEAD}^{tree}")"
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
-git archive --format=tar.gz --output="$scratch/wingman.tar.gz" HEAD
-cp -R examples/consumer "$scratch/consumer"
+git archive --format=tar.gz --output="$scratch/wingman.tar.gz" "$candidate_tree"
+mkdir "$scratch/consumer"
+tar -xzf "$scratch/wingman.tar.gz" -C "$scratch/consumer" --strip-components=2 examples/consumer
 
 archive_url="file://$scratch/wingman.tar.gz"
 export ZIG_GLOBAL_CACHE_DIR="$scratch/global-cache"
