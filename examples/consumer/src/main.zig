@@ -1160,13 +1160,16 @@ test "BLAKE3 public parallel API permits inline provider and retires workers" {
 test "LZ4 literal wire fixed counts exact extent and spare capacity" {
     var encoded = [_]u8{ 0x50, 'h', 'e', 'l', 'l', 'o' };
     var output: [8]u8 = @splat(0xa5);
-    const bounded = try lz4.decodeBlock(&encoded, &output, .{ .output_size = .bounded });
+    const bounded = try lz4.block.decode.into(&encoded, &output, .{ .output_size = .bounded });
     try std.testing.expectEqual(6, bounded.consumed);
     try std.testing.expectEqual(5, bounded.produced);
     try std.testing.expectEqualStrings("hello", output[0..5]);
     try std.testing.expect(std.mem.allEqual(u8, output[5..], 0xa5));
-    try std.testing.expectError(error.OutputSizeMismatch, lz4.decodeBlock(&encoded, &output, .{}));
-    const exact = try lz4.decodeBlock(&encoded, output[0..5], .{});
+    try std.testing.expectError(
+        error.OutputSizeMismatch,
+        lz4.block.decode.into(&encoded, &output, .{}),
+    );
+    const exact = try lz4.block.decode.into(&encoded, output[0..5], .{});
     @memset(&encoded, 0xff);
     try std.testing.expectEqual(5, exact.produced);
     try std.testing.expectEqualStrings("hello", output[0..5]);
@@ -1176,32 +1179,45 @@ test "LZ4 dictionary blocks greedy HC and finite work refusal" {
     const allocator = std.testing.allocator;
     const dictionary = "dictionary words dictionary words";
     const source = "dictionary words dictionary words plus a final literal tail";
-    const workspace = try lz4.EncoderWorkspace.create(allocator);
+    const workspace = try lz4.block.encode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
-    const hc = try lz4.HcEncoderWorkspace.create(allocator);
+    const hc = try lz4.block.encode.hc.Workspace.create(allocator);
     defer hc.destroy(allocator);
     defer hc.clear();
-    const storage = try allocator.alloc(u8, try lz4.blockEncodeBound(source.len));
+    const storage = try allocator.alloc(u8, try lz4.block.encode.bound(source.len));
     defer allocator.free(storage);
     var output: [source.len]u8 = undefined;
-    const fast_block = try lz4.encodeBlock(
+    const fast_block = try lz4.block.encode.into(
         source,
         storage,
         workspace,
         .{ .dictionary = dictionary },
     );
-    const history: lz4.HistoryView = .{ .older = dictionary[0..10], .newer = dictionary[10..] };
-    _ = try lz4.decodeBlock(fast_block, &output, .{ .dictionary = history });
+    const history: lz4.block.decode.History = .{
+        .older = dictionary[0..10],
+        .newer = dictionary[10..],
+    };
+    _ = try lz4.block.decode.into(fast_block, &output, .{ .history = history });
     try std.testing.expectEqualStrings(source, &output);
-    const hc_block = try lz4.encodeBlockHc(source, storage, hc, .{ .dictionary = dictionary });
-    _ = try lz4.decodeBlock(hc_block, &output, .{ .dictionary = history });
+    const hc_block = try lz4.block.encode.hc.into(
+        source,
+        storage,
+        hc,
+        .{ .dictionary = dictionary },
+    );
+    _ = try lz4.block.decode.into(hc_block, &output, .{ .history = history });
     try std.testing.expectEqualStrings(source, &output);
     try std.testing.expect(hc.stats.work_units > 0);
     try std.testing.expectError(
         error.LimitExceeded,
-        lz4.encodeBlockHc(source, storage, hc, .{ .limits = .{ .work_units = 0 } }),
+        lz4.block.encode.hc.into(
+            source,
+            storage,
+            hc,
+            .{ .policy = .{ .limits = .{ .work_units = 0 } } },
+        ),
     );
-    _ = try lz4.encodeBlockHc(source, storage, hc, .{});
+    _ = try lz4.block.encode.hc.into(source, storage, hc, .{});
 }
 
 test "LZ4 raw decoder retires one-byte fragments and requires reset after failure" {
@@ -1209,7 +1225,7 @@ test "LZ4 raw decoder retires one-byte fragments and requires reset after failur
     const allocator = std.testing.allocator;
     const history = try allocator.create([65536]u8);
     defer allocator.destroy(history);
-    var decoder: lz4.Decoder = undefined;
+    var decoder: lz4.block.decode.StreamDecoder = undefined;
     try decoder.reset(history, .{});
     var read: usize = 0;
     var written: usize = 0;
@@ -1233,7 +1249,7 @@ test "LZ4 raw decoder retires one-byte fragments and requires reset after failur
     try std.testing.expectEqual(wire.len, read);
     try std.testing.expectEqualStrings("hello", &restored);
     const complete = try decoder.step(.{ .bytes = &.{}, .final = true }, &.{});
-    try std.testing.expectEqual(lz4.DecodeStatus.complete, complete.status);
+    try std.testing.expectEqual(lz4.block.decode.StreamDecoder.Status.complete, complete.status);
     try std.testing.expectEqual(0, complete.produced);
     try decoder.reset(history, .{});
     try std.testing.expectError(
@@ -1249,29 +1265,29 @@ test "LZ4 raw decoder retires one-byte fragments and requires reset after failur
 test "LZ4 standard frames checksums concatenation and skippable boundaries" {
     const allocator = std.testing.allocator;
     const source = "a repeated phrase: a repeated phrase: a repeated phrase";
-    const options: lz4.FrameEncodeOptions = .{
+    const options: lz4.frame.encode.Options = .{
         .block_checksum = true,
         .content_size = source.len,
         .independent = false,
     };
-    const workspace = try lz4.FrameEncoderWorkspace.create(allocator, .k64);
+    const workspace = try lz4.frame.encode.Workspace.create(allocator, .k64);
     defer workspace.destroy(allocator);
-    const storage = try allocator.alloc(u8, try lz4.frameEncodeBound(source.len, options));
+    const storage = try allocator.alloc(u8, try lz4.frame.encode.bound(source.len, options));
     defer allocator.free(storage);
-    const frame = try lz4.encodeFrame(source, storage, .{ .workspace = workspace }, options);
+    const frame = try lz4.frame.encode.into(source, storage, .{ .workspace = workspace }, options);
     try std.testing.expectEqualSlices(u8, &.{ 4, 0x22, 0x4d, 0x18 }, frame[0..4]);
     var skip_storage: [12]u8 = undefined;
-    const skip = try lz4.encodeSkippableFrame("note", &skip_storage, 15);
+    const skip = try lz4.frame.encode.skippable.into("note", &skip_storage, 15);
     const sequence = try allocator.alloc(u8, skip.len + frame.len * 2);
     defer allocator.free(sequence);
     @memcpy(sequence[0..skip.len], skip);
     @memcpy(sequence[skip.len..][0..frame.len], frame);
     @memcpy(sequence[skip.len + frame.len ..], frame);
-    const first = try lz4.decodeFrame(sequence, &.{}, .{});
+    const first = try lz4.frame.decode.into(sequence, &.{}, .{});
     try std.testing.expectEqual(skip.len, first.consumed);
     try std.testing.expectEqual(0, first.produced);
     var output: [source.len * 2 + 7]u8 = @splat(0xa5);
-    const complete = try lz4.decodeFrame(
+    const complete = try lz4.frame.decode.into(
         sequence,
         &output,
         .{ .frames = .concatenate, .trailing_data = .reject },
@@ -1283,7 +1299,7 @@ test "LZ4 standard frames checksums concatenation and skippable boundaries" {
     try std.testing.expectEqualStrings(source, output[source.len..][0..source.len]);
     try std.testing.expect(std.mem.allEqual(u8, output[complete.produced..], 0xa5));
     frame[frame.len - 1] ^= 1;
-    try std.testing.expectError(error.ChecksumMismatch, lz4.decodeFrame(frame, &output, .{}));
+    try std.testing.expectError(error.ChecksumMismatch, lz4.frame.decode.into(frame, &output, .{}));
 }
 
 test "BVH owned samples and public rigid transforms compose outside the package" {

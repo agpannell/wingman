@@ -176,8 +176,10 @@ test "complete and streaming checksums" {
 Input byte slices need no padding or extra alignment. Storage and lifetimes are explicit:
 
 - Checksum and hash updates retain no input chunks. XXH3 custom-secret streams borrow the secret.
-- LZ4 complete calls retain no input; resumable owners borrow their workspace and copy accepted
-  fragments. Output stays private until completion and any required integrity checks succeed.
+- DEFLATE, zlib, gzip and LZ4 use caller-owned storage. Complete calls retain no buffers;
+  streaming workers borrow their reservations and retire fragments through progress counts.
+  Encoding returns a borrowed prefix of caller output. Publish recovered bytes after complete
+  validation and any required enclosing integrity checks.
 - RIFF and WAVE inspection views borrow encoded input. Keep it alive while using those views or
   the Microsoft coefficient bytes in a WAVE format description.
 - Raw audio decoders write caller-provided storage. WAVE decoding offers either caller samples

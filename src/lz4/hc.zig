@@ -1,102 +1,128 @@
-//! Bounded offline LZ4 parsing with exact token/extension prices. The wire format is the ordinary
-//! LZ4 block format; no special decoder is needed. This implementation uses a 2 KiB parsing
-//! horizon, one path per position, and a long-match shortcut. It does not claim global optimality.
-//! Algorithm references: LZ4 1.10.0 lib/lz4hc.c (BSD-2-Clause), especially LZ4HC_literalsPrice,
-//! LZ4HC_sequencePrice and its bounded optimal parser.
+//! High-compression (HC) LZ4 encoding searches prior matches and prices sequences by their exact
+//! serialized byte cost. It produces ordinary LZ4 blocks; no special decoder is needed. This
+//! implementation uses a 2 KiB parsing horizon, one path per position, and a long-match shortcut.
+//! It does not claim global optimality. Algorithm references: LZ4 1.10.0 lib/lz4hc.c
+//! (BSD-2-Clause), especially LZ4HC_literalsPrice, LZ4HC_sequencePrice and its bounded optimal
+//! parser.
 
 const std = @import("std");
 const overlaps = @import("../common/byte_ranges.zig").overlaps;
 
-const lz4 = @import("block.zig");
+const encoding = @import("block_encode.zig");
+const test_decoding = @import("block_recovery.zig"); // Inline recovery comparisons only.
+const Writer = @import("BlockWriter.zig");
+const maximum_distance = @import("block.zig").maximum_distance;
 
-/// Search budgets, independent of upstream compression level numbers.
-pub const HcProfile = enum {
-    /// Shallower search, with at most 128 chain probes per position.
-    balanced,
-    /// Deeper search for smaller output, with at most 4096 probes per position.
-    offline,
+/// Dictionary-free search policy. Its allowance covers the enclosing raw call or every HC block in
+/// one frame, including repeated dictionary priming and stored fallbacks.
+pub const Policy = struct {
+    /// Search budgets, independent of upstream compression level numbers.
+    pub const Profile = enum {
+        /// Shallower search, with at most 128 chain probes per position.
+        balanced,
+        /// Deeper search for smaller output, with at most 4096 probes per position.
+        offline,
+    };
+
+    /// Size prices only serialized bytes; throughput also prices each match and short overlapping
+    /// copies. This is a heuristic, not a latency guarantee.
+    pub const DecoderCost = enum {
+        /// Minimize serialized byte cost.
+        size,
+        /// Also penalize match dispatch and short overlapping copies during decoding.
+        throughput,
+    };
+
+    /// Per-operation search/parser admission, including dictionary priming. Each insertion,
+    /// eligible chain probe and parser edge costs one unit. A probe includes its initial four-byte
+    /// prefix check; each additional endpoint-word, extension-word or byte comparison costs one,
+    /// even on a mismatch. Hashing, table clearing, path reconstruction and wire writing are
+    /// outside this unit model.
+    pub const Limits = struct {
+        /// Maximum admitted units; exhaustion returns LimitExceeded before the next charged
+        /// operation.
+        work_units: u64 = std.math.maxInt(u64),
+    };
+
+    /// Search depth/long-match policy, independent of upstream numeric compression levels.
+    profile: Profile = .offline,
+    /// Serialized-size pricing alone or a heuristic penalty for costly decoded matches.
+    decoder_cost: DecoderCost = .size,
+    /// Operation-wide search/parser allowance.
+    limits: Limits = .{},
 };
 
-/// Size prices only serialized bytes; throughput also prices each match and short overlapping
-/// copies. This is a heuristic, not a latency guarantee.
-pub const HcDecoderCost = enum {
-    /// Minimize serialized byte cost.
-    size,
-    /// Also penalize match dispatch and short overlapping copies during decoding.
-    throughput,
-};
-
-/// Per-block search/parser admission, including dictionary priming. Each insertion, eligible chain
-/// probe and parser edge costs one unit. A probe includes its initial four-byte prefix check; each
-/// additional endpoint-word, extension-word or byte comparison costs one, even on a mismatch.
-/// Hashing, table clearing, path reconstruction and wire writing are outside this unit model.
-pub const HcEncodeLimits = struct {
-    /// Maximum admitted units; exhaustion returns LimitExceeded before the next charged operation.
-    work_units: u64 = std.math.maxInt(u64),
-};
-
-/// Dictionary and bounded search policy for a complete high-compression block.
-pub const HcEncodeOptions = struct {
-    /// Immutable history for this complete call, trimmed to the last 65,535 bytes.
+/// Dictionary and search policy for one complete high-compression block.
+pub const Options = struct {
+    /// Immutable initial history, trimmed to its reachable 65,535-byte suffix.
     dictionary: []const u8 = &.{},
-    profile: HcProfile = .offline,
-    decoder_cost: HcDecoderCost = .size,
-    limits: HcEncodeLimits = .{},
+    /// Dictionary-free search choices and allowance for this complete call.
+    policy: Policy = .{},
 };
 
 /// Copied effort and format statistics, reset on each admitted operation.
-pub const HcStats = struct { work_units: u64 = 0, probes: u64 = 0, sequences: u64 = 0 };
+pub const Stats = struct {
+    /// Admitted search and parser units under Policy.Limits.
+    work_units: u64 = 0,
+    /// Eligible chain candidates examined, including their initial prefix checks.
+    probes: u64 = 0,
+    /// Match sequences emitted before the final literal sequence.
+    sequences: u64 = 0,
+};
 
 /// HC resource failures in addition to the ordinary block contract.
-pub const HcError = lz4.Error || error{LimitExceeded};
+pub const Error = encoding.Error || error{LimitExceeded};
 
 const horizon = 2048;
 const hashes = 32768;
+// Cheapest path to a byte position in the active parsing horizon. A literal edge has match zero; a
+// match edge records its decoded length and backward distance. Previous indexes the predecessor
+// within this horizon; literals counts that path's pending run after its preceding match edge.
 const Node = struct { price: u32, literals: u32, previous: u16, match: u16, distance: u16 };
 
 /// Fixed, address-stable HC scratch. No input or allocator is retained. The greedy encoder's 16 KiB
-/// `EncoderWorkspace` is separate from this scratch.
-pub const HcEncoderWorkspace = struct {
+/// `block.encode.Workspace` is separate from this scratch.
+pub const Workspace = struct {
+    /// Internal one-based latest position for each four-byte hash.
     heads: [hashes]u32,
+    /// Internal predecessor links indexed by the low sixteen position bits.
     chains: [65536]u32,
+    /// Internal cheapest parser state for each byte of the active horizon.
     nodes: [horizon + 1]Node,
+    /// Internal reverse predecessor walk, reused while emitting the selected parse.
     path: [horizon]u16,
-    stats: HcStats,
+    /// Read-only statistics for the last admitted operation, including partial work on failure.
+    stats: Stats,
 
-    /// Allocates scratch at its final address; `encodeBlockHc` initializes it.
-    pub fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*HcEncoderWorkspace {
-        return allocator.create(HcEncoderWorkspace);
+    /// Allocates scratch at its final address; `into` initializes it.
+    pub fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*Workspace {
+        return allocator.create(Workspace);
     }
 
     /// Releases scratch through its construction authority.
-    pub fn destroy(self: *HcEncoderWorkspace, allocator: std.mem.Allocator) void {
+    pub fn destroy(self: *Workspace, allocator: std.mem.Allocator) void {
         allocator.destroy(self);
     }
 
     /// Erases retained source-derived tables and statistics after final use.
-    pub fn clear(self: *HcEncoderWorkspace) void {
+    pub fn clear(self: *Workspace) void {
         std.crypto.secureZero(u8, std.mem.asBytes(self));
     }
 
-    fn charge(self: *HcEncoderWorkspace, amount: u64, limit: u64) HcError!void {
+    fn charge(self: *Workspace, amount: u64, limit: u64) Error!void {
         if (amount > limit - self.stats.work_units) return error.LimitExceeded;
         self.stats.work_units += amount;
     }
 };
 
-/// Encodes an ordinary raw block using bounded HC parsing. Requires the full blockEncodeBound
-/// capacity, exact disjoint spans and no padding. Dictionary bytes are borrowed for this call; only
-/// their last 65,535 bytes are used. Failure leaves output unpublished; reuse is valid after any
-/// result.
-pub fn encodeBlockHc(
-    source: []const u8,
-    output: []u8,
-    workspace: *HcEncoderWorkspace,
-    options: HcEncodeOptions,
-) HcError![]u8 {
+/// Encodes an ordinary raw block using bounded HC parsing. Requires full
+/// `block.encode.bound(source.len)` capacity, exact disjoint spans and no padding. Dictionary bytes
+/// are borrowed for this call; only their last 65,535 bytes are used. Failure leaves output
+/// unpublished; reuse is valid after any result.
+pub fn into(source: []const u8, output: []u8, workspace: *Workspace, options: Options) Error![]u8 {
     const dictionary = options.dictionary;
-    const bound = try lz4.blockEncodeBound(source.len);
-    const dict = dictionary[dictionary.len - @min(dictionary.len, lz4.maximum_distance) ..];
+    const bound = try encoding.bound(source.len);
+    const dict = dictionary[dictionary.len - @min(dictionary.len, maximum_distance) ..];
     const scratch = std.mem.asBytes(workspace);
     if (overlaps(source, output)) return error.Aliasing;
     if (overlaps(source, scratch) or overlaps(output, scratch)) return error.Aliasing;
@@ -108,17 +134,20 @@ pub fn encodeBlockHc(
     const data: Data = .{ .dictionary = dict, .source = source };
     var inserted: usize = 0;
     while (inserted < dict.len and inserted + 4 <= data.len()) : (inserted += 1) {
-        try insert(&data, workspace, inserted, options.limits.work_units);
+        try insert(&data, workspace, inserted, options.policy.limits.work_units);
     }
 
+    // Full block encoding-bound admission covers every exact sequence write, including worst-case
+    // match splits and extension bytes. Wire emission is shared with greedy encoding; parser prices
+    // and the independent expected-wire fixtures do not depend on that writer.
     var writer: Writer = .{ .bytes = output };
     var cursor: usize = 0;
     var anchor: usize = 0;
-    const nice: usize = switch (options.profile) {
+    const nice: usize = switch (options.policy.profile) {
         .balanced => 64,
         .offline => 256,
     };
-    const depth: usize = switch (options.profile) {
+    const depth: usize = switch (options.policy.profile) {
         .balanced => 128,
         .offline => 4096,
     };
@@ -156,12 +185,19 @@ pub fn encodeBlockHc(
             const position = cursor + i;
             const absolute = dict.len + position;
             while (inserted < absolute) : (inserted += 1) {
-                try insert(&data, workspace, inserted, options.limits.work_units);
+                try insert(&data, workspace, inserted, options.policy.limits.work_units);
             }
             const match: Match = blk: {
                 if (position > source.len - 12) break :blk .{};
                 const maximum = source.len - 5 - position;
-                break :blk try find(&data, workspace, absolute, maximum, depth, options);
+                break :blk try find(
+                    &data,
+                    workspace,
+                    absolute,
+                    maximum,
+                    depth,
+                    options.policy.limits.work_units,
+                );
             };
             if (match.length >= nice) {
                 terminal = i;
@@ -170,7 +206,7 @@ pub fn encodeBlockHc(
             }
             // A literal edge adds one byte and pays only when it crosses an extension boundary.
             const node = workspace.nodes[i];
-            try workspace.charge(1, options.limits.work_units);
+            try workspace.charge(1, options.policy.limits.work_units);
             const added_extension = extension(node.literals + 1, 15) - extension(node.literals, 15);
             const literal_byte_price: u32 = 1;
             const literal_extension_price: u32 = @intCast(added_extension);
@@ -187,10 +223,10 @@ pub fn encodeBlockHc(
 
             var length: usize = 4;
             while (length <= @min(match.length, count - i)) : (length += 1) {
-                try workspace.charge(1, options.limits.work_units);
+                try workspace.charge(1, options.policy.limits.work_units);
                 // Decoder-cost mode penalizes short, overlapping copies heuristically.
                 const penalty: u32 = blk: {
-                    if (options.decoder_cost != .throughput) break :blk 0;
+                    if (options.policy.decoder_cost != .throughput) break :blk 0;
                     const short_overlap: u32 = @intFromBool(match.distance < 8);
                     break :blk 2 + short_overlap * 2;
                 };
@@ -243,7 +279,7 @@ pub fn encodeBlockHc(
 
 test "LZ4 HC independent block costs include comparisons and dictionary priming" {
     const allocator = std.testing.allocator;
-    const workspace = try HcEncoderWorkspace.create(allocator);
+    const workspace = try Workspace.create(allocator);
     defer workspace.destroy(allocator);
 
     // These totals count the operations in each tiny parse, independently of reported statistics.
@@ -284,18 +320,17 @@ test "LZ4 HC independent block costs include comparisons and dictionary priming"
     var output: [66]u8 = undefined;
     var restored: [32]u8 = undefined;
     for (cases) |case| {
-        for ([_]HcProfile{ .balanced, .offline }) |profile| {
+        for ([_]Policy.Profile{ .balanced, .offline }) |profile| {
             var budget: u64 = 0;
             while (budget <= case.work) : (budget += 1) {
                 @memset(&output, 0xa7);
-                const encoded = encodeBlockHc(
+                const encoded = into(
                     case.source,
                     output[1 .. output.len - 1],
                     workspace,
                     .{
                         .dictionary = case.dictionary,
-                        .profile = profile,
-                        .limits = .{ .work_units = budget },
+                        .policy = .{ .profile = profile, .limits = .{ .work_units = budget } },
                     },
                 );
                 if (budget < case.work) {
@@ -305,7 +340,7 @@ test "LZ4 HC independent block costs include comparisons and dictionary priming"
                     const wire = try encoded;
                     try std.testing.expectEqualSlices(u8, case.wire, wire);
                     try std.testing.expectEqualDeep(
-                        HcStats{
+                        Stats{
                             .work_units = case.work,
                             .probes = case.probes,
                             .sequences = case.sequences,
@@ -313,10 +348,10 @@ test "LZ4 HC independent block costs include comparisons and dictionary priming"
                         workspace.stats,
                     );
                     try std.testing.expect(std.mem.allEqual(u8, output[1 + wire.len ..], 0xa7));
-                    _ = try lz4.decodeBlock(
+                    _ = try test_decoding.into(
                         wire,
                         restored[0..case.source.len],
-                        .{ .dictionary = .{ .newer = case.dictionary } },
+                        .{ .history = .{ .newer = case.dictionary } },
                     );
                     try std.testing.expectEqualSlices(
                         u8,
@@ -328,15 +363,15 @@ test "LZ4 HC independent block costs include comparisons and dictionary priming"
                 try std.testing.expectEqual(@as(u8, 0xa7), output[output.len - 1]);
             }
             // An ample allowance also exercises locally aggregated search charges.
-            const wire = try encodeBlockHc(
+            const wire = try into(
                 case.source,
                 &output,
                 workspace,
-                .{ .dictionary = case.dictionary, .profile = profile },
+                .{ .dictionary = case.dictionary, .policy = .{ .profile = profile } },
             );
             try std.testing.expectEqualSlices(u8, case.wire, wire);
             try std.testing.expectEqualDeep(
-                HcStats{
+                Stats{
                     .work_units = case.work,
                     .probes = case.probes,
                     .sequences = case.sequences,
@@ -381,12 +416,7 @@ const Data = struct {
     }
 };
 
-fn insert(
-    data: *const Data,
-    workspace: *HcEncoderWorkspace,
-    position: usize,
-    limit: u64,
-) HcError!void {
+fn insert(data: *const Data, workspace: *Workspace, position: usize, limit: u64) Error!void {
     try workspace.charge(1, limit);
     const hash_word = data.word(position);
     const slot = (hash_word *% 0x9e3779b1) >> 17;
@@ -396,31 +426,31 @@ fn insert(
 
 fn find(
     data: *const Data,
-    workspace: *HcEncoderWorkspace,
+    workspace: *Workspace,
     position: usize,
     maximum: usize,
     depth: usize,
-    options: HcEncodeOptions,
-) HcError!Match {
+    work_limit: u64,
+) Error!Match {
     // A chain probe can cost at most one visit, one endpoint check and `maximum` byte comparisons.
     // When that upper bound fits, findCounted(false) accumulates exact work locally and charges it
     // once; near the budget boundary, findCounted(true) checks each unit so exhaustion is exact.
     const bound: u64 = @as(u64, depth) * (maximum + 2);
-    if (bound <= options.limits.work_units - workspace.stats.work_units) {
-        return findCounted(false, data, workspace, position, maximum, depth, options);
+    if (bound <= work_limit - workspace.stats.work_units) {
+        return findCounted(false, data, workspace, position, maximum, depth, work_limit);
     }
-    return findCounted(true, data, workspace, position, maximum, depth, options);
+    return findCounted(true, data, workspace, position, maximum, depth, work_limit);
 }
 
 fn findCounted(
     comptime bounded: bool,
     data: *const Data,
-    workspace: *HcEncoderWorkspace,
+    workspace: *Workspace,
     position: usize,
     maximum: usize,
     depth: usize,
-    options: HcEncodeOptions,
-) HcError!Match {
+    work_limit: u64,
+) Error!Match {
     const current_word = data.word(position);
     const slot = (current_word *% 0x9e3779b1) >> 17;
     var link = workspace.heads[slot];
@@ -435,12 +465,12 @@ fn findCounted(
     while (link != 0 and probes < depth) : (probes += 1) {
         // Links store position + 1 so zero remains the empty-table sentinel.
         const candidate_position: usize = link - 1;
-        if (candidate_position >= position or position - candidate_position > lz4.maximum_distance)
+        if (candidate_position >= position or position - candidate_position > maximum_distance)
             // Newer chain links point only to older positions, so the distance limit excludes every
             // remaining candidate as well.
             break;
         if (bounded) {
-            try workspace.charge(1, options.limits.work_units);
+            try workspace.charge(1, work_limit);
         } else {
             work_units += 1;
         }
@@ -450,7 +480,7 @@ fn findCounted(
         // rescanning a potentially very long shared prefix.
         if (result.length >= 4 and result.length < maximum) {
             if (bounded) {
-                try workspace.charge(1, options.limits.work_units);
+                try workspace.charge(1, work_limit);
             } else {
                 work_units += 1;
             }
@@ -469,7 +499,7 @@ fn findCounted(
                 // extensions use Data.byte below.
                 while (matched + 8 <= maximum and candidate_position + matched >= dictionary_end) {
                     if (bounded) {
-                        try workspace.charge(1, options.limits.work_units);
+                        try workspace.charge(1, work_limit);
                     } else {
                         work_units += 1;
                     }
@@ -489,7 +519,7 @@ fn findCounted(
                 }
                 while (matched < maximum) : (matched += 1) {
                     if (bounded) {
-                        try workspace.charge(1, options.limits.work_units);
+                        try workspace.charge(1, work_limit);
                     } else {
                         work_units += 1;
                     }
@@ -511,7 +541,7 @@ fn findCounted(
 
 test "LZ4 HC independent search costs cover tails words and endpoint rejection" {
     const allocator = std.testing.allocator;
-    const workspace = try HcEncoderWorkspace.create(allocator);
+    const workspace = try Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const cases = [_]struct {
         source: []const u8,
@@ -599,7 +629,7 @@ test "LZ4 HC independent search costs cover tails words and endpoint rejection" 
                 case.position,
                 case.maximum,
                 case.candidates.len,
-                .{ .limits = .{ .work_units = budget } },
+                budget,
             );
             if (budget < case.work) {
                 try std.testing.expectError(error.LimitExceeded, result);
@@ -617,7 +647,7 @@ test "LZ4 HC independent search costs cover tails words and endpoint rejection" 
             case.position,
             case.maximum,
             case.candidates.len,
-            .{},
+            std.math.maxInt(u64),
         );
         try std.testing.expectEqualDeep(case.match, aggregate);
         try std.testing.expectEqual(case.work, workspace.stats.work_units);
@@ -633,96 +663,53 @@ fn literalPrice(length: usize) usize {
     return 1 + length + extension(length, 15);
 }
 
-// Full blockEncodeBound admission proves all writes, including worst-case match splits. Every match
-// replaces at least four bytes with at most three bytes.
-const Writer = struct {
-    bytes: []u8,
-    cursor: usize = 0,
-
-    fn byte(self: *Writer, value: u8) void {
-        self.bytes[self.cursor] = value;
-        self.cursor += 1;
-    }
-
-    fn extended(self: *Writer, count: usize) void {
-        var remaining = count;
-        while (remaining >= 255) : (remaining -= 255) self.byte(255);
-        self.byte(@intCast(remaining));
-    }
-
-    fn literals(self: *Writer, bytes: []const u8) void {
-        if (bytes.len >= 15) self.extended(bytes.len - 15);
-        @memcpy(self.bytes[self.cursor..][0..bytes.len], bytes);
-        self.cursor += bytes.len;
-    }
-
-    fn sequence(self: *Writer, bytes: []const u8, distance: u16, length: usize) void {
-        const literal_bits: u8 = @as(u8, @intCast(@min(bytes.len, 15))) << 4;
-        const match_bits: u8 = @intCast(@min(length - 4, 15));
-        self.byte(literal_bits | match_bits);
-        self.literals(bytes);
-        std.mem.writeInt(u16, self.bytes[self.cursor..][0..2], distance, .little);
-        self.cursor += 2;
-        if (length >= 19) self.extended(length - 19);
-    }
-
-    fn final(self: *Writer, bytes: []const u8) void {
-        self.byte(@as(u8, @intCast(@min(bytes.len, 15))) << 4);
-        self.literals(bytes);
-    }
-};
-
 test "LZ4 HC bounded parsing dictionaries budgets and clearing" {
-    const last: [*]const u8 = @ptrFromInt(std.math.maxInt(usize));
-    try std.testing.expect(overlaps(last[0..1], last[0..1]));
     const allocator = std.testing.allocator;
-    const workspace = try HcEncoderWorkspace.create(allocator);
+    const workspace = try Workspace.create(allocator);
     defer workspace.destroy(allocator);
     var source: [12000]u8 = undefined;
     for (&source, 0..) |*b, i| b.* = @intCast((i *% 137 + i / 19) % 251);
     @memcpy(source[6000..], source[0..6000]);
-    const output = try allocator.alloc(u8, try lz4.blockEncodeBound(source.len));
+    const output = try allocator.alloc(u8, try encoding.bound(source.len));
     defer allocator.free(output);
     var decoded: [source.len]u8 = undefined;
-    for ([_]HcProfile{ .balanced, .offline }) |profile| {
+    for ([_]Policy.Profile{ .balanced, .offline }) |profile| {
         @memset(output, 0xa7);
-        const wire = try encodeBlockHc(
+        const wire = try into(
             &source,
             output,
             workspace,
-            .{ .profile = profile, .dictionary = source[0..4096] },
+            .{ .dictionary = source[0..4096], .policy = .{ .profile = profile } },
         );
-        _ = try lz4.decodeBlock(wire, &decoded, .{ .dictionary = .{ .newer = source[0..4096] } });
+        _ = try test_decoding.into(wire, &decoded, .{ .history = .{ .newer = source[0..4096] } });
         try std.testing.expectEqualSlices(u8, &source, &decoded);
         try std.testing.expect(std.mem.allEqual(u8, output[wire.len..], 0xa7));
         const work_units = workspace.stats.work_units;
-        _ = try encodeBlockHc(
+        _ = try into(
             &source,
             output,
             workspace,
             .{
-                .profile = profile,
-                .limits = .{ .work_units = work_units },
                 .dictionary = source[0..4096],
+                .policy = .{ .profile = profile, .limits = .{ .work_units = work_units } },
             },
         );
         try std.testing.expectError(
             error.LimitExceeded,
-            encodeBlockHc(
+            into(
                 &source,
                 output,
                 workspace,
                 .{
-                    .profile = profile,
-                    .limits = .{ .work_units = work_units - 1 },
                     .dictionary = source[0..4096],
+                    .policy = .{ .profile = profile, .limits = .{ .work_units = work_units - 1 } },
                 },
             ),
         );
     }
     try std.testing.expectError(
         error.Aliasing,
-        encodeBlockHc(source[0..20], &source, workspace, .{ .dictionary = &.{} }),
+        into(source[0..20], &source, workspace, .{ .dictionary = &.{} }),
     );
     workspace.clear();
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(workspace), 0));
