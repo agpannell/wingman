@@ -1000,7 +1000,8 @@ pub const FrameEncoder = struct {
     const Phase = enum { pending, prefix, body, suffix, input, footer, done, failed };
 
     /// Begins a frame and copies the dictionary suffix. Existing buffer reservations may be reused
-    /// for any block size that fits their capacity.
+    /// for any block size that fits their capacity. Refused reset preserves the active stream and
+    /// workspace contents.
     pub fn reset(
         self: *FrameEncoder,
         storage: FrameEncodeStorage,
@@ -1024,11 +1025,15 @@ pub const FrameEncoder = struct {
             try checkEncoderStorage(self, workspace, hc_workspace, dictSuffix(dict.bytes));
         }
 
+        // Admit the frame before replacing a usable encoder or copying its dictionary.
+        var counter: Counter = .init(options.limits);
+        try counter.frame();
+
         self.* = .{
             .workspace = workspace,
             .options = options,
             .hc_workspace = hc_workspace,
-            .counter = .init(options.limits),
+            .counter = counter,
             .input_used = 0,
             .dictionary_size = 0,
             .history_size = 0,
@@ -1053,7 +1058,6 @@ pub const FrameEncoder = struct {
             self.dictionary_size = bytes.len;
             self.history_size = bytes.len;
         }
-        try self.counter.frame();
         const size = writeHeader(&self.small, options);
         self.pending = self.small[0..size];
     }
@@ -2091,4 +2095,79 @@ test "LZ4 frame HC storage refusals preserve the active encoder and allow retry"
     var restored: [source.len]u8 = undefined;
     _ = try decodeFrame(actual[0..retried.produced], &restored, .{ .output_size = .exact });
     try std.testing.expectEqualStrings(source, &restored);
+}
+
+test "LZ4 frame allowance refusals preserve staged input and copied dictionaries" {
+    const allocator = std.testing.allocator;
+    const workspace = try FrameEncoderWorkspace.create(allocator, .k64);
+    defer workspace.destroy(allocator);
+    const source = "active state keeps copied dictionary and staged input available";
+    const options: FrameEncodeOptions = .{
+        .independent = false,
+        .content_size = source.len,
+        .dictionary = .{ .bytes = "active state ", .id = 17 },
+    };
+    var expected_bytes: [256]u8 = undefined;
+    const expected = try encodeFrame(source, &expected_bytes, .{ .workspace = workspace }, options);
+
+    // Initialize every reservation before taking snapshots; reset will replace only dictionary
+    // prefixes, while process stages the first seven source bytes without emitting a block.
+    @memset(workspace.input, 0x31);
+    @memset(workspace.encoded, 0x52);
+    @memset(&workspace.history, 0x73);
+    @memset(&workspace.dictionary, 0x94);
+    @memset(&workspace.codec.positions, 0xb5b5b5b5);
+    var encoder: FrameEncoder = undefined;
+    try encoder.reset(.{ .workspace = workspace }, options);
+    var actual: [256]u8 = undefined;
+    const staged = try encoder.step(source[0..7], &actual, .process);
+    try std.testing.expectEqual(FrameEncodeStatus.need_input, staged.status);
+    try std.testing.expectEqual(7, staged.consumed);
+    const admitted = .{
+        encoder.counter, encoder.input_used, encoder.dictionary_size, encoder.history_size,
+        encoder.hc_work,
+    };
+    const reservations = [_][]const u8{
+        workspace.input,
+        workspace.encoded,
+        &workspace.history,
+        &workspace.dictionary,
+        std.mem.asBytes(&workspace.codec),
+    };
+    var snapshots: [reservations.len][]u8 = @splat(&.{});
+    defer for (snapshots) |snapshot| allocator.free(snapshot);
+    for (reservations, &snapshots) |bytes, *snapshot| snapshot.* = try allocator.dupe(u8, bytes);
+
+    try std.testing.expectError(
+        error.LimitExceeded,
+        encoder.reset(
+            .{ .workspace = workspace },
+            .{
+                .dictionary = .{ .bytes = "replacement dictionary", .id = 29 },
+                .limits = .{ .frames = 0 },
+            },
+        ),
+    );
+    try std.testing.expectEqualDeep(
+        admitted,
+        .{
+            encoder.counter, encoder.input_used, encoder.dictionary_size, encoder.history_size,
+            encoder.hc_work,
+        },
+    );
+    for (reservations, snapshots) |bytes, snapshot| {
+        try std.testing.expectEqualSlices(u8, snapshot, bytes);
+    }
+    const finished = try encoder.step(
+        source[staged.consumed..],
+        actual[staged.produced..],
+        .finish,
+    );
+    try std.testing.expectEqual(FrameEncodeStatus.complete, finished.status);
+    try std.testing.expectEqual(source.len - staged.consumed, finished.consumed);
+    try std.testing.expectEqualSlices(
+        u8,
+        expected,
+        actual[0 .. staged.produced + finished.produced],
+    );
 }
