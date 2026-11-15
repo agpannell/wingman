@@ -3,6 +3,9 @@
 const std = @import("std");
 const zlib = @import("../zlib.zig");
 
+/// Backing allocation failure, size overflow or insufficient caller storage.
+pub const WorkspaceError = std.mem.Allocator.Error || error{ SizeOverflow, WorkspaceTooSmall };
+
 /// Native encoder reservation backed by caller storage or an allocation. Copies share the same
 /// state and must not be used concurrently. Release an allocated reservation with its allocator.
 pub const Workspace = WorkspaceImpl(zlib.encode.StreamEncoder, zlib.encode.Workspace);
@@ -27,8 +30,7 @@ fn WorkspaceImpl(comptime EncoderType: type, comptime WorkspaceType: type) type 
 
         /// Byte-aligned request for the native state and its worst-case alignment padding.
         pub const minimum_bytes = @sizeOf(State) + @alignOf(State) - 1;
-        /// Reservation overflow or exhaustion of caller storage.
-        pub const Error = std.mem.Allocator.Error || error{ SizeOverflow, WorkspaceTooSmall };
+        pub const Error = WorkspaceError;
 
         /// Complete single-span request for encoding and extra scratch, without allocation.
         pub fn byteCount(extra_bytes: usize) error{SizeOverflow}!usize {
@@ -133,8 +135,12 @@ fn WorkspaceImpl(comptime EncoderType: type, comptime WorkspaceType: type) type 
 }
 
 /// Native codec refusal or failure to deliver compressed bytes to the Writer.
-pub const WriteError = zlib.encode.Error || zlib.encode.StreamEncoder.Error || zlib.encode
-    .four_byte_runs.StreamEncoder.Error || std.Io.Writer.Error;
+pub const WriteError = zlib.encode.Error || std.Io.Writer.Error || error{
+    /// A native stream call is invalid at the current lifecycle boundary.
+    InvalidState,
+    /// A previous native stream failure requires reset before continuing.
+    NeedReset,
+};
 
 fn nativeState(storage: anytype) *@TypeOf(storage).State {
     return @ptrCast(storage.state);

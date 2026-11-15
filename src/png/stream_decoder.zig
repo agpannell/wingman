@@ -46,8 +46,8 @@ fn StreamStorage(comptime Sample: type) type {
     };
 }
 
-/// Framing/pixel/policy or explicit caller backing shortage.
-pub const Error = raster.Error || error{ PaletteTooSmall, AlphaTooSmall, OutputRowTooSmall };
+/// Raster, framing and caller-backing failures during suspended decoding.
+pub const StreamError = raster.Error || error{ PaletteTooSmall, AlphaTooSmall, OutputRowTooSmall };
 
 /// Input suspension, one complete selected row or persistent terminal result.
 const InternalStatus = enum { need_input, row, done, failed, canceled };
@@ -74,7 +74,7 @@ fn planHeader(
     comptime Sample: type,
     header: Header,
     options: StreamDecodeOptions,
-) Error!StreamRequirements {
+) StreamError!StreamRequirements {
     if (header.width > options.policy.maximum_source_extent or header.height > options.policy
         .maximum_source_extent) return error.InvalidPng;
     const encoded_bytes = options.total_bytes orelse 0;
@@ -128,7 +128,7 @@ fn DecodeProgress(comptime Sample: type) type {
             /// The full image and physical end have been validated.
             complete,
             /// A persistent decoding or resource failure; reset before reuse.
-            failed: Error,
+            failed: StreamError,
             /// The caller canceled the decoder; reset before reuse.
             canceled,
         };
@@ -146,6 +146,8 @@ pub fn StreamDecoder(comptime Sample: type) type {
     if (Sample != u8 and Sample != u16) @compileError("PNG output samples must be u8 or u16");
     return struct {
         const Self = @This();
+
+        pub const Error = StreamError;
 
         /// Framing and selected-output policy; copied at initialization.
         pub const Options = StreamDecodeOptions;
@@ -959,7 +961,7 @@ test "PNG suspended indexed tables use actual backing and preserve current bands
         for (band[4..]) |value| try std.testing.expectEqual(guard, value);
         const variants = [_]struct {
             value: StreamStorage(Sample),
-            expected: Error,
+            expected: StreamError,
         }{
             .{
                 .value = .{

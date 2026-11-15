@@ -10,7 +10,6 @@ const ImageRegion = @import("../common/ImageRegion.zig");
 const raster = @import("raster_decoder.zig");
 const regions = @import("region_decode.zig");
 const backing = @import("decode_workspace.zig");
-const Error = regions.Error;
 const Options = regions.Options;
 const Requirements = regions.Requirements;
 const Storage = backing.Storage;
@@ -23,7 +22,7 @@ pub fn fromSource(
     storage: Storage(Sample),
     reconstruction: []Sample,
     options: Options,
-) Error!RowReader(Sample) {
+) regions.Error!RowReader(Sample) {
     try regions.admitImage(image, options);
     const limits = options.limits;
     const RegionPlan = regions.Plan(Sample);
@@ -59,6 +58,8 @@ pub fn fromSource(
 pub fn RowReader(comptime Sample: type) type {
     return struct {
         const Self = @This();
+
+        pub const Error = regions.Error;
 
         /// One complete selected row in ascending crop-relative order.
         pub const Row = struct {

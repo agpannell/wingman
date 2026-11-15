@@ -24,10 +24,7 @@ const encoding_fixtures = png_encoding_vectors;
 
 /// Checked metadata, profile, TIFF, resource, allocation and backing-writer errors.
 pub const Error = metadata.Metadata.Error || icc.Error || exif.Error || chunks.Error || Limits
-    .Error || EncodingStorage.Error || encoding_workspace.WriteError || std.mem.Allocator.Error ||
-    error{
-        SizeOverflow,
-    };
+    .Error || encoding_workspace.WorkspaceError || encoding_workspace.WriteError;
 
 /// Checks selected records and creates a small immutable borrow, allocating no storage. Color/depth
 /// must describe a valid PNG layout. Source metadata and later encoded payloads are both bounded;

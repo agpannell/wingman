@@ -22,7 +22,7 @@ const Header = @import("Header.zig");
 
 const Crc32 = @import("../crc.zig").Crc32IsoHdlc;
 
-const Error = format.Error;
+pub const Error = format.Error;
 
 const Source = @This();
 

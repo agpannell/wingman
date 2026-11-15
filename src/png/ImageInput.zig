@@ -9,7 +9,8 @@ const Samples = format.Samples;
 const Transparency = format.Transparency;
 
 const ImageInput = @This();
-const Error = error{ InvalidImageExtent, SizeOverflow, InvalidTexelCount };
+/// Invalid dimensions, overflowing sample count or a mismatched texel slice.
+pub const Error = error{ InvalidImageExtent, SizeOverflow, InvalidTexelCount };
 
 /// Nonzero PNG width, at most 2^31-1.
 width: u32,

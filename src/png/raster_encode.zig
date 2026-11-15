@@ -63,10 +63,9 @@ pub const Options = struct {
 };
 
 /// Checked shape, row storage, palette, compression, allocation and bounded output failures.
-pub const Error = EncodingStorage.Error || encoding_workspace.WriteError || chunks.Error || std.mem
-    .Allocator.Error || error{
+pub const Error = encoding_workspace.WorkspaceError || encoding_workspace.WriteError || chunks
+    .Error || error{
     InvalidImageExtent,
-    SizeOverflow,
     InvalidTexelCount,
     InvalidSampleDepth,
     InvalidRowStride,

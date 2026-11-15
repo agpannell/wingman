@@ -4,8 +4,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const png_format = @import("format.zig");
 const RgbaConverter = @import("RgbaConverter.zig");
-const Error = png_format.Error;
 const expandRgb8InPlace = RgbaConverter.expandRgb8InPlace;
+
+pub const Error = png_format.Error;
 
 /// Scanline filter choice, independent of DEFLATE compression.
 pub const Filter = union(enum) {

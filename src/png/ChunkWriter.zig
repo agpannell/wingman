@@ -4,7 +4,8 @@ const std = @import("std");
 
 const Crc32 = @import("../crc.zig").Crc32IsoHdlc;
 
-const FramingError = error{ InvalidChunkType, ChunkTooLarge, OutputTooSmall };
+/// Invalid chunk type, excessive wire length or insufficient complete-chunk capacity.
+pub const FramingError = error{ InvalidChunkType, ChunkTooLarge, OutputTooSmall };
 
 /// Invalid chunk declarations, bounded destination failures and incomplete payloads.
 pub const Error = std.Io.Writer.Error || FramingError || error{

@@ -7,7 +7,7 @@ const SourceImage = @import("Source.zig");
 const png_palette_vectors = @import("testdata/palette.zig");
 
 const RgbaConverter = @This();
-const Error = png_format.Error;
+pub const Error = png_format.Error;
 const PaletteIndexPolicy = png_format.PaletteIndexPolicy;
 const filter_vector_lanes = std.simd.suggestVectorLength(u8) orelse 1;
 

@@ -4,13 +4,13 @@
 
 const std = @import("std");
 const format = @import("format.zig");
-const raster = @import("region_decode.zig");
+const regions = @import("region_decode.zig");
 const Limits = @import("Limits.zig");
 const ImageRegion = @import("../common/ImageRegion.zig");
 const metadata = @import("metadata.zig");
 
 const Header = @This();
-const Error = format.Error;
+pub const Error = format.Error;
 
 /// Nonzero stored width within PNG's 31-bit bound and the selected source limit.
 width: u32,
@@ -49,8 +49,8 @@ pub fn regionRequirements(
     comptime Sample: type,
     rectangle: ImageRegion,
     options: RegionOptions,
-) raster.Error!raster.Requirements {
-    return raster.headerRequirements(
+) regions.Error!regions.Requirements {
+    return regions.headerRequirements(
         Sample,
         self,
         rectangle,

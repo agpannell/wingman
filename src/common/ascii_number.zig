@@ -4,7 +4,8 @@
 //! standard parser, excluding nonfinite values and Zig literal extensions.
 const std = @import("std");
 
-const NumberError = error{InvalidNumber};
+/// The input does not represent an admitted finite decimal or unsigned count.
+pub const NumberError = error{InvalidNumber};
 
 /// Parses a signed decimal with optional fraction/exponent into finite binary64. Underflow rounds
 /// normally, including signed zero; overflow and malformed or unsupported spellings fail.
@@ -63,12 +64,15 @@ pub fn integer(bytes: []const u8) NumberError!u32 {
 }
 
 test "strict decimal rejects literal extensions, malformed text and nonfinite values" {
-    for ([_][]const u8{
-        "",          "+",    "-",     ".",      ".e1",     "e1",   "1e",    "1e+",      "1e-",
-        "++1",       "--1",  "+-1",   "1.2.3",  "1e2e3",   "1p2",  "0x1p1", "+0X.8P+2", "-0x1.8p-2",
-        "0b10",      "0o7",  "1_2",   "0_0.1",  "1.0e1_0", "1e_2", "1__2",  "NaN",      "inf",
-        "+infinity", "-INF", "1e309", "-1e309", " 1",      "1 ",   "\t1",   "1\x00",    "1,0",
-    }) |text| try std.testing.expectError(error.InvalidNumber, decimal(text));
+    for (
+        [_][]const u8{
+            "",         "+",         "-",     ".",         ".e1",   "e1",    "1e",      "1e+",
+            "1e-",      "++1",       "--1",   "+-1",       "1.2.3", "1e2e3", "1p2",     "0x1p1",
+            "+0X.8P+2", "-0x1.8p-2", "0b10",  "0o7",       "1_2",   "0_0.1", "1.0e1_0", "1e_2",
+            "1__2",     "NaN",       "inf",   "+infinity", "-INF",  "1e309", "-1e309",  " 1",
+            "1 ",       "\t1",       "1\x00", "1,0",
+        },
+    ) |text| try std.testing.expectError(error.InvalidNumber, decimal(text));
 }
 
 test "strict decimal preserves binary64 boundaries and signed underflow" {
@@ -108,11 +112,13 @@ test "short decimals agree bit for bit with independent standard conversion" {
             @as(u64, @bitCast(try decimal(text))),
         );
     }
-    for ([_][]const u8{
-        "0",                 "-0",                   "+1.",               ".1",
-        "-.123456789012345", "999999999999999.",     "0.000000000000001", "9007199254740992",
-        "9007199254740993",  "1.234567890123456789",
-    }) |text| {
+    for (
+        [_][]const u8{
+            "0",                 "-0",                   "+1.",               ".1",
+            "-.123456789012345", "999999999999999.",     "0.000000000000001", "9007199254740992",
+            "9007199254740993",  "1.234567890123456789",
+        },
+    ) |text| {
         try testing.expectEqual(
             @as(u64, @bitCast(try std.fmt.parseFloat(f64, text))),
             @as(u64, @bitCast(try decimal(text))),

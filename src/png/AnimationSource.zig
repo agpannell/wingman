@@ -9,7 +9,9 @@ const format = @import("format.zig");
 const Limits = @import("Limits.zig");
 const FrameControl = @import("FrameControl.zig");
 const animation = @import("animation.zig");
-const Error = format.Error || error{
+
+/// PNG structure, APNG control and configured resource failures during source admission.
+pub const Error = format.Error || error{
     OutputTooSmall,
     NotAnimatedPng,
     InvalidApng,

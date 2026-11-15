@@ -6,7 +6,7 @@ const std = @import("std");
 const memory = @import("../common/byte_ranges.zig");
 const format = @import("format.zig");
 
-const DecodeError = format.DecodeError;
+pub const DecodeError = format.DecodeError;
 const Encoding = format.ScalarEncoding;
 
 /// Reads the first eight bytes of an EAC alpha block and writes sixteen row-major alpha bytes. This

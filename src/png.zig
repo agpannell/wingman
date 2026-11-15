@@ -72,14 +72,16 @@ pub const decode = struct {
     pub const Storage = decode_backing.Storage;
     pub const Workspace = decode_backing.Workspace;
     pub const Requirements = raster_decoding.Requirements;
+    pub const RequirementsError = raster_decoding.Error;
+    pub const IntoError = image_decoding.IntoError;
     pub const RegionOptions = region_decoding.Options;
     pub const RegionRequirements = region_decoding.Requirements;
     pub const View = region_decoding.View;
     pub const RowReader = row_reading.RowReader;
     pub const StreamDecoder = stream_decoding.StreamDecoder;
     pub const PaletteIndexPolicy = format.PaletteIndexPolicy;
-    pub const Error = image_decoding.Error || image_decoding.IntoError || stream_decoding.Error ||
-        animation_decoding.Error || std.mem.Allocator.Error;
+    pub const Error = IntoError || stream_decoding.StreamError || animation_decoding.Error || std
+        .mem.Allocator.Error;
 
     pub const rgbaAlloc = image_decoding.rgbaAlloc;
     pub const rgbaAllocWithScratch = image_decoding.rgbaAllocWithScratch;

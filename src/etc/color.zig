@@ -5,7 +5,7 @@ const std = @import("std");
 const memory = @import("../common/byte_ranges.zig");
 const format = @import("format.zig");
 
-const DecodeError = format.DecodeError;
+pub const DecodeError = format.DecodeError;
 
 /// Reads the first eight source bytes and writes the first 64 destination bytes. Extra capacity is
 /// untouched. The used spans must be disjoint, and every error preserves the entire destination. No
@@ -70,15 +70,12 @@ test decodeBlock {
 }
 
 test "ETC1 all intensity tables and selector signs follow the independent wire tables" {
-    const expected = [4][8]u8{ .{
-        138, 141, 145, 149, 154, 160, 169, 183,
-    }, .{
-        144, 153, 165, 178, 196, 216, 242, 255,
-    }, .{
-        134, 131, 127, 123, 118, 112, 103, 89,
-    }, .{
-        128, 119, 107, 94, 76, 56, 30, 0,
-    } };
+    const expected = [4][8]u8{
+        .{ 138, 141, 145, 149, 154, 160, 169, 183 },
+        .{ 144, 153, 165, 178, 196, 216, 242, 255 },
+        .{ 134, 131, 127, 123, 118, 112, 103, 89 },
+        .{ 128, 119, 107, 94, 76, 56, 30, 0 },
+    };
     for (0..4) |selector| for (0..8) |table| {
         var encoded = [_]u8{ 0x88, 0x88, 0x88, 0, 0, 0, 0, 0 };
         encoded[3] = @as(u8, @intCast(table)) * 36;
@@ -88,9 +85,11 @@ test "ETC1 all intensity tables and selector signs follow the independent wire t
         try decodeBlock(&encoded, &rgba);
         for (0..16) |texel| {
             const value = expected[selector][table];
-            try std.testing.expectEqualSlices(u8, &.{
-                value, value, value, 255,
-            }, rgba[texel * 4 ..][0..4]);
+            try std.testing.expectEqualSlices(
+                u8,
+                &.{ value, value, value, 255 },
+                rgba[texel * 4 ..][0..4],
+            );
         }
     };
 }
@@ -127,9 +126,10 @@ test "ETC1 admission preserves destination and spare capacity" {
         decodeBlock(&@as([8]u8, @splat(0)), output[0..63]),
     );
     try std.testing.expectError(error.OverlappingStorage, decodeBlock(output[0..8], &output));
-    try std.testing.expectError(error.InvalidBlock, decodeBlock(&.{
-        4, 0, 0, 2, 0, 0, 0, 0,
-    }, &output));
+    try std.testing.expectError(
+        error.InvalidBlock,
+        decodeBlock(&.{ 4, 0, 0, 2, 0, 0, 0, 0 }, &output),
+    );
     try std.testing.expectEqualSlices(u8, &before, &output);
     try decodeBlock(&@as([8]u8, @splat(0)), &output);
     try std.testing.expectEqualSlices(u8, before[64..], output[64..]);
