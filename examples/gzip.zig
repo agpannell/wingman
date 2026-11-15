@@ -9,21 +9,21 @@ pub fn main(init: std.process.Init) !void {
     else
         "gzip verifies bytes. gzip verifies bytes. gzip verifies bytes.";
     const allocator = init.gpa;
-    const encoder = try gzip.EncoderWorkspace.create(allocator);
+    const encoder = try gzip.encode.Workspace.create(allocator);
     defer encoder.destroy(allocator);
     defer encoder.clear();
-    const decoder = try gzip.DecoderWorkspace.create(allocator);
+    const decoder = try gzip.decode.Workspace.create(allocator);
     defer decoder.destroy(allocator);
-    const options: gzip.EncodeOptions = .{ .name = "sample.txt", .header_crc = true };
-    const capacity = try gzip.encodeBound(source.len, options);
+    const options: gzip.encode.Options = .{ .name = "sample.txt", .header_crc = true };
+    const capacity = try gzip.encode.bound(source.len, options);
     const compressed_storage = try allocator.alloc(u8, capacity);
     defer allocator.free(compressed_storage);
-    const compressed = try gzip.encode(source, compressed_storage, encoder, options);
-    const parsed = try gzip.parseHeader(compressed, .{});
+    const compressed = try gzip.encode.into(source, compressed_storage, encoder, options);
+    const parsed = try gzip.Header.parse(compressed, .{});
     const name = parsed.header.name orelse return error.MissingName;
     const restored = try allocator.alloc(u8, source.len);
     defer allocator.free(restored);
-    const result = try gzip.decode(
+    const result = try gzip.decode.into(
         compressed,
         restored,
         .{ .workspace = decoder },

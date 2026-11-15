@@ -1,0 +1,1270 @@
+//! Resumable DEFLATE decoding with retired fragments and caller-owned tables/history. reset starts
+//! an independent stream. Keep workspace and history exclusively borrowed until reset or end of
+//! use. The worker may move between calls: it retains no self pointer, allocator or input/output
+//! fragment; moving retires the old copy. Owner, reservations and fragments must be mutually
+//! disjoint.
+//!
+//! Failure returns no progress and requires reset. Output remains provisional until its enclosing
+//! format/checksum succeeds. Empty output can still admit headers and end markers; completion
+//! leaves following trailers unconsumed.
+
+const builtin = @import("builtin");
+const std = @import("std");
+const BitReader = @import("BitReader.zig");
+const DecodeWorkspace = @import("DecodeWorkspace.zig");
+const copying = @import("match_copy.zig");
+const byte_ranges = @import("../common/byte_ranges.zig");
+const fixtures = @import("decode_fixtures.zig");
+const huffman = @import("huffman.zig");
+const protocol = @import("format.zig");
+const test_complete = @import("decode.zig"); // Used only by inline comparison/reuse tests.
+const Limits = @import("DecodeLimits.zig");
+
+const StreamDecoder = @This();
+const Entry = huffman.Entry;
+const fixed = huffman.fixed;
+const leaf = huffman.leaf;
+
+/// Resumable policy. Output capacity and final input belong to each `step`, so complete-call extent
+/// and trailing-data selections are deliberately absent. Dictionary history is copied during reset.
+pub const Options = struct {
+    /// Maximum backward match distance in 1..32768.
+    window_bytes: usize = 32768,
+    /// Optional initial dictionary, copied before any source is accepted.
+    dictionary: ?[]const u8 = null,
+    /// Cumulative admission across every suspension.
+    limits: Limits = .{},
+};
+
+const precode_order = protocol.precode_order;
+const copyMatch = copying.copyMatch;
+const frozen_fixtures = fixtures.frozen_fixtures;
+const general_pairs = fixtures.general_pairs;
+
+/// Borrowed input for one step. `final` marks the end of this fragment as EOF; preserve it with an
+/// unconsumed suffix. Once consumed, EOF stays latched while pending output drains. Accepted
+/// fragments can retire immediately on return.
+pub const Input = struct {
+    /// Bytes available now; no input pointer is retained.
+    bytes: []const u8,
+    /// No source bytes follow this fragment.
+    final: bool = false,
+};
+
+/// Resource or terminal boundary reached by a raw decoder step.
+pub const Status = enum {
+    /// Supply more encoded input, preserving any unconsumed suffix.
+    need_input,
+    /// Supply output capacity and resubmit any unconsumed input.
+    need_output,
+    /// The raw stream ended; following container or application bytes remain unconsumed.
+    complete,
+};
+
+/// Copied progress relative to one step's supplied slices.
+pub const Progress = struct {
+    /// Accepted source bytes, excluding following framing or lookahead.
+    consumed: usize,
+    /// Initialized output bytes; the remaining suffix is unchanged.
+    produced: usize,
+    /// Resource needed next, or successful raw-stream completion.
+    status: Status,
+};
+
+/// Copied cumulative byte accounting, without narrowing to the host's slice-index width.
+pub const Counts = struct {
+    /// Encoded bytes accepted since reset.
+    input_bytes: u64,
+    /// Restored bytes, excluding preset dictionary history.
+    output_bytes: u64,
+};
+
+/// Exclusive mutable reservations borrowed until the next reset or end of decoder use.
+pub const Storage = struct {
+    /// Address-stable table reservation.
+    workspace: *DecodeWorkspace,
+    /// Independent 32 KiB ring history; its contents need no initialization.
+    history: *[32768]u8,
+};
+
+/// Codec failures across reset, dictionary attachment and decoding steps. Individual methods return
+/// their relevant subsets. Failed steps and dictionary attachment require reset.
+pub const Error = StepError || error{
+    /// A reset requested an unsupported history window.
+    InvalidOptions,
+};
+
+/// Failures while advancing a raw DEFLATE stream. A failure requires reset.
+pub const StepError = error{
+    /// Malformed raw DEFLATE input or an invalid match distance.
+    InvalidStream,
+    /// A configured cumulative input/output/work allowance was exhausted.
+    LimitExceeded,
+    /// Owner, fragments or external reservations overlap.
+    StorageOverlap,
+    /// Final input ended before the raw stream's end marker.
+    Truncated,
+    /// A previous step failed; call `StreamDecoder.reset` before continuing.
+    NeedReset,
+    /// The requested setup/step operation is not valid at this stream boundary.
+    InvalidState,
+    /// Cumulative byte accounting cannot fit its u64 counters.
+    CounterOverflow,
+};
+
+const Phase = enum {
+    block,
+    stored_length,
+    stored_complement,
+    stored_copy,
+    counts,
+    precode,
+    lengths,
+    repeat,
+    codes,
+    literal,
+    length_extra,
+    distance,
+    distance_extra,
+    match,
+    complete,
+};
+
+/// Exclusive external table reservation. Fields below are mechanism state, not caller controls.
+workspace: *DecodeWorkspace,
+/// Exclusive ring of previously restored bytes and any copied preset dictionary.
+history: *[32768]u8,
+/// Maximum admitted backward match distance, from 1 through 32768 bytes.
+window_bytes: usize,
+/// Cumulative byte/work allowances copied by reset.
+limits: Limits,
+
+/// Parsing operation to resume on the next fragment.
+phase: Phase = .block,
+/// Encoded low bits carried across calls without retaining the input fragment.
+buffered_bits: u64 = 0,
+/// Consumable bit count in buffered_bits.
+buffered_bit_count: u8 = 0,
+/// The current block is the stream's final block.
+last: bool = false,
+/// The current compressed block uses the fixed RFC codebooks.
+fixed_codes: bool = false,
+/// Final input was consumed; pending output may still need draining.
+eof: bool = false,
+/// A failed operation requires reset before further work.
+failed: bool = false,
+/// Input processing has begun, so preset history can no longer be changed.
+started: bool = false,
+
+/// Next ring position to write, modulo 32768.
+history_position: usize = 0,
+/// Initialized ring bytes, capped at 32768; the match-distance guard separately enforces the
+/// window.
+history_length: usize = 0,
+
+/// Declared literal/length alphabet size for the dynamic header under construction.
+literal_count: usize = 0,
+/// Declared distance alphabet size for the dynamic header under construction.
+distance_count: usize = 0,
+/// Number of code-length alphabet widths declared by that header.
+precode_count: usize = 0,
+/// Next code-length slot during precode/length construction.
+index: usize = 0,
+/// Stored length awaiting its complement/copy, or partially decoded/remaining match length.
+pending: usize = 0,
+/// Decoded backward match distance, completed by the distance_extra phase.
+distance_value: usize = 0,
+/// Extra bits required by the current length or distance symbol.
+extra: u8 = 0,
+/// Code-length repeat symbol, or literal byte awaiting output capacity.
+symbol: u16 = 0,
+
+/// Total accepted encoded bytes in this stream.
+input_bytes: u64 = 0,
+/// Total restored bytes, excluding a supplied dictionary.
+output_bytes: u64 = 0,
+/// Remaining combined accepted-input/produced-output allowance.
+work_left: u64 = 0,
+
+/// Starts a new independent stream, ending all previous borrows and failure state. History contents
+/// need no initialization; no bytes are cleared. Invalid windows and overlaps among the incoming
+/// dictionary, owner and reservations fail before setup.
+pub fn reset(
+    self: *StreamDecoder,
+    storage: Storage,
+    options: Options,
+) error{ InvalidOptions, StorageOverlap }!void {
+    const workspace = storage.workspace;
+    const history = storage.history;
+    const limits = options.limits;
+    try disjoint(std.mem.asBytes(self), std.mem.asBytes(workspace));
+    try disjoint(std.mem.asBytes(self), history);
+    try disjoint(std.mem.asBytes(workspace), history);
+    if (options.window_bytes == 0 or options.window_bytes > 32768) return error.InvalidOptions;
+    if (options.dictionary) |dictionary| {
+        // Reset replaces self and then copies history. Refuse every incoming overlap before either
+        // write, including a dictionary borrowed from the previous owner.
+        try disjoint(dictionary, std.mem.asBytes(self));
+        try disjoint(dictionary, std.mem.asBytes(workspace));
+        try disjoint(dictionary, history);
+    }
+    self.* = .{
+        .workspace = workspace,
+        .history = history,
+        .window_bytes = options.window_bytes,
+        .limits = limits,
+        .work_left = limits.work_units,
+    };
+    // Reset admitted every dictionary span and installed fresh lifecycle state above.
+    if (options.dictionary) |dictionary| self.setDictionary(dictionary) catch unreachable;
+}
+
+/// Returns the current cumulative accounting. A failed step publishes no accepted progress; these
+/// observations do not make output from that step valid.
+pub fn counts(self: *const StreamDecoder) Counts {
+    return .{ .input_bytes = self.input_bytes, .output_bytes = self.output_bytes };
+}
+
+/// Tightens the remaining combined input/output work allowance between steps. This cannot grant
+/// more work and does not reset a failed worker; its next step still returns NeedReset. Container
+/// decoders use it to charge framing bytes against the same allowance as their DEFLATE payload.
+pub fn limitWork(self: *StreamDecoder, remaining_units: u64) void {
+    self.work_left = @min(self.work_left, remaining_units);
+}
+
+/// Seeds a fresh stream from only the reachable suffix. The dictionary is copied, can retire on
+/// return, and is not included in output or counters. Call before the first step; wrappers own
+/// dictionary identity checks.
+pub fn setDictionary(
+    self: *StreamDecoder,
+    dictionary: []const u8,
+) error{ NeedReset, InvalidState, StorageOverlap }!void {
+    if (self.failed) {
+        @branchHint(.unlikely);
+        return error.NeedReset;
+    }
+    self.seed(dictionary) catch |err| {
+        @branchHint(.cold);
+        self.failed = true;
+        return err;
+    };
+}
+
+/// Advances until input/output is needed or the raw stream ends. Repeated blocked empty calls do no
+/// work. EOF turns need_input into Truncated, including when final bytes were consumed during an
+/// earlier output stall.
+pub fn step(self: *StreamDecoder, input: Input, output: []u8) StepError!Progress {
+    if (self.failed) {
+        @branchHint(.unlikely);
+        return error.NeedReset;
+    }
+    return self.advance(input, output) catch |err| {
+        @branchHint(.cold);
+        self.failed = true;
+        return err;
+    };
+}
+
+fn seed(self: *StreamDecoder, dictionary: []const u8) error{ InvalidState, StorageOverlap }!void {
+    if (self.started) return error.InvalidState;
+    try self.admit(dictionary, &.{});
+    const count = @min(dictionary.len, self.window_bytes);
+    @memcpy(self.history[0..count], dictionary[dictionary.len - count ..]);
+    self.history_length = count;
+    self.history_position = count & 32767;
+}
+
+fn admit(self: *StreamDecoder, source: []const u8, output: []u8) error{StorageOverlap}!void {
+    try disjoint(source, output);
+    const reservations = .{
+        std.mem.asBytes(self),
+        std.mem.asBytes(self.workspace),
+        @as([]u8, self.history),
+    };
+    inline for (reservations) |reservation| {
+        try disjoint(source, reservation);
+        try disjoint(output, reservation);
+    }
+}
+
+fn advance(self: *StreamDecoder, supplied_input: Input, supplied_output: []u8) StepError!Progress {
+    try self.admit(supplied_input.bytes, supplied_output);
+    const input_left = self.limits.input_bytes -| self.input_bytes;
+    const output_left = self.limits.output_bytes -| self.output_bytes;
+    const admitted_input: usize = @intCast(
+        @min(supplied_input.bytes.len, input_left, self.work_left),
+    );
+    const admitted_output: usize = @intCast(@min(supplied_output.len, output_left, self.work_left));
+    const input: Input = .{
+        .bytes = supplied_input.bytes[0..admitted_input],
+        .final = supplied_input.final and admitted_input == supplied_input.bytes.len,
+    };
+    const output = supplied_output[0..admitted_output];
+    if (self.eof and supplied_input.bytes.len != 0 and self.phase != .complete)
+        return error.InvalidState;
+    self.started = true;
+
+    var bits: BitReader = .{
+        .source = input.bytes,
+        .value = self.buffered_bits,
+        .count = self.buffered_bit_count,
+    };
+    var written: usize = 0;
+    const status: Status = parse: while (true) {
+        const remaining: usize = @intCast(@min(input.bytes.len, self.work_left - written));
+        bits.source = input.bytes[0..remaining];
+        switch (self.phase) {
+            .block => {
+                const header = streamTake(&bits, 3) orelse break :parse .need_input;
+                self.last = header & 1 != 0;
+                switch (header >> 1) {
+                    0 => {
+                        bits.alignByte();
+                        self.phase = .stored_length;
+                    },
+                    1 => {
+                        self.fixed_codes = true;
+                        self.phase = .codes;
+                    },
+                    2 => {
+                        self.fixed_codes = false;
+                        self.phase = .counts;
+                    },
+                    else => return error.InvalidStream,
+                }
+            },
+            .stored_length => {
+                self.pending = streamTake(&bits, 16) orelse break :parse .need_input;
+                self.phase = .stored_complement;
+            },
+            .stored_complement => {
+                const complement = streamTake(&bits, 16) orelse break :parse .need_input;
+                if (self.pending != @as(u16, ~complement)) return error.InvalidStream;
+                self.phase = .stored_copy;
+            },
+            .stored_copy => {
+                if (self.pending == 0) {
+                    self.endBlock(&bits);
+                    continue;
+                }
+                if (written == output.len) break :parse .need_output;
+                const count = @min(
+                    self.pending,
+                    output.len - written,
+                    bits.source.len - bits.position,
+                );
+                if (count == 0) break :parse .need_input;
+                try self.checkWork(bits.position + count, written, count);
+                @memcpy(output[written..][0..count], input.bytes[bits.position..][0..count]);
+                bits.position += count;
+                written += count;
+                self.pending -= count;
+            },
+            .counts => {
+                const encoded_counts = streamTake(&bits, 14) orelse break :parse .need_input;
+                self.literal_count = 257 + (encoded_counts & 31);
+                self.distance_count = 1 + ((encoded_counts >> 5) & 31);
+                self.precode_count = 4 + (encoded_counts >> 10);
+                if (self.literal_count > 286) return error.InvalidStream;
+                @memset(self.workspace.lengths[0..19], 0);
+                self.index = 0;
+                self.phase = .precode;
+            },
+            .precode => {
+                while (self.index < self.precode_count) : (self.index += 1) {
+                    const width = streamTake(&bits, 3) orelse break :parse .need_input;
+                    const symbol = precode_order[self.index];
+                    self.workspace.lengths[symbol] = @intCast(width);
+                }
+                _ = try self.workspace.precode.build(self.workspace.lengths[0..19], false, false);
+                self.index = 0;
+                self.phase = .lengths;
+            },
+            .lengths => {
+                const total = self.literal_count + self.distance_count;
+                if (self.index == total) {
+                    if (self.workspace.lengths[256] == 0) return error.InvalidStream;
+                    const literal_lengths = self.workspace.lengths[0..self.literal_count];
+                    const distance_lengths = self.workspace.lengths[self.literal_count..total];
+                    _ = try self.workspace.literal.ordinary.build(literal_lengths, false, true);
+                    _ = try self.workspace.distance.build(distance_lengths, true, true);
+                    self.phase = .codes;
+                    continue;
+                }
+                const decoded = try streamEntry(&self.workspace.precode, &bits);
+                const entry = decoded orelse break :parse .need_input;
+                if (entry.value < 16) {
+                    self.workspace.lengths[self.index] = @intCast(entry.value);
+                    self.index += 1;
+                } else {
+                    if (entry.value == 16 and self.index == 0) return error.InvalidStream;
+                    self.symbol = entry.value;
+                    self.phase = .repeat;
+                }
+            },
+            .repeat => {
+                const width: u8 = switch (self.symbol) {
+                    16 => 2,
+                    17 => 3,
+                    18 => 7,
+                    else => return error.InvalidStream,
+                };
+                const extra = streamTake(&bits, width) orelse break :parse .need_input;
+                const count: usize = extra + @as(usize, if (self.symbol == 18) 11 else 3);
+                const total = self.literal_count + self.distance_count;
+                if (count > total - self.index) return error.InvalidStream;
+                const value: u8 = blk: {
+                    if (self.symbol != 16) break :blk 0;
+                    break :blk self.workspace.lengths[self.index - 1];
+                };
+                @memset(self.workspace.lengths[self.index..][0..count], value);
+                self.index += count;
+                self.phase = .lengths;
+            },
+            .codes => {
+                // Small output fragments cannot enter the bulk loop. Keep its state and budget
+                // admission out of their token path.
+                if (output.len - written >= 258 and bits.source.len - bits.position >= 8) {
+                    if (self.fixed_codes) {
+                        try self.fastCodes(true, &bits, output, &written);
+                    } else {
+                        try self.fastCodes(false, &bits, output, &written);
+                    }
+                }
+                if (self.phase != .codes) continue;
+                const entry = blk: {
+                    if (self.fixed_codes) {
+                        const decoded = try streamEntry(&fixed.literal, &bits);
+                        const raw = decoded orelse break :parse .need_input;
+                        break :blk leaf(.literal_length, raw.value, @intCast(raw.bits));
+                    }
+                    const decoded = try streamEntry(&self.workspace.literal.ordinary, &bits);
+                    break :blk decoded orelse break :parse .need_input;
+                };
+                if (entry.value < 256) {
+                    self.symbol = entry.value;
+                    self.phase = .literal;
+                } else if (entry.value == 256) {
+                    self.endBlock(&bits);
+                } else {
+                    if (entry.value == 65535) return error.InvalidStream;
+                    self.pending = entry.value - 256;
+                    self.extra = entry.extra;
+                    self.phase = .length_extra;
+                }
+            },
+            .literal => {
+                if (written == output.len) break :parse .need_output;
+                try self.checkWork(bits.position, written, 1);
+                output[written] = @intCast(self.symbol);
+                written += 1;
+                self.phase = .codes;
+            },
+            .length_extra => {
+                self.pending += streamTake(&bits, self.extra) orelse break :parse .need_input;
+                self.phase = .distance;
+            },
+            .distance => {
+                const entry = blk: {
+                    if (self.fixed_codes) {
+                        const decoded = try streamEntry(&fixed.distance, &bits);
+                        const raw = decoded orelse break :parse .need_input;
+                        break :blk leaf(.distance, raw.value, @intCast(raw.bits));
+                    }
+                    const decoded = try streamEntry(&self.workspace.distance, &bits);
+                    break :blk decoded orelse break :parse .need_input;
+                };
+                if (entry.value == 0) return error.InvalidStream;
+                self.distance_value = entry.value;
+                self.extra = entry.extra;
+                self.phase = .distance_extra;
+            },
+            .distance_extra => {
+                const extra = streamTake(&bits, self.extra) orelse break :parse .need_input;
+                self.distance_value += extra;
+                try self.checkDistance(self.distance_value, written);
+                self.phase = .match;
+            },
+            .match => {
+                if (written == output.len) break :parse .need_output;
+                const count = @min(self.pending, output.len - written);
+                try self.checkWork(bits.position, written, count);
+                self.copyHistory(output, &written, self.distance_value, count);
+                self.pending -= count;
+                if (self.pending == 0) self.phase = .codes;
+            },
+            .complete => break :parse .complete,
+        }
+    };
+
+    if (status == .need_input and bits.source.len < input.bytes.len) return error.LimitExceeded;
+    self.buffered_bits = bits.value;
+    self.buffered_bit_count = bits.count;
+    if (status == .need_input and admitted_input < supplied_input.bytes.len)
+        return error.LimitExceeded;
+    if (status == .need_output and admitted_output < supplied_output.len)
+        return error.LimitExceeded;
+    if (input.final and bits.position == input.bytes.len) self.eof = true;
+    if (status == .need_input and (input.final or self.eof)) return error.Truncated;
+    self.input_bytes = std.math.add(
+        u64,
+        self.input_bytes,
+        bits.position,
+    ) catch return error.CounterOverflow;
+    self.output_bytes = std.math.add(
+        u64,
+        self.output_bytes,
+        written,
+    ) catch return error.CounterOverflow;
+    if (self.input_bytes > self.limits.input_bytes or self.output_bytes > self.limits.output_bytes)
+        return error.LimitExceeded;
+    const work = std.math.add(u64, bits.position, written) catch return error.CounterOverflow;
+    if (work > self.work_left) return error.LimitExceeded;
+    self.work_left -= work;
+    self.saveHistory(output[0..written]);
+    return .{ .consumed = bits.position, .produced = written, .status = status };
+}
+
+fn endBlock(self: *StreamDecoder, bits: *BitReader) void {
+    self.phase = if (self.last) .complete else .block;
+    if (self.last) bits.alignByte();
+}
+
+fn checkWork(
+    self: *const StreamDecoder,
+    consumed: usize,
+    produced: usize,
+    count: usize,
+) error{LimitExceeded}!void {
+    if (consumed > self.work_left) return error.LimitExceeded;
+    const remaining = self.work_left - consumed;
+    if (produced > remaining or count > remaining - produced) return error.LimitExceeded;
+}
+
+fn checkDistance(
+    self: *const StreamDecoder,
+    distance: usize,
+    written: usize,
+) error{InvalidStream}!void {
+    if (distance == 0 or distance > self.window_bytes) return error.InvalidStream;
+    if (distance > written and distance - written > self.history_length) return error.InvalidStream;
+}
+
+// Bounded complete-token loop: at most 48 encoded bits and 258 restored bytes per token. Word
+// lookahead is reclaimed before returning to the checked state machine, so it never accepts an
+// enclosing trailer.
+fn fastCodes(
+    self: *StreamDecoder,
+    comptime fixed_codes: bool,
+    bits: *BitReader,
+    output: []u8,
+    written: *usize,
+) error{InvalidStream}!void {
+    if (bits.count > 7 or bits.source.len > self.work_left) return;
+    if (output.len > self.work_left - bits.source.len) return;
+    while (bits.source.len - bits.position >= 8 and output.len - written.* >= 258) {
+        const entry = if (fixed_codes) blk: {
+            const symbol = try fixed.literal.decode(bits, .root);
+            break :blk leaf(.literal_length, symbol, 0);
+        } else try self.workspace.literal.ordinary.decode(bits, .complete);
+        if (!fixed_codes and entry.bits == 0) {
+            @branchHint(.unlikely);
+            return error.InvalidStream;
+        }
+        if (entry.value < 256) {
+            output[written.*] = @intCast(entry.value);
+            written.* += 1;
+            continue;
+        }
+        if (entry.value == 256) {
+            @branchHint(.unlikely);
+            self.endBlock(bits);
+            break;
+        }
+        if (entry.value == 65535) return error.InvalidStream;
+        const length = entry.value - 256 + @as(usize, try bits.take(entry.extra));
+        const distance_entry = if (fixed_codes) blk: {
+            const symbol = try fixed.distance.decode(bits, .root);
+            break :blk leaf(.distance, symbol, 0);
+        } else try self.workspace.distance.decode(bits, .distance);
+        if (distance_entry.value == 0) return error.InvalidStream;
+        const distance = distance_entry.value + @as(usize, try bits.take(distance_entry.extra));
+        try self.checkDistance(distance, written.*);
+        self.copyHistory(output, written, distance, length);
+    }
+    // Every whole unread byte belongs to the caller, even at EOB. Keep only the remaining bits of
+    // the last actually accepted byte.
+    bits.position -= bits.count / 8;
+    bits.count &= 7;
+    bits.value &= (@as(u64, 1) << @as(u6, @intCast(bits.count))) - 1;
+}
+
+fn copyHistory(
+    self: *const StreamDecoder,
+    output: []u8,
+    written: *usize,
+    distance: usize,
+    length: usize,
+) void {
+    var left = length;
+    while (left != 0 and distance > written.*) {
+        const back = distance - written.*;
+        const start = (self.history_position + 32768 - back) & 32767;
+        const count = @min(left, back, 32768 - start);
+        @memcpy(output[written.*..][0..count], self.history[start..][0..count]);
+        written.* += count;
+        left -= count;
+    }
+    if (left >= 3) {
+        copyMatch(output, written.*, distance, left);
+    } else {
+        for (0..left) |i| output[written.* + i] = output[written.* + i - distance];
+    }
+    written.* += left;
+}
+
+fn saveHistory(self: *StreamDecoder, bytes: []const u8) void {
+    if (bytes.len >= 32768) {
+        @memcpy(self.history, bytes[bytes.len - 32768 ..]);
+        self.history_position = 0;
+        self.history_length = 32768;
+    } else {
+        const first = @min(bytes.len, 32768 - self.history_position);
+        @memcpy(self.history[self.history_position..][0..first], bytes[0..first]);
+        @memcpy(self.history[0 .. bytes.len - first], bytes[first..]);
+        self.history_position = (self.history_position + bytes.len) & 32767;
+        self.history_length = @min(32768, self.history_length + bytes.len);
+    }
+}
+
+fn streamFill(bits: *BitReader, needed: u8) bool {
+    while (bits.count < needed and bits.position < bits.source.len) {
+        bits.value |= @as(u64, bits.source[bits.position]) << @as(u6, @intCast(bits.count));
+        bits.position += 1;
+        bits.count += 8;
+    }
+    return bits.count >= needed;
+}
+
+fn streamTake(bits: *BitReader, count: u8) ?u16 {
+    if (!streamFill(bits, count)) return null;
+    return bits.takeBuffered(count);
+}
+
+// Probe without retiring any code bits until the complete leaf is present. Replicated short leaves
+// work with fewer bits than the root width, including an EOB in the last byte. Continuations and
+// partial fields can span fragments.
+fn streamEntry(table: anytype, bits: *BitReader) error{InvalidStream}!?Entry {
+    const root_bits: u8 = @intCast(@ctz(table.root.len));
+    while (true) {
+        const root_index = @as(usize, @truncate(bits.value)) & (table.root.len - 1);
+        var entry = table.root[root_index];
+        if (entry.bits == 0) {
+            if (bits.count >= root_bits) return error.InvalidStream;
+            if (!streamFill(bits, bits.count + 1)) return null;
+            continue;
+        }
+        var used = entry.bits;
+        if (bits.count < used) {
+            if (!streamFill(bits, used)) return null;
+            continue;
+        }
+        while (entry.node) {
+            if (!streamFill(bits, used + 1)) return null;
+            const shift: u6 = @intCast(used);
+            const side: usize = @intCast((bits.value >> shift) & 1);
+            entry = table.children[entry.value][side];
+            used += 1;
+            if (entry.bits == 0) return error.InvalidStream;
+        }
+        bits.drop(used);
+        return entry;
+    }
+}
+
+test "decoder reset admits dictionary before replacing the owner" {
+    const allocator = std.testing.allocator;
+    const old_workspace = try DecodeWorkspace.create(allocator);
+    defer old_workspace.destroy(allocator);
+    const new_workspace = try DecodeWorkspace.create(allocator);
+    defer new_workspace.destroy(allocator);
+    const old_history = try allocator.create([32768]u8);
+    defer allocator.destroy(old_history);
+    const new_history = try allocator.create([32768]u8);
+    defer allocator.destroy(new_history);
+    var decoder: StreamDecoder = undefined;
+    try decoder.reset(.{ .workspace = old_workspace, .history = old_history }, .{});
+    const raw = [_]u8{ 1, 1, 0, 254, 255, 'A' };
+    _ = try decoder.step(.{ .bytes = &raw, .final = true }, &.{});
+
+    // An aliased owner field is caller-supplied source, even when reset would overwrite it.
+    const owner_bytes = std.mem.asBytes(&decoder.input_bytes);
+    const before = owner_bytes[0..@sizeOf(u64)].*;
+    const storage: Storage = .{ .workspace = new_workspace, .history = new_history };
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decoder.reset(storage, .{ .dictionary = owner_bytes }),
+    );
+    try std.testing.expectEqualSlices(u8, &before, owner_bytes);
+
+    // Incoming history cannot also be dictionary input. A retired history reservation remains a
+    // valid source when reset installs separate storage and copies its bytes.
+    @memset(new_history[0..8], 0xa5);
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decoder.reset(storage, .{ .dictionary = new_history[0..8] }),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, new_history[0..8], 0xa5));
+    const workspace_bytes = std.mem.asBytes(new_workspace);
+    @memset(workspace_bytes[0..8], 0xa5);
+    try std.testing.expectError(
+        error.StorageOverlap,
+        decoder.reset(storage, .{ .dictionary = workspace_bytes[0..8] }),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, workspace_bytes[0..8], 0xa5));
+    @memcpy(old_history[0..8], "history!");
+    try decoder.reset(storage, .{ .dictionary = old_history[0..8] });
+    try std.testing.expectEqualSlices(u8, "history!", new_history[0..decoder.history_length]);
+}
+
+test "resumable DEFLATE retires fragments through tables matches and history wraps" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const expected = try allocator.alloc(u8, 200000);
+    defer allocator.free(expected);
+    const stored_abc = [_]u8{ 1, 3, 0, 252, 255, 'a', 'b', 'c' };
+    const empty_fixed = [_]u8{ 3, 0 };
+    const wires = [_][]const u8{
+        &stored_abc,
+        &empty_fixed,
+        &frozen_fixtures.hello_deflate,
+        &frozen_fixtures.runs_deflate,
+        &frozen_fixtures.blocks_deflate,
+        &frozen_fixtures.skew_deflate,
+    };
+    for (wires) |wire| {
+        const whole = try test_complete.into(wire, expected, .{ .workspace = workspace }, .{});
+        for ([_]usize{ 1, 2, 7, 8, 31, 65536 }) |in_width| {
+            for ([_]usize{ 1, 2, 3, 7, 257, 258, 32767, 32768, 65536 }) |out_width| {
+                var decoder: StreamDecoder = undefined;
+                try decoder.reset(
+                    .{ .workspace = workspace, .history = history },
+                    .{ .limits = .{} },
+                );
+                var consumed: usize = 0;
+                var produced: usize = 0;
+                var source: [65536]u8 = undefined;
+                var target: [65554]u8 = undefined;
+                @memset(&target, 0xa5);
+                while (true) {
+                    const n = @min(in_width, wire.len - consumed);
+                    @memcpy(source[0..n], wire[consumed..][0..n]);
+                    @memset(target[0 .. out_width + 17], 0xa5);
+                    const result = try decoder.step(
+                        .{ .bytes = source[0..n], .final = consumed + n == wire.len },
+                        target[1..][0..out_width],
+                    );
+                    @memset(source[0..n], 0xcc);
+                    consumed += result.consumed;
+                    try std.testing.expectEqualSlices(
+                        u8,
+                        expected[produced..][0..result.produced],
+                        target[1..][0..result.produced],
+                    );
+                    for (target[1 + result.produced .. out_width + 17]) |byte| {
+                        try std.testing.expectEqual(0xa5, byte);
+                    }
+                    produced += result.produced;
+                    if (result.status == .complete) break;
+                    try std.testing.expect(result.consumed != 0 or result.produced != 0);
+                }
+                for (target[out_width + 1 ..]) |byte| try std.testing.expectEqual(0xa5, byte);
+                try std.testing.expectEqual(wire.len, consumed);
+                try std.testing.expectEqual(whole.produced, produced);
+                try std.testing.expectEqual(consumed, decoder.input_bytes);
+                try std.testing.expectEqual(produced, decoder.output_bytes);
+            }
+        }
+    }
+}
+
+test "resumable DEFLATE checks every split finality limits poisoning and dictionary suffix" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    var decoder: StreamDecoder = undefined;
+    var output: [64]u8 = undefined;
+    const wire = &frozen_fixtures.hello_deflate;
+    for (0..wire.len + 1) |split| {
+        for (0..19) |capacity| {
+            try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+            var first = try decoder.step(.{ .bytes = wire[0..split] }, output[0..capacity]);
+            var consumed = first.consumed;
+            var produced = first.produced;
+            while (first.status != .complete) {
+                first = try decoder.step(
+                    .{ .bytes = wire[consumed..], .final = true },
+                    output[produced..],
+                );
+                consumed += first.consumed;
+                produced += first.produced;
+            }
+            try std.testing.expectEqual(wire.len, consumed);
+            try std.testing.expectEqualStrings("hello hello hello\n", output[0..produced]);
+        }
+    }
+    for (0..wire.len) |end| {
+        try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+        try std.testing.expectError(
+            error.Truncated,
+            decoder.step(.{ .bytes = wire[0..end], .final = true }, &output),
+        );
+        try std.testing.expectError(error.NeedReset, decoder.step(.{ .bytes = wire }, &output));
+    }
+    try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+    const blocked = try decoder.step(.{ .bytes = wire, .final = true }, &.{});
+    try std.testing.expectEqual(Status.need_output, blocked.status);
+    _ = try decoder.step(.{ .bytes = wire[blocked.consumed..], .final = true }, &output);
+    try decoder.reset(
+        .{ .workspace = workspace, .history = history },
+        .{ .limits = .{ .output_bytes = 17 } },
+    );
+    try std.testing.expectError(
+        error.LimitExceeded,
+        decoder.step(.{ .bytes = wire, .final = true }, &output),
+    );
+    try decoder.reset(
+        .{ .workspace = workspace, .history = history },
+        .{ .limits = .{ .work_units = 0 } },
+    );
+    const empty = try decoder.step(.{ .bytes = &.{} }, &.{});
+    try std.testing.expectEqual(
+        Progress{ .consumed = 0, .produced = 0, .status = .need_input },
+        empty,
+    );
+    try std.testing.expectError(error.LimitExceeded, decoder.step(.{ .bytes = wire }, &output));
+    // Fixed final length-three/distance-one/EOB, accepted by zlib 1.3.2 with raw initial history
+    // "A". No encoder/table produces these bytes here.
+    const match_wire = [_]u8{ 0x03, 0x02, 0x00 };
+    const dictionary = try allocator.alloc(u8, 40000);
+    defer allocator.free(dictionary);
+    @memset(dictionary, 'A');
+    try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+    try decoder.setDictionary(dictionary);
+    @memset(dictionary, 0xcc);
+    const matched = try decoder.step(.{ .bytes = &match_wire, .final = true }, &output);
+    try std.testing.expectEqualStrings("AAA", output[0..matched.produced]);
+    const one_shot = try test_complete.into(
+        &match_wire,
+        &output,
+        .{ .workspace = workspace, .history = history },
+        .{ .dictionary = "A" },
+    );
+    try std.testing.expectEqualStrings("AAA", output[0..one_shot.produced]);
+    try std.testing.expectEqual(32768, decoder.history_length);
+    try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+    try std.testing.expectError(
+        error.InvalidStream,
+        decoder.step(.{ .bytes = &match_wire, .final = true }, &output),
+    );
+}
+
+test "stream limits bound work and writes before publication across suspensions" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    var decoder: StreamDecoder = undefined;
+    var output: [32]u8 = undefined;
+    const wire = &frozen_fixtures.hello_deflate;
+    for (0..wire.len + 18) |work| {
+        try decoder.reset(
+            .{ .workspace = workspace, .history = history },
+            .{ .limits = .{ .work_units = work } },
+        );
+        @memset(&output, 0xa5);
+        try std.testing.expectError(
+            error.LimitExceeded,
+            decoder.step(.{ .bytes = wire, .final = true }, &output),
+        );
+        // Even an unpublished failing step never restores more bytes than its complete work budget,
+        // or writes beyond caller output.
+        for (output[@min(work, output.len)..]) |byte| try std.testing.expectEqual(0xa5, byte);
+    }
+    try decoder.reset(
+        .{ .workspace = workspace, .history = history },
+        .{
+            .limits = .{ .work_units = wire.len + 18, .input_bytes = wire.len, .output_bytes = 18 },
+        },
+    );
+    const exact = try decoder.step(.{ .bytes = wire, .final = true }, &output);
+    try std.testing.expectEqual(Status.complete, exact.status);
+    try std.testing.expectEqual(@as(u64, 0), decoder.work_left);
+    try decoder.reset(
+        .{ .workspace = workspace, .history = history },
+        .{ .limits = .{ .input_bytes = wire.len - 1 } },
+    );
+    try std.testing.expectError(
+        error.LimitExceeded,
+        decoder.step(.{ .bytes = wire, .final = true }, &output),
+    );
+    try decoder.reset(
+        .{ .workspace = workspace, .history = history },
+        .{ .limits = .{ .output_bytes = 18, .work_units = wire.len + 18 } },
+    );
+    var consumed: usize = 0;
+    var produced: usize = 0;
+    while (true) {
+        const end = @min(consumed + 1, wire.len);
+        const result = try decoder.step(
+            .{ .bytes = wire[consumed..end], .final = end == wire.len },
+            output[produced..][0..1],
+        );
+        consumed += result.consumed;
+        produced += result.produced;
+        if (result.status == .complete) break;
+    }
+    try std.testing.expectEqual(@as(u64, 0), decoder.work_left);
+}
+
+test "resumable malformed input stays bounded and agrees with whole-buffer acceptance" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    var decoder: StreamDecoder = undefined;
+    var bytes: [128]u8 = undefined;
+    var whole_output: [4096]u8 = undefined;
+    var output: [4098]u8 = undefined;
+    var random: std.Random.DefaultPrng = .init(0x6d326465666c6174);
+    for (0..4096) |iteration| {
+        random.random().bytes(&bytes);
+        const source = bytes[0 .. iteration % (bytes.len + 1)];
+        const whole = test_complete.into(
+            source,
+            &whole_output,
+            .{ .workspace = workspace },
+            .{},
+        ) catch null;
+        try decoder.reset(
+            .{ .workspace = workspace, .history = history },
+            .{ .limits = .{ .output_bytes = 4096 } },
+        );
+        @memset(&output, 0xa5);
+        var consumed: usize = 0;
+        var produced: usize = 0;
+        while (true) {
+            const end = @min(source.len, consumed + 1 + iteration % 9);
+            const result = decoder.step(
+                .{ .bytes = source[consumed..end], .final = end == source.len },
+                output[1 + produced ..][0..@min(17, 4097 - produced)],
+            ) catch {
+                try std.testing.expect(whole == null);
+                break;
+            };
+            consumed += result.consumed;
+            produced += result.produced;
+            if (result.status == .complete) {
+                const expected = whole orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(
+                    expected,
+                    test_complete.Result{ .consumed = consumed, .produced = produced },
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    whole_output[0..produced],
+                    output[1..][0..produced],
+                );
+                break;
+            }
+            try std.testing.expect(result.consumed != 0 or result.produced != 0);
+        }
+        try std.testing.expectEqual(0xa5, output[0]);
+        try std.testing.expectEqual(0xa5, output[output.len - 1]);
+    }
+}
+
+test "resumable word refills and suspended copies respect inaccessible pages" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const posix = std.posix;
+    const page_size = std.heap.pageSize();
+    const memory = try posix.mmap(
+        null,
+        6 * page_size,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer posix.munmap(memory);
+    for ([_]usize{ 0, 2, 3, 5 }) |page| {
+        const address = memory.ptr + page * page_size;
+        const result = std.os.linux.mprotect(address, page_size, .{});
+        try std.testing.expectEqual(.SUCCESS, posix.errno(result));
+    }
+    const input_page = memory[page_size .. 2 * page_size];
+    const output_page = memory[4 * page_size .. 5 * page_size];
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const fixture = general_pairs;
+    for ([_]usize{ 1, 7, 8, fixture.source.len }) |input_width| {
+        for ([_]usize{ 0, 1, 7, 8, 257, 258, 1024 }) |output_width| {
+            var decoder: StreamDecoder = undefined;
+            try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+            var consumed: usize = 0;
+            var produced: usize = 0;
+            var calls: usize = 0;
+            while (true) {
+                const n = @min(input_width, fixture.source.len - consumed);
+                const source = input_page[page_size - n ..];
+                @memcpy(source, fixture.source[consumed..][0..n]);
+                const capacity = if (calls == 0) output_width else @max(1, output_width);
+                const output = output_page[page_size - capacity ..];
+                @memset(output_page, 0xa5);
+                const result = try decoder.step(
+                    .{ .bytes = source, .final = consumed + n == fixture.source.len },
+                    output,
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    fixture.expected[produced..][0..result.produced],
+                    output[0..result.produced],
+                );
+                for (output_page[0 .. page_size - capacity]) |byte| {
+                    try std.testing.expectEqual(0xa5, byte);
+                }
+                for (output[result.produced..]) |byte| try std.testing.expectEqual(0xa5, byte);
+                @memset(source, 0xcc);
+                consumed += result.consumed;
+                produced += result.produced;
+                if (result.status == .complete) break;
+                calls += 1;
+                try std.testing.expect(calls <= fixture.source.len + fixture.expected.len + 1);
+            }
+            try std.testing.expectEqual(fixture.source.len, consumed);
+            try std.testing.expectEqual(fixture.expected.len, produced);
+        }
+    }
+}
+
+test "preset history reaches maximum RFC distance across output suspensions" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const dictionary = try allocator.alloc(u8, 40000);
+    defer allocator.free(dictionary);
+    for (dictionary, 0..) |*byte, i| byte.* = @truncate(i * 31 + i / 17);
+    // Independent fixed length 258/distance 32768/EOB facts, also used by the complete-buffer RFC
+    // test. Trailing bytes force word-refill lookahead.
+    const wire = [_]u8{ 0x1b, 0xbd, 0xff, 0x1f, 0 };
+    const trailing = [_]u8{ 0x6c, 0x6f, 0x6f, 0x6b, 0x61, 0x68, 0x65, 0x61, 0x64 };
+    const source = wire ++ trailing;
+    var decoder: StreamDecoder = undefined;
+    var output: [258]u8 = undefined;
+    for ([_]usize{ 1, 2, 3, 257, 258 }) |width| {
+        try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+        try decoder.setDictionary(dictionary);
+        var consumed: usize = 0;
+        var produced: usize = 0;
+        while (true) {
+            const result = try decoder.step(
+                .{ .bytes = source[consumed..], .final = true },
+                output[produced..][0..@min(width, output.len - produced)],
+            );
+            consumed += result.consumed;
+            produced += result.produced;
+            if (result.status == .complete) break;
+        }
+        try std.testing.expectEqual(wire.len, consumed);
+        try std.testing.expectEqualSlices(
+            u8,
+            dictionary[dictionary.len - 32768 ..][0..258],
+            &output,
+        );
+    }
+    try decoder.reset(
+        .{ .workspace = workspace, .history = history },
+        .{ .window_bytes = 32767, .limits = .{} },
+    );
+    try decoder.setDictionary(dictionary);
+    try std.testing.expectError(
+        error.InvalidStream,
+        decoder.step(.{ .bytes = &source, .final = true }, &output),
+    );
+    try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+    try decoder.setDictionary(dictionary[0..32767]);
+    try std.testing.expectError(
+        error.InvalidStream,
+        decoder.step(.{ .bytes = &source, .final = true }, &output),
+    );
+}
+
+test "resumable decoding keeps all forty-eight token bits through byte fragments" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const wire = &frozen_fixtures.expanded_48bit_deflate;
+    const expected = &frozen_fixtures.expanded_48bit_golden;
+    var decoder: StreamDecoder = undefined;
+    try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+    var consumed: usize = 0;
+    var produced: usize = 0;
+    var output: [259]u8 = undefined;
+    while (true) {
+        const end = @min(consumed + 1, wire.len);
+        @memset(&output, 0xa5);
+        const result = try decoder.step(
+            .{ .bytes = wire[consumed..end], .final = end == wire.len },
+            &output,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            expected[produced..][0..result.produced],
+            output[0..result.produced],
+        );
+        for (output[result.produced..]) |byte| try std.testing.expectEqual(0xa5, byte);
+        consumed += result.consumed;
+        produced += result.produced;
+        if (result.status == .complete) break;
+        try std.testing.expect(result.consumed != 0 or result.produced != 0);
+    }
+    try std.testing.expectEqual(wire.len, consumed);
+    try std.testing.expectEqual(expected.len, produced);
+}
+
+test "streaming bulk lookup rejects singleton holes before producing bytes" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    var decoder: StreamDecoder = undefined;
+    try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+    // Independent malformed singleton-EOB wire from the canonical-table tests. Padding admits the
+    // word-refill loop; an invalid zero-width leaf must not turn into a literal or spend the
+    // caller's output reservation.
+    const invalid = [_]u8{ 0x05, 0xc0, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0xa0, 0xff, 0xaf, 0x13 };
+    const padding: [64]u8 = @splat(0);
+    const source = invalid ++ padding;
+    var output: [1024]u8 = @splat(0xa5);
+    try std.testing.expectError(
+        error.InvalidStream,
+        decoder.step(.{ .bytes = &source, .final = true }, &output),
+    );
+    for (output) |byte| try std.testing.expectEqual(0xa5, byte);
+}
+
+test "new canonical wires retain exact fragmented recovery after direct workspace reuse" {
+    const allocator = std.testing.allocator;
+    const workspace = try DecodeWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const history = try allocator.create([32768]u8);
+    defer allocator.destroy(history);
+    const decoder = try allocator.create(StreamDecoder);
+    defer allocator.destroy(decoder);
+    const cases = [_]struct {
+        wire: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .wire = &frozen_fixtures.byte_dominant_narrow_deflate,
+            .expected = &frozen_fixtures.byte_dominant_narrow_golden,
+        },
+        .{
+            .wire = &frozen_fixtures.wide_expanded_deflate,
+            .expected = &frozen_fixtures.wide_expanded_golden,
+        },
+    };
+    for (cases) |fixture| {
+        const backing = try allocator.alloc(u8, fixture.expected.len + 64);
+        defer allocator.free(backing);
+        inline for (.{ 1, 7, 64 }, .{ 1, 3, 257 }) |input_chunk, output_chunk| {
+            // The direct decoder leaves its selected table representation in the union. Streaming
+            // reset rebuilds the ordinary tables it owns.
+            _ = try test_complete.into(
+                fixture.wire,
+                backing[32..][0..fixture.expected.len],
+                .{ .workspace = workspace },
+                .{},
+            );
+            try decoder.reset(.{ .workspace = workspace, .history = history }, .{ .limits = .{} });
+            @memset(backing, 0xa5);
+            const output = backing[32..][0..fixture.expected.len];
+            var consumed: usize = 0;
+            var produced: usize = 0;
+            var calls: usize = 0;
+            while (true) {
+                calls += 1;
+                try std.testing.expect(calls < 5000);
+                const end = @min(fixture.wire.len, consumed + input_chunk);
+                const fragment_progress = try decoder.step(
+                    .{ .bytes = fixture.wire[consumed..end], .final = end == fixture.wire.len },
+                    output[produced..@min(output.len, produced + output_chunk)],
+                );
+                consumed += fragment_progress.consumed;
+                produced += fragment_progress.produced;
+                if (fragment_progress.status == .complete) break;
+            }
+            try std.testing.expectEqual(fixture.wire.len, consumed);
+            try std.testing.expectEqual(fixture.expected.len, produced);
+            try std.testing.expectEqualSlices(u8, fixture.expected, output);
+            for (backing[0..32]) |byte| try std.testing.expectEqual(0xa5, byte);
+            for (backing[32 + produced ..]) |byte| try std.testing.expectEqual(0xa5, byte);
+        }
+    }
+}
+
+fn disjoint(first: []const u8, second: []const u8) error{StorageOverlap}!void {
+    if (byte_ranges.overlaps(first, second)) return error.StorageOverlap;
+}
+
+test "container work allowance only tightens and cannot recover failed state" {
+    const workspace = try DecodeWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    var history: [32768]u8 = undefined;
+    const wire = [_]u8{ 1, 1, 0, 254, 255, 'A' };
+    var output: [1]u8 = undefined;
+    var decoder: StreamDecoder = undefined;
+    try decoder.reset(.{ .workspace = workspace, .history = &history }, .{});
+    decoder.limitWork(wire.len + output.len);
+    decoder.limitWork(std.math.maxInt(u64));
+    try std.testing.expectEqual(
+        .complete,
+        (try decoder.step(.{ .bytes = &wire, .final = true }, &output)).status,
+    );
+    try std.testing.expectEqual(
+        Counts{ .input_bytes = wire.len, .output_bytes = output.len },
+        decoder.counts(),
+    );
+    try std.testing.expect(@TypeOf(decoder.counts().input_bytes) == u64);
+    try std.testing.expect(@TypeOf(decoder.counts().output_bytes) == u64);
+
+    try decoder.reset(
+        .{ .workspace = workspace, .history = &history },
+        .{ .limits = .{ .work_units = wire.len } },
+    );
+    decoder.limitWork(wire.len + output.len);
+    try std.testing.expectError(
+        error.LimitExceeded,
+        decoder.step(.{ .bytes = &wire, .final = true }, &output),
+    );
+    decoder.limitWork(std.math.maxInt(u64));
+    try std.testing.expectError(
+        error.NeedReset,
+        decoder.step(.{ .bytes = &wire, .final = true }, &output),
+    );
+}

@@ -331,7 +331,7 @@ fn decodeByteImage(
     const compressed_reader = image.image_data.reader(&fixed_input, &chunked_input);
     // Admit PNG's header across arbitrary IDAT boundaries before reserving inflate storage.
     const zlib_header = compressed_reader.peekArray(2) catch return error.InvalidPng;
-    zlib.validateHeader(zlib_header) catch return error.InvalidPng;
+    zlib.decode.validateDictionaryFreeHeader(zlib_header) catch return error.InvalidPng;
 
     const pixel_count = checkedMul(image_width, image_height) catch return error.InvalidPng;
     const rgba_byte_count = checkedMul(pixel_count, 4) catch return error.InvalidPng;
@@ -430,7 +430,7 @@ fn decodeWordImage(
     var chunked: ImageData.Reader = undefined;
     const reader = image.image_data.reader(&fixed, &chunked);
     const header = reader.peekArray(2) catch return error.InvalidPng;
-    zlib.validateHeader(header) catch return error.InvalidPng;
+    zlib.decode.validateDictionaryFreeHeader(header) catch return error.InvalidPng;
     const pixel_count = checkedMul(image.width, image.height) catch return error.InvalidPng;
     const count = checkedMul(pixel_count, 4) catch return error.InvalidPng;
     const byte_count = checkedMul(count, @sizeOf(u16)) catch return error.InvalidPng;
@@ -624,7 +624,7 @@ fn validateImageHeader(image_data: ImageData) Error!void {
     var chunked: ImageData.Reader = undefined;
     const input = image_data.reader(&fixed, &chunked);
     const header = input.peekArray(2) catch return error.InvalidPng;
-    zlib.validateHeader(header) catch return error.InvalidPng;
+    zlib.decode.validateDictionaryFreeHeader(header) catch return error.InvalidPng;
 }
 
 fn validateImageContents(
@@ -664,8 +664,8 @@ fn transferScratchBound(image: SourceImage, output_bytes: usize) usize {
     const filtered = image.filtered_byte_count;
     const joined = @min(image.image_data.byte_count, (filtered *| 2) +| 64);
     return output_bytes +| filtered +| joined +| streaming_state_byte_count +| @sizeOf(
-        deflate.DecoderWorkspace,
-    ) +| @alignOf(deflate.DecoderWorkspace) +| 1024 +| Inflater.history_bytes;
+        deflate.decode.Workspace,
+    ) +| @alignOf(deflate.decode.Workspace) +| 1024 +| Inflater.history_bytes;
 }
 
 fn replayImageRows(
@@ -799,7 +799,7 @@ fn reuseExpandedRows(
     const stage_length = std.math.add(
         usize,
         payload_end,
-        @sizeOf(deflate.DecoderWorkspace) + @alignOf(deflate.DecoderWorkspace) - 1,
+        @sizeOf(deflate.decode.Workspace) + @alignOf(deflate.decode.Workspace) - 1,
     ) catch return .unavailable;
 
     // The required initial reservation matches bounded streaming validation. Larger
@@ -817,9 +817,9 @@ fn reuseExpandedRows(
     const address = std.mem.alignForward(
         usize,
         @intFromPtr(backing.ptr) + payload_end,
-        @alignOf(deflate.DecoderWorkspace),
+        @alignOf(deflate.decode.Workspace),
     );
-    const workspace: *deflate.DecoderWorkspace = @ptrFromInt(address);
+    const workspace: *deflate.decode.Workspace = @ptrFromInt(address);
     try inflateContiguous(source, backing[0..image.filtered_byte_count], workspace);
 
     // The decoder state is retired before growth or relocation. Admission has checked the complete
@@ -1013,7 +1013,7 @@ fn reuseSequentialRows(
     defer if (owns_backing) allocator.free(backing);
     if (!try inflateStoredImageData(image_data, backing)) {
         if (!image_data.multiple) {
-            var storage = try InflateStorage(deflate.DecoderWorkspace).init(allocator);
+            var storage = try InflateStorage(deflate.decode.Workspace).init(allocator);
             defer storage.deinit(allocator);
             try inflateContiguous(image_data.first, backing, storage.state());
         } else {
@@ -1030,7 +1030,7 @@ fn reuseSequentialRows(
             const joined_length: ?usize = if (payload_end) |end| std.math.add(
                 usize,
                 end,
-                @sizeOf(deflate.DecoderWorkspace) + @alignOf(deflate.DecoderWorkspace) - 1,
+                @sizeOf(deflate.decode.Workspace) + @alignOf(deflate.decode.Workspace) - 1,
             ) catch null else null;
             var joined: ?[]u8 = null;
             var storage: ?InflateStorage(Inflater) = null;
@@ -1065,9 +1065,9 @@ fn reuseSequentialRows(
                 const address = std.mem.alignForward(
                     usize,
                     @intFromPtr(backing.ptr) + payload_end.?,
-                    @alignOf(deflate.DecoderWorkspace),
+                    @alignOf(deflate.decode.Workspace),
                 );
-                const workspace: *deflate.DecoderWorkspace = @ptrFromInt(address);
+                const workspace: *deflate.decode.Workspace = @ptrFromInt(address);
                 try inflateContiguous(payload, backing[0..image.filtered_byte_count], workspace);
             } else {
                 // Alignment belongs to the state byte owner, so an unaligned retained prefix cannot
@@ -1139,7 +1139,7 @@ fn inflateStoredImageData(image_data: ImageData, filtered: []u8) Error!bool {
     var fixed: std.Io.Reader = undefined;
     var chunked: ImageData.Reader = undefined;
     const reader = image_data.reader(&fixed, &chunked);
-    const result = (zlib.decodeStoredReader(
+    const result = (zlib.decode.consumeStoredReader(
         reader,
         filtered,
     ) catch return error.InvalidPng) orelse return false;
@@ -1150,17 +1150,17 @@ fn inflateStoredImageData(image_data: ImageData, filtered: []u8) Error!bool {
 fn inflateContiguous(
     source: []const u8,
     filtered: []u8,
-    workspace: *deflate.DecoderWorkspace,
+    workspace: *deflate.decode.Workspace,
 ) Error!void {
     // Keep the token loop out of line: LLVM inlining here slows literal-heavy and noisy inputs.
     const result = @call(
         .never_inline,
-        zlib.decode,
+        zlib.decode.into,
         .{
             source,
             filtered,
-            @as(zlib.DecodeStorage, .{ .workspace = workspace }),
-            @as(zlib.DecodeOptions, .{}),
+            @as(zlib.decode.Storage, .{ .workspace = workspace }),
+            @as(zlib.decode.Options, .{}),
         },
     ) catch return error.InvalidPng;
     if (result.produced != filtered.len) return error.InvalidPng;
@@ -2443,7 +2443,7 @@ test "direct inflate storage reclaims scratch with an unaligned retained prefix"
             Inflater,
         ) + @alignOf(
             Inflater,
-        ) - 1 else @sizeOf(deflate.DecoderWorkspace) + @alignOf(deflate.DecoderWorkspace) - 1;
+        ) - 1 else @sizeOf(deflate.decode.Workspace) + @alignOf(deflate.decode.Workspace) - 1;
         const backing = try allocator.alloc(u8, fixture.filtered.len + state_bytes + 7);
         defer allocator.free(backing);
         var scratch: std.heap.FixedBufferAllocator = .init(backing);
@@ -4515,7 +4515,7 @@ test "PNG word transfer follows relocated byte alignment and declined remaps" {
 test "prepared PNG decoding preserves guards and rejects short output" {
     const fixtures = png_raster_vectors;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     var history: [raster.history_bytes]u8 = undefined;
     var packed_rows: [8]u8 = undefined;

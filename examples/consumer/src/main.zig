@@ -58,7 +58,12 @@ test "PNG package decodes independently framed pixels and writes a PNG" {
     try std.testing.expectEqual(8, decoded.encoded_bit_depth);
     try std.testing.expectEqual(6, decoded.encoded_color_type);
 
-    const encoded = try png.encode.alloc(allocator, try png.ImageInput.rgba8(&expected, 2, 1), .{});
+    const compression: png.encode.Compression = .{ .level = 6 };
+    const encoded = try png.encode.alloc(
+        allocator,
+        try png.ImageInput.rgba8(&expected, 2, 1),
+        .{ .compression = compression },
+    );
     defer allocator.free(encoded);
     var recovered = try png.decode.rgbaAlloc(u8, allocator, encoded, .{});
     defer recovered.deinit(allocator);
@@ -198,16 +203,16 @@ test "APNG public frames inspect and compose into a borrowed canvas" {
 
 test "gzip verifies a member and rejects a damaged trailer" {
     const allocator = std.testing.allocator;
-    const encoder = try gzip.EncoderWorkspace.create(allocator);
+    const encoder = try gzip.encode.Workspace.create(allocator);
     defer encoder.destroy(allocator);
-    const decoder = try gzip.DecoderWorkspace.create(allocator);
+    const decoder = try gzip.decode.Workspace.create(allocator);
     defer decoder.destroy(allocator);
     const source = "a gzip consumer; a gzip consumer";
-    const storage = try allocator.alloc(u8, try gzip.encodeBound(source.len, .{}));
+    const storage = try allocator.alloc(u8, try gzip.encode.bound(source.len, .{}));
     defer allocator.free(storage);
-    const encoded = try gzip.encode(source, storage, encoder, .{});
+    const encoded = try gzip.encode.into(source, storage, encoder, .{});
     var output: [source.len]u8 = undefined;
-    const result = try gzip.decode(
+    const result = try gzip.decode.into(
         encoded,
         &output,
         .{ .workspace = decoder },
@@ -219,22 +224,23 @@ test "gzip verifies a member and rejects a damaged trailer" {
     encoded[encoded.len - 8] ^= 1;
     try std.testing.expectError(
         error.InvalidStream,
-        gzip.decode(encoded, &output, .{ .workspace = decoder }, .{}),
+        gzip.decode.into(encoded, &output, .{ .workspace = decoder }, .{}),
     );
 }
 
 test "zlib verifies a framed stream and rejects a damaged checksum" {
     const allocator = std.testing.allocator;
-    const encoder = try zlib.EncoderWorkspace.create(allocator);
+    const encoder = try zlib.encode.Workspace.create(allocator);
     defer encoder.destroy(allocator);
-    const decoder = try zlib.DecoderWorkspace.create(allocator);
+    const decoder = try zlib.decode.Workspace.create(allocator);
     defer decoder.destroy(allocator);
     const source = "a zlib consumer; a zlib consumer";
-    const storage = try allocator.alloc(u8, try zlib.encodeBound(source.len, .{}));
+    const storage = try allocator.alloc(u8, try zlib.encode.bound(source.len, .{}));
     defer allocator.free(storage);
-    const encoded = try zlib.encode(source, storage, encoder, .{});
+    const encoded = try zlib.encode.into(source, storage, encoder, .{});
+    try zlib.decode.validateDictionaryFreeHeader(encoded[0..2]);
     var output: [source.len]u8 = undefined;
-    const result = try zlib.decode(
+    const result = try zlib.decode.into(
         encoded,
         &output,
         .{ .workspace = decoder },
@@ -245,22 +251,22 @@ test "zlib verifies a framed stream and rejects a damaged checksum" {
     encoded[encoded.len - 1] ^= 1;
     try std.testing.expectError(
         error.InvalidStream,
-        zlib.decode(encoded, &output, .{ .workspace = decoder }, .{}),
+        zlib.decode.into(encoded, &output, .{ .workspace = decoder }, .{}),
     );
 }
 
 test "raw DEFLATE round trip uses caller workspaces and checks extent" {
     const allocator = std.testing.allocator;
-    const encoder = try deflate.EncoderWorkspace.create(allocator);
+    const encoder = try deflate.encode.Workspace.create(allocator);
     defer encoder.destroy(allocator);
-    const decoder = try deflate.DecoderWorkspace.create(allocator);
+    const decoder = try deflate.decode.Workspace.create(allocator);
     defer decoder.destroy(allocator);
     const source = "independent consumer; independent consumer";
-    const storage = try allocator.alloc(u8, try deflate.encodeBound(source.len));
+    const storage = try allocator.alloc(u8, try deflate.encode.bound(source.len));
     defer allocator.free(storage);
-    const encoded = try deflate.encode(source, storage, encoder, .{});
+    const encoded = try deflate.encode.into(source, storage, encoder, .{});
     var output: [source.len]u8 = undefined;
-    const result = try deflate.decode(
+    const result = try deflate.decode.into(
         encoded,
         &output,
         .{ .workspace = decoder },
@@ -275,13 +281,13 @@ test "bounded run encoding and producer staging use the package facades" {
     const allocator = std.testing.allocator;
     var source: [96]u8 = undefined;
     for (&source, 0..) |*byte, i| byte.* = "abcd"[i % 4];
-    var wire: [zlib.short_four_byte_run_output_capacity]u8 = undefined;
+    var wire: [zlib.encode.four_byte_runs.short.output_capacity]u8 = undefined;
     var restored: [source.len]u8 = undefined;
-    const decoder = try deflate.DecoderWorkspace.create(allocator);
+    const decoder = try deflate.decode.Workspace.create(allocator);
     defer decoder.destroy(allocator);
 
-    const raw = try deflate.encodeShortFourByteRuns(&source, &wire);
-    const raw_result = try deflate.decode(
+    const raw = try deflate.encode.four_byte_runs.short.into(&source, &wire);
+    const raw_result = try deflate.decode.into(
         raw,
         &restored,
         .{ .workspace = decoder },
@@ -290,8 +296,8 @@ test "bounded run encoding and producer staging use the package facades" {
     try std.testing.expectEqual(raw.len, raw_result.consumed);
     try std.testing.expectEqualSlices(u8, &source, &restored);
 
-    const framed = try zlib.encodeShortFourByteRuns(&source, &wire);
-    const framed_result = try zlib.decode(
+    const framed = try zlib.encode.four_byte_runs.short.into(&source, &wire);
+    const framed_result = try zlib.decode.into(
         framed,
         &restored,
         .{ .workspace = decoder },
@@ -305,17 +311,18 @@ test "bounded run encoding and producer staging use the package facades" {
         0x78, 0x01, 0x01, 0x01, 0x00, 0xfe, 0xff, 0x41,
         0x00, 0x42, 0x00, 0x42,
     };
-    var stored: [zlib.short_stored_output_capacity]u8 = undefined;
-    try std.testing.expectEqualSlices(u8, &stored_a, try zlib.encodeShortStored("A", &stored));
+    var stored: [zlib.encode.short_stored.output_capacity]u8 = undefined;
+    try std.testing.expectEqualSlices(
+        u8,
+        &stored_a,
+        try zlib.encode.short_stored.into("A", &stored),
+    );
 
-    const workspace = try zlib.FourByteRunEncoderWorkspace.create(allocator);
+    const workspace = try zlib.encode.four_byte_runs.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     defer workspace.clear();
-    var encoder: zlib.FourByteRunEncoder = undefined;
-    try encoder.reset(
-        workspace,
-        .{ .deflate = .{ .compression = .{ .strategy = .four_byte_runs } } },
-    );
+    var encoder: zlib.encode.four_byte_runs.StreamEncoder = undefined;
+    try encoder.reset(workspace, .{});
     // Drain the header, then fill and immediately commit the borrowed input prefix.
     var written = (try encoder.step(&.{}, &wire, .process)).produced;
     const input = encoder.inputBuffer() orelse return error.MissingInputBuffer;
@@ -333,7 +340,7 @@ test "bounded run encoding and producer staging use the package facades" {
         }
     }
     try std.testing.expect(complete);
-    const staged = try zlib.decode(
+    const staged = try zlib.decode.into(
         wire[0..written],
         &restored,
         .{ .workspace = decoder },
@@ -345,16 +352,16 @@ test "bounded run encoding and producer staging use the package facades" {
 
 test "raw DEFLATE levels and exact output errors are available to consumers" {
     const allocator = std.testing.allocator;
-    const encoder = try deflate.EncoderWorkspace.create(allocator);
+    const encoder = try deflate.encode.Workspace.create(allocator);
     defer encoder.destroy(allocator);
-    const decoder = try deflate.DecoderWorkspace.create(allocator);
+    const decoder = try deflate.decode.Workspace.create(allocator);
     defer decoder.destroy(allocator);
     const source = "a small repeated record; a small repeated record";
     var encoded_storage: [256]u8 = undefined;
     var output: [source.len + 2]u8 = @splat(0xa5);
 
     for ([_]u8{ 0, 1, 3, 6, 9 }) |level| {
-        const encoded = try deflate.encode(
+        const encoded = try deflate.encode.into(
             source,
             &encoded_storage,
             encoder,
@@ -365,7 +372,7 @@ test "raw DEFLATE levels and exact output errors are available to consumers" {
             try std.testing.expectEqual(@as(u8, 0), (encoded[0] >> 1) & 0b11);
         }
         @memset(&output, 0xa5);
-        const decoded = try deflate.decode(
+        const decoded = try deflate.decode.into(
             encoded,
             output[1 .. source.len + 1],
             .{ .workspace = decoder },
@@ -379,14 +386,24 @@ test "raw DEFLATE levels and exact output errors are available to consumers" {
         // A raw end before the requested exact extent has its own error; no output is published.
         try std.testing.expectError(
             error.OutputSizeMismatch,
-            deflate.decode(encoded, &output, .{ .workspace = decoder }, .{ .output_size = .exact }),
+            deflate.decode.into(
+                encoded,
+                &output,
+                .{ .workspace = decoder },
+                .{ .output_size = .exact },
+            ),
         );
     }
 
     @memset(&encoded_storage, 0xa5);
     try std.testing.expectError(
         error.InvalidOptions,
-        deflate.encode(source, &encoded_storage, encoder, .{ .compression = .{ .level = 10 } }),
+        deflate.encode.into(
+            source,
+            &encoded_storage,
+            encoder,
+            .{ .compression = .{ .level = 10 } },
+        ),
     );
     try std.testing.expect(std.mem.allEqual(u8, &encoded_storage, 0xa5));
 }

@@ -9,18 +9,18 @@ pub fn main(init: std.process.Init) !void {
     else
         "zlib verifies bytes. zlib verifies bytes. zlib verifies bytes.";
     const allocator = init.gpa;
-    const encoder = try zlib.EncoderWorkspace.create(allocator);
+    const encoder = try zlib.encode.Workspace.create(allocator);
     defer encoder.destroy(allocator);
     defer encoder.clear();
-    const decoder = try zlib.DecoderWorkspace.create(allocator);
+    const decoder = try zlib.decode.Workspace.create(allocator);
     defer decoder.destroy(allocator);
-    const capacity = try zlib.encodeBound(source.len, .{});
+    const capacity = try zlib.encode.bound(source.len, .{});
     const compressed_storage = try allocator.alloc(u8, capacity);
     defer allocator.free(compressed_storage);
-    const compressed = try zlib.encode(source, compressed_storage, encoder, .{});
+    const compressed = try zlib.encode.into(source, compressed_storage, encoder, .{});
     const restored = try allocator.alloc(u8, source.len);
     defer allocator.free(restored);
-    const result = try zlib.decode(
+    const result = try zlib.decode.into(
         compressed,
         restored,
         .{ .workspace = decoder },

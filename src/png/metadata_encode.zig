@@ -198,7 +198,7 @@ pub const Prepared = struct {
     pub fn encodedSizeWithScratch(
         self: Prepared,
         allocator: std.mem.Allocator,
-        compression: zlib.Compression,
+        compression: zlib.encode.Compression,
     ) Error!usize {
         return self.emit(null, .{ .allocator = allocator }, compression);
     }
@@ -211,7 +211,7 @@ pub const Prepared = struct {
         self: Prepared,
         allocator: std.mem.Allocator,
         destination: []u8,
-        compression: zlib.Compression,
+        compression: zlib.encode.Compression,
     ) Error!usize {
         return self.emit(destination, .{ .allocator = allocator }, compression);
     }
@@ -229,7 +229,7 @@ pub const Prepared = struct {
         self: Prepared,
         destination: []u8,
         workspace: EncodingStorage,
-        compression: zlib.Compression,
+        compression: zlib.encode.Compression,
     ) Error!usize {
         return self.emit(destination, .{ .workspace = workspace }, compression);
     }
@@ -238,7 +238,7 @@ pub const Prepared = struct {
         self: Prepared,
         destination: ?[]u8,
         mode: EmissionMode,
-        compression: zlib.Compression,
+        compression: zlib.encode.Compression,
     ) Error!usize {
         try compression.validate();
         const value = self.value;
@@ -353,7 +353,7 @@ const EmissionMode = union(enum) {
 pub const Encoder = struct {
     destination: ?[]u8,
     mode: EmissionMode,
-    compression: zlib.Compression,
+    compression: zlib.encode.Compression,
     maximum_payload_bytes: usize,
     offset: usize = 0,
     payload_bytes: usize = 0,
@@ -368,7 +368,7 @@ pub const Encoder = struct {
         for (parts) |part| count = try add(count, part.len);
         if (uncompressed) |source| {
             if (self.mode != .allocator) {
-                const capacity = try add(count, try zlib.encodeBound(source.len, .{}));
+                const capacity = try add(count, try zlib.encode.bound(source.len, .{}));
                 const framed = try chunks.byteCount(capacity);
                 if (self.mode == .bound) {
                     self.offset = try add(self.offset, framed);
@@ -425,7 +425,7 @@ fn compress(
     source: []const u8,
     output: *std.Io.Writer,
     mode: EmissionMode,
-    compression: zlib.Compression,
+    compression: zlib.encode.Compression,
 ) Error!void {
     switch (mode) {
         .allocator => |allocator| {
@@ -583,9 +583,9 @@ test "prepared compressed text bounds a stream ending at a complete slab" {
     const wire = chunk[11 .. 8 + payload_len];
     const restored = try allocator.alloc(u8, source.len);
     defer allocator.free(restored);
-    const decoder = try zlib.DecoderWorkspace.create(allocator);
+    const decoder = try zlib.decode.Workspace.create(allocator);
     defer decoder.destroy(allocator);
-    const result = try zlib.decode(wire, restored, .{ .workspace = decoder }, .{});
+    const result = try zlib.decode.into(wire, restored, .{ .workspace = decoder }, .{});
     try std.testing.expectEqual(wire.len, result.consumed);
     try std.testing.expectEqual(source.len, result.produced);
     try std.testing.expectEqualSlices(u8, source, restored);
@@ -744,7 +744,7 @@ test "PNG metadata encoding preserves typed color HDR density Exif profile and t
     try std.testing.expectEqualSlices(u8, facts.exif_little, details.exif_payload.?);
     const orientation = try (try exif.View.open(details.exif_payload.?, .{})).orientation();
     try std.testing.expectEqual(exif.Orientation.right_top, orientation);
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const expanded = try allocator.alloc(u8, 4096);
     defer allocator.free(expanded);
@@ -982,8 +982,14 @@ test "prepared metadata rejects invalid compression before allocation or writes"
     var output: [512]u8 = undefined;
     for (values) |value| {
         const prepared = try prepare(value, 6, 8, .{});
-        for ([_]u8{ 10, 255 }) |level| {
-            const method: zlib.Compression = .{ .level = level };
+        const invalid = [_]zlib.encode.Compression{
+            .{ .level = 10 },
+            .{ .level = 255 },
+            .{ .strategy = .four_byte_runs, .lazy_lookahead = .reduced },
+            .{ .strategy = .four_byte_runs, .offline_pricing = .reduced },
+            .{ .level = 0, .strategy = .four_byte_runs, .offline_refinement = .early },
+        };
+        for (invalid) |method| {
             try std.testing.expectError(
                 error.InvalidOptions,
                 prepared.encodedSizeWithScratch(std.testing.failing_allocator, method),
@@ -1009,7 +1015,7 @@ test "zero metadata records emit no bytes and empty text still emits" {
     const empty = try prepare(MetadataInput{}, 6, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), empty.record_count);
     var output: [128]u8 = @splat(0xa5);
-    const method: zlib.Compression = .{ .level = 6 };
+    const method: zlib.encode.Compression = .{ .level = 6 };
     const length = try empty.encodedSizeWithScratch(std.testing.failing_allocator, method);
     try std.testing.expectEqual(@as(usize, 0), length);
     const written = try empty.writeIntoWithScratch(std.testing.failing_allocator, &output, method);

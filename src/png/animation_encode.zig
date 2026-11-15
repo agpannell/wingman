@@ -28,7 +28,7 @@ pub const Options = struct {
     filter: Filter = .adaptive,
     /// Shared compression options for each raster and selected compressed metadata; defaults to
     /// level 6 with automatic lookahead. A newly assigned Compression defaults to full lookahead.
-    compression: zlib.Compression = .{ .level = 6, .lazy_lookahead = .automatic },
+    compression: zlib.encode.Compression = .{ .level = 6, .lazy_lookahead = .automatic },
     /// Traversal shared by all rasters; defaults to sequential. Each raster and Adam7 pass starts
     /// fresh filter history.
     interlace: Interlace = .none,
@@ -225,7 +225,7 @@ fn addRasterBound(
         layout.bits_per_pixel,
         @backingInt(policy.interlace),
     ) catch return error.SizeOverflow;
-    const compressed_byte_bound = try zlib.encodeBound(filtered.filtered_bytes, .{});
+    const compressed_byte_bound = try zlib.encode.bound(filtered.filtered_bytes, .{});
     const records = try chunks.dataRecordCount(compressed_byte_bound, chunk_bytes, frame_data);
     wire_bound.* = try add(
         wire_bound.*,
@@ -650,7 +650,7 @@ test "APNG encoding preserves every native packed profile and included or exclud
             for ([_]Interlace{ .none, .adam7 }) |interlace| {
                 for (filters) |filter| {
                     for (
-                        [_]zlib.Compression{ .{ .level = 0 }, .{ .level = 9 } },
+                        [_]zlib.encode.Compression{ .{ .level = 0 }, .{ .level = 9 } },
                         0..,
                     ) |method, index| {
                         const image: AnimationInput = .{
@@ -1263,8 +1263,8 @@ test "APNG prepared metadata counts actual sequence words and both raw and encod
     };
     const repeated: [128]u8 = @splat('x');
     const cases = .{
-        .{ .method = zlib.Compression{ .level = 0 }, .text = "x" },
-        .{ .method = zlib.Compression{ .level = 3 }, .text = &repeated },
+        .{ .method = zlib.encode.Compression{ .level = 0 }, .text = "x" },
+        .{ .method = zlib.encode.Compression{ .level = 3 }, .text = &repeated },
     };
     inline for (cases) |case| {
         var options: Options = .{
@@ -1336,7 +1336,9 @@ test "default APNG compression composes with level and strategy mutation" {
     options.data_chunk_bytes = 7;
     for (0..10) |level| {
         options.compression.level = @intCast(level);
-        for ([_]zlib.Compression.Strategy{ .default, .huffman_only, .four_byte_runs }) |strategy| {
+        for (
+            [_]zlib.encode.Compression.Strategy{ .default, .huffman_only, .four_byte_runs },
+        ) |strategy| {
             options.compression.strategy = strategy;
             _ = try requirements(image, options);
             const encoded = try alloc(allocator, image, options);
@@ -1374,8 +1376,15 @@ test "invalid compression is refused before APNG allocation and prepared writes"
     const backing = try allocator.alloc(u8, required.workspace_bytes);
     defer allocator.free(backing);
     const workspace = try EncoderWorkspace.initBuffer(backing, required.workspace_extra_bytes);
-    for ([_]u8{ 10, 255 }) |level| {
-        const options: Options = .{ .compression = .{ .level = level } };
+    const invalid = [_]zlib.encode.Compression{
+        .{ .level = 10 },
+        .{ .level = 255 },
+        .{ .strategy = .four_byte_runs, .lazy_lookahead = .reduced },
+        .{ .strategy = .four_byte_runs, .offline_pricing = .reduced },
+        .{ .level = 0, .strategy = .four_byte_runs, .offline_refinement = .early },
+    };
+    for (invalid) |compression| {
+        const options: Options = .{ .compression = compression };
         try std.testing.expectError(error.InvalidOptions, requirements(image, options));
         try std.testing.expectError(
             error.InvalidOptions,

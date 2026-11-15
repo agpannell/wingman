@@ -324,7 +324,7 @@ const raster_fixtures = png_raster_vectors;
 test "PNG crops match independent all-filter and Adam7 byte word samples" {
     const fixtures = raster_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes + 3);
     defer allocator.free(history);
@@ -435,7 +435,7 @@ test "PNG crops match independent all-filter and Adam7 byte word samples" {
 test "PNG unselected palette failure preserves whole crop destinations" {
     const fixtures = raster_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes);
     defer allocator.free(history);
@@ -473,7 +473,7 @@ const palette_fixtures = png_palette_vectors;
 test "PNG palette recovery applies outside crops" {
     const fixtures = palette_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes);
     defer allocator.free(history);

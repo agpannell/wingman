@@ -85,7 +85,7 @@ pub fn requirements(comptime Sample: type, header: Header) Error!Requirements {
     ) catch return error.WorkBudgetExceeded;
     return .{
         .history_bytes = history_bytes,
-        .workspace_bytes = @sizeOf(deflate.DecoderWorkspace),
+        .workspace_bytes = @sizeOf(deflate.decode.Workspace),
         .packed_rows_bytes = row_bytes,
         .conversion_row_samples = conversion_samples,
         .conversion_row_bytes = conversion_bytes,
@@ -139,11 +139,11 @@ pub fn Decoder(comptime Sample: type) type {
         /// Sample interpretation whose palettes borrow independent caller/source storage.
         converter: RgbaConverter,
         /// Generic dependency state, exposing exact encoded/filtered/work counters.
-        inflater: zlib.Decoder,
+        inflater: zlib.decode.StreamDecoder,
         /// Internal inflation limits; do not modify while decoding.
-        inflation_limits: zlib.DecodeLimits,
+        inflation_limits: zlib.decode.Limits,
         /// Borrowed final-address DEFLATE workspace.
-        workspace: *deflate.DecoderWorkspace,
+        workspace: *deflate.decode.Workspace,
         /// Borrowed 32 KiB history prefix.
         history: *[history_bytes]u8,
         /// Borrowed packed-row scratch prefix.
@@ -404,7 +404,11 @@ pub fn Decoder(comptime Sample: type) type {
             self.inflater.work_left = maximum - used;
         }
 
-        fn inflate(self: *Self, input: []const u8, output: []u8) Error!zlib.DecodeProgress {
+        fn inflate(
+            self: *Self,
+            input: []const u8,
+            output: []u8,
+        ) Error!zlib.decode.StreamDecoder.Progress {
             const input_left: usize = @intCast(
                 self.inflation_limits.input_bytes - self.inflater.input_bytes,
             );
@@ -433,7 +437,7 @@ pub fn Decoder(comptime Sample: type) type {
     };
 }
 
-fn mapFailure(failure: zlib.DecodeError) Error {
+fn mapFailure(failure: zlib.decode.StreamDecoder.Error) Error {
     return switch (failure) {
         error.LimitExceeded, error.CounterOverflow => error.WorkBudgetExceeded,
         else => error.InvalidPng,
@@ -442,7 +446,7 @@ fn mapFailure(failure: zlib.DecodeError) Error {
 
 test "suspended PNG raster retires every stored-stream split and preserves backing suffixes" {
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, history_bytes + 3);
     defer allocator.free(history);

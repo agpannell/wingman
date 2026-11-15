@@ -12,31 +12,31 @@ pub fn main(init: std.process.Init) !void {
 
     // Workspaces are caller-owned and must stay at stable addresses. Clearing the encoder erases
     // retained input and scratch before the same allocator releases it.
-    const encoder_workspace = try deflate.EncoderWorkspace.create(allocator);
+    const encoder_workspace = try deflate.encode.Workspace.create(allocator);
     defer encoder_workspace.destroy(allocator);
     defer encoder_workspace.clear();
-    const decoder_workspace = try deflate.DecoderWorkspace.create(allocator);
+    const decoder_workspace = try deflate.decode.Workspace.create(allocator);
     defer decoder_workspace.destroy(allocator);
 
-    // encodeBound reserves enough space for a complete stream. The returned encoded slice borrows
+    // encode.bound reserves enough space for a complete stream. The returned encoded slice borrows
     // that reservation, so retain the full allocation to free it later. Level 6 is the default;
     // level 9 spends more work on offline parsing and can be useful when size matters more.
-    const capacity = try deflate.encodeBound(source.len);
+    const capacity = try deflate.encode.bound(source.len);
     const encoded_storage = try allocator.alloc(u8, capacity);
     defer allocator.free(encoded_storage);
-    const options: deflate.EncodeOptions = .{ .compression = .{ .level = 6 } };
-    const encoded = try deflate.encode(source, encoded_storage, encoder_workspace, options);
+    const options: deflate.encode.Options = .{ .compression = .{ .level = 6 } };
+    const encoded = try deflate.encode.into(source, encoded_storage, encoder_workspace, options);
 
     // This application knows the original size, so require both that exact output extent and
     // consumption of the entire encoded slice. Raw DEFLATE itself carries neither size nor
     // checksum.
     const restored = try allocator.alloc(u8, source.len);
     defer allocator.free(restored);
-    const decode_options: deflate.DecodeOptions = .{
+    const decode_options: deflate.decode.Options = .{
         .output_size = .exact,
         .trailing_data = .reject,
     };
-    const decoded = try deflate.decode(
+    const decoded = try deflate.decode.into(
         encoded,
         restored,
         .{ .workspace = decoder_workspace },
@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
     // with any unconsumed suffix, then with empty input while pending output drains.
     const fragment_storage = try allocator.alloc(u8, capacity);
     defer allocator.free(fragment_storage);
-    var encoder: deflate.Encoder = undefined;
+    var encoder: deflate.encode.StreamEncoder = undefined;
     try encoder.reset(encoder_workspace, options);
     var consumed: usize = 0;
     var produced: usize = 0;
@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
         const input_end = consumed + input_count;
         const output_count = @min(fragment_storage.len - produced, 11);
         const output_end = produced + output_count;
-        const action: deflate.EncodeAction = if (input_end == source.len) .finish else .process;
+        const action: deflate.encode.Action = if (input_end == source.len) .finish else .process;
         const progress = try encoder.step(
             source[consumed..input_end],
             fragment_storage[produced..output_end],
@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         if (progress.consumed == 0 and progress.produced == 0) return error.NoProgress;
     }
     const streamed = fragment_storage[0..produced];
-    const streamed_result = try deflate.decode(
+    const streamed_result = try deflate.decode.into(
         streamed,
         restored,
         .{ .workspace = decoder_workspace },

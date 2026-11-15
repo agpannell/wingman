@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const deflate = @import("../deflate.zig");
-const zlib = @import("../zlib.zig");
+const StreamDecoder = @import("StreamDecoder.zig");
 
 const Reader = @This();
 
@@ -17,10 +17,10 @@ pub const history_bytes = 32768;
 reader: std.Io.Reader,
 /// Borrowed compressed input reader, kept live and at its address throughout use.
 input: *std.Io.Reader,
-/// Native DEFLATE tables and progress, initialized in place by init.
-workspace: deflate.DecoderWorkspace,
+/// Native DEFLATE table scratch, initialized on demand by decoding.
+workspace: deflate.decode.Workspace,
 /// zlib framing and checksum state, borrowing workspace and caller history.
-decoder: zlib.Decoder,
+decoder: StreamDecoder,
 /// Decompressed lookahead owned by reader.
 buffer: [4096]u8,
 /// Whether the complete zlib stream has been validated.
@@ -52,10 +52,9 @@ fn stream(
     if (self.complete) return error.EndOfStream;
     // Keep output separate from filtered LZ history and the Reader's buffered prefix.
     var output: [4096]u8 = undefined;
-    const progress = zlib.decodeReader(
+    const progress = self.decoder.readInto(
         self.input,
         output[0..limit.minInt(output.len)],
-        &self.decoder,
     ) catch return error.ReadFailed;
     if (progress.status == .need_dictionary) return error.ReadFailed;
     self.complete = progress.status == .complete;

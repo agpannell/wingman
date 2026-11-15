@@ -19,7 +19,7 @@ const testing_encoding = png_encoding_vectors;
 
 const FilterType = Filter.Type;
 pub const Filter = @import("scanline_filters.zig").Filter;
-pub const Compression = zlib.Compression;
+pub const Compression = zlib.encode.Compression;
 pub const Workspace = encoding_workspace.Workspace;
 const Interlace = format.Interlace;
 
@@ -29,7 +29,7 @@ pub const Options = struct {
     filter: Filter = .adaptive,
     /// Level 6 with automatic lookahead by default. A newly assigned Compression uses its own
     /// full-lookahead default unless automatic or reduced is requested.
-    compression: zlib.Compression = .{ .level = 6, .lazy_lookahead = .automatic },
+    compression: zlib.encode.Compression = .{ .level = 6, .lazy_lookahead = .automatic },
     /// Sequential or Adam7 traversal; no interlace remains the default.
     interlace: Interlace = .none,
     /// Typed ancillary declarations, emitted before palette and image data without transforms.
@@ -116,7 +116,7 @@ fn prepareWithAdmission(
         layout.bits_per_pixel,
         @backingInt(options.interlace),
     ) catch return error.SizeOverflow;
-    const compressed_bound = try zlib.encodeBound(filtered_layout.filtered_bytes, .{});
+    const compressed_bound = try zlib.encode.bound(filtered_layout.filtered_bytes, .{});
     const data_records = try chunks.dataRecordCount(
         compressed_bound,
         options.data_chunk_bytes,
@@ -658,11 +658,11 @@ test "sequential packed row batches preserve Up history and skip stride padding"
         defer allocator.free(encoded);
         const compressed_len = std.mem.readInt(u32, encoded[33..][0..4], .big);
         try std.testing.expectEqualStrings("IDAT", encoded[37..41]);
-        const workspace = try zlib.DecoderWorkspace.create(allocator);
+        const workspace = try zlib.decode.Workspace.create(allocator);
         defer workspace.destroy(allocator);
         var history: [32768]u8 = undefined;
         var filtered: [height * (row_bytes + 1)]u8 = undefined;
-        const result = try zlib.decode(
+        const result = try zlib.decode.into(
             encoded[41..][0..compressed_len],
             &filtered,
             .{ .workspace = workspace, .history = &history },
@@ -732,7 +732,7 @@ test "PNG encoding serializes padded native words without reducing channel preci
         image.samples = .{ .words = .{ .values = words, .stride = stride } };
         for ([_]Interlace{ .none, .adam7 }) |interlace| {
             for (
-                [_]zlib.Compression{
+                [_]zlib.encode.Compression{
                     .{ .level = 0 },
                     .{ .strategy = .huffman_only },
                     .{ .level = 3 },
@@ -885,7 +885,11 @@ test "PNG segmented IDAT preserves native words Adam7 and compressed metadata" {
         0xfedc, 0x7654, 0x3210, 0xffff, 0x1111, 0x2222, 0x3333, 0x4444,
     };
     for (
-        [_]zlib.Compression{ .{ .level = 0 }, .{ .strategy = .huffman_only }, .{ .level = 9 } },
+        [_]zlib.encode.Compression{
+            .{ .level = 0 },
+            .{ .strategy = .huffman_only },
+            .{ .level = 9 },
+        },
     ) |method| {
         const encoded = try allocWithScratch(
             allocator,
@@ -1593,7 +1597,9 @@ test "default PNG compression permits level and strategy mutation" {
     var options: Options = .{};
     for (0..10) |level| {
         options.compression.level = @intCast(level);
-        for ([_]zlib.Compression.Strategy{ .default, .huffman_only, .four_byte_runs }) |strategy| {
+        for (
+            [_]zlib.encode.Compression.Strategy{ .default, .huffman_only, .four_byte_runs },
+        ) |strategy| {
             options.compression.strategy = strategy;
             _ = try requirements(image, options);
             const encoded = try alloc(allocator, image, options);
@@ -1614,8 +1620,15 @@ test "invalid compression is refused before PNG allocation and prepared writes" 
     const backing = try allocator.alloc(u8, required.workspace_bytes);
     defer allocator.free(backing);
     const workspace = try EncoderWorkspace.initBuffer(backing, required.workspace_extra_bytes);
-    for ([_]u8{ 10, 255 }) |level| {
-        const options: Options = .{ .compression = .{ .level = level } };
+    const invalid = [_]zlib.encode.Compression{
+        .{ .level = 10 },
+        .{ .level = 255 },
+        .{ .strategy = .four_byte_runs, .lazy_lookahead = .reduced },
+        .{ .strategy = .four_byte_runs, .offline_pricing = .reduced },
+        .{ .level = 0, .strategy = .four_byte_runs, .offline_refinement = .early },
+    };
+    for (invalid) |compression| {
+        const options: Options = .{ .compression = compression };
         try std.testing.expectError(error.InvalidOptions, requirements(image, options));
         try std.testing.expectError(
             error.InvalidOptions,

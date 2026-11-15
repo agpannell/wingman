@@ -197,7 +197,7 @@ const palette_fixtures = png_palette_vectors;
 test "PNG row reader matches independent all-filter and Adam7 byte word crops" {
     const fixtures = raster_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes + 3);
     defer allocator.free(history);
@@ -297,7 +297,7 @@ test "PNG row reader matches independent all-filter and Adam7 byte word crops" {
 test "PNG row reader preserves destination on unselected palette failure" {
     const fixtures = raster_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes);
     defer allocator.free(history);
@@ -341,7 +341,7 @@ test "PNG row reader preserves destination on unselected palette failure" {
 test "PNG row palette recovery survives byte word row reset" {
     const fixtures = palette_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes);
     defer allocator.free(history);

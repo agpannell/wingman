@@ -5,10 +5,10 @@ const zlib = @import("../zlib.zig");
 
 /// Native encoder reservation backed by caller storage or an allocation. Copies share the same
 /// state and must not be used concurrently. Release an allocated reservation with its allocator.
-pub const Workspace = WorkspaceImpl(zlib.Encoder, zlib.EncoderWorkspace);
+pub const Workspace = WorkspaceImpl(zlib.encode.StreamEncoder, zlib.encode.Workspace);
 pub const FourByteRunWorkspace = WorkspaceImpl(
-    zlib.FourByteRunEncoder,
-    zlib.FourByteRunEncoderWorkspace,
+    zlib.encode.four_byte_runs.StreamEncoder,
+    zlib.encode.four_byte_runs.Workspace,
 );
 
 fn WorkspaceImpl(comptime EncoderType: type, comptime WorkspaceType: type) type {
@@ -133,16 +133,27 @@ fn WorkspaceImpl(comptime EncoderType: type, comptime WorkspaceType: type) type 
 }
 
 /// Native codec refusal or failure to deliver compressed bytes to the Writer.
-pub const WriteError = zlib.EncodeError || std.Io.Writer.Error;
+pub const WriteError = zlib.encode.Error || zlib.encode.StreamEncoder.Error || zlib.encode
+    .four_byte_runs.StreamEncoder.Error || std.Io.Writer.Error;
 
 fn nativeState(storage: anytype) *@TypeOf(storage).State {
     return @ptrCast(storage.state);
 }
 
 /// Starts a fresh zlib stream, abandoning any previous one without writing output.
-pub fn beginStream(self: anytype, compression: zlib.Compression) zlib.EncodeError!void {
+pub fn beginStream(self: anytype, compression: zlib.encode.Compression) zlib.encode.Error!void {
     const state = nativeState(self);
-    try state.encoder.reset(&state.workspace, .{ .deflate = .{ .compression = compression } });
+    if (@TypeOf(self) == FourByteRunWorkspace) {
+        try compression.validate();
+        if (compression.level != 0 and compression.strategy != .four_byte_runs)
+            return error.InvalidOptions;
+        try state.encoder.reset(
+            &state.workspace,
+            .{ .mode = if (compression.level == 0) .stored else .runs },
+        );
+    } else {
+        try state.encoder.reset(&state.workspace, .{ .compression = compression });
+    }
 }
 
 /// Consumes the supplied input and drains available wire bytes to output without allocation. The
@@ -302,7 +313,7 @@ fn testRowStaging(comptime Storage: type) !void {
     defer reference.deinit(allocator);
     var source: [4128]u8 = undefined;
     for (&source, 0..) |*byte, index| byte.* = @truncate(index * 73 + index / 17);
-    const compression: zlib.Compression = .{ .strategy = .four_byte_runs };
+    const compression: zlib.encode.Compression = .{ .strategy = .four_byte_runs };
     var expected_buffer: [8192]u8 = undefined;
     var expected: std.Io.Writer = .fixed(&expected_buffer);
     try beginStream(reference, compression);
@@ -367,7 +378,7 @@ fn testWideRowDrain(comptime Storage: type) !void {
     const guarded = try allocator.alloc(u8, 80032);
     defer allocator.free(guarded);
     @memset(guarded, 0xa5);
-    const compression: zlib.Compression = .{ .strategy = .four_byte_runs };
+    const compression: zlib.encode.Compression = .{ .strategy = .four_byte_runs };
     var expected: std.Io.Writer = .fixed(expected_buffer);
     try beginStream(reference, compression);
     try writeStream(reference, &expected, prefix);
@@ -385,4 +396,44 @@ fn testWideRowDrain(comptime Storage: type) !void {
     try std.testing.expectEqualSlices(u8, expected.buffered(), output.buffered());
     for (guarded[0..16]) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
     for (guarded[80016..]) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+}
+
+test "compact stream validates general compression before translating its mode" {
+    const allocator = std.testing.allocator;
+    var compact = try FourByteRunWorkspace.initCapacity(allocator, 0);
+    defer compact.deinit(allocator);
+    const invalid = [_]zlib.encode.Compression{
+        .{ .level = 10, .strategy = .four_byte_runs },
+        .{ .strategy = .four_byte_runs, .lazy_lookahead = .reduced },
+        .{ .strategy = .four_byte_runs, .offline_pricing = .reduced },
+        .{ .level = 0, .strategy = .four_byte_runs, .offline_refinement = .early },
+        .{ .level = 6, .strategy = .default },
+    };
+    for (invalid) |compression| {
+        @memset(compact.allocation, 0xa5);
+        try std.testing.expectError(error.InvalidOptions, beginStream(compact, compression));
+        try std.testing.expect(std.mem.allEqual(u8, compact.allocation, 0xa5));
+    }
+
+    var full = try Workspace.initCapacity(allocator, 0);
+    defer full.deinit(allocator);
+    var source: [512]u8 = undefined;
+    for (&source, 0..) |*byte, i| byte.* = @truncate(i % 4);
+    for ([_]u8{ 0, 1, 6, 9 }) |level| {
+        const compression: zlib.encode.Compression = .{
+            .level = level,
+            .strategy = .four_byte_runs,
+        };
+        var expected_bytes: [1024]u8 = undefined;
+        var actual_bytes: [1024]u8 = undefined;
+        var expected: std.Io.Writer = .fixed(&expected_bytes);
+        var actual: std.Io.Writer = .fixed(&actual_bytes);
+        try beginStream(full, compression);
+        try beginStream(compact, compression);
+        try writeStream(full, &expected, &source);
+        try writeStream(compact, &actual, &source);
+        try finishStream(full, &expected);
+        try finishStream(compact, &actual);
+        try std.testing.expectEqualSlices(u8, expected.buffered(), actual.buffered());
+    }
 }

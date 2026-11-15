@@ -3,6 +3,9 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
+// Dependent-history copying mechanisms studied in zlib-ng:
+// https://github.com/zlib-ng/zlib-ng/blob/12731092979c6d07f42da27da673a9f6c7b13586/chunkset_tpl.h
+
 /// Store width selected from the compile-time backend and CPU features.
 pub const copy_bytes: usize = blk: {
     if (builtin.zig_backend != .stage2_llvm) break :blk 16;
@@ -14,8 +17,8 @@ pub const copy_bytes: usize = blk: {
 /// Copies a 3..258-byte match at distance >= 8 into a 298-byte destination reservation. Only
 /// exact-size decoding may leave temporary bytes beyond an individual match. The margin covers five
 /// eager eight-byte words and all later paired words. Sequential stores precede dependent history
-/// reads. Success overwrites the complete supplied output; a final short stream fails before
-/// publication.
+/// reads. The enclosing exact decode must overwrite its complete destination before success; a
+/// final short stream fails before result publication.
 pub fn copyExtendedWords(destination: []u8, source: []const u8, length: usize) void {
     std.debug.assert(destination.len >= 298 and length >= 3 and length <= 258);
     inline for (0..5) |word| destination[word * 8 ..][0..8].* = source[word * 8 ..][0..8].*;
@@ -174,9 +177,11 @@ pub fn copyPeriodicBytes(destination: []u8, source: []const u8, distance: usize)
 /// Fills at least copy_bytes destination bytes from an initialized 1..32-byte period. The period
 /// must fit the selected store width; no seed padding or output overcopy is needed.
 pub fn repeatPeriodic(comptime period: usize, destination: []u8, seed: *const [period]u8) void {
-    return @call(.always_inline, repeatPeriodicWithWidth, .{
-        period, copy_bytes, destination, seed,
-    });
+    return @call(
+        .always_inline,
+        repeatPeriodicWithWidth,
+        .{ period, copy_bytes, destination, seed },
+    );
 }
 
 /// Repeats initialized history at distance 8..32 through a destination of at least 64 bytes.

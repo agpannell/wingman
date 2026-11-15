@@ -739,7 +739,7 @@ const raster_fixtures = png_raster_vectors;
 test "PNG suspended input retires fragments and delivers complete byte word crop rows" {
     const fixtures = raster_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes + 3);
     defer allocator.free(history);
@@ -897,7 +897,7 @@ test "PNG suspended input retires fragments and delivers complete byte word crop
 test "PNG suspended indexed tables use actual backing and preserve current bands on late failure" {
     const fixtures = raster_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes);
     defer allocator.free(history);
@@ -1040,7 +1040,7 @@ test "PNG suspended indexed tables use actual backing and preserve current bands
 test "PNG suspended finish split reset framing and exact work policies remain bounded" {
     const fixtures = raster_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes);
     defer allocator.free(history);
@@ -1163,7 +1163,7 @@ const palette_fixtures = png_palette_vectors;
 test "PNG palette recovery survives retired fragments and native byte word stream reset" {
     const fixtures = palette_fixtures;
     const allocator = std.testing.allocator;
-    const workspace = try deflate.DecoderWorkspace.create(allocator);
+    const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const history = try allocator.alloc(u8, raster.history_bytes);
     defer allocator.free(history);

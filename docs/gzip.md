@@ -2,12 +2,14 @@
 
 gzip wraps a DEFLATE stream in a member with a header, CRC-32 checksum and original-size trailer.
 `wingman.gzip` encodes and verifies [RFC 1952](https://www.rfc-editor.org/rfc/rfc1952) members,
-including optional metadata and concatenated members. For raw streams use [`wingman.deflate`](deflate.md);
-for the distinct RFC 1950 wrapper use [`wingman.zlib`](zlib.md). CRC-32 detects accidental
-corruption; it does not authenticate content.
+including optional metadata and concatenated members. For raw streams use
+[`wingman.deflate`](deflate.md); for the distinct RFC 1950 wrapper use [`wingman.zlib`](zlib.md).
+CRC-32 detects accidental corruption; it does not authenticate content.
 
-Run `zig build gzip-example` or pass text after `--`. The [example](../examples/gzip.zig) writes
-one member with a name and header checksum, inspects the header and verifies the restored bytes.
+Use [the package setup](../README.md#use-it-in-a-project) with Zig 0.17.0 and import
+`@import("wingman").gzip`. From the package checkout, run `zig build gzip-example` or
+`zig build gzip-example -- "your text"`. The [example](../examples/gzip.zig) writes one member with
+a name and header checksum, inspects the header and verifies the restored bytes.
 
 ## Complete members
 
@@ -19,26 +21,26 @@ nothing and retain no input, output or allocator after return.
 ```zig
 const gzip = @import("wingman").gzip;
 
-const encoder = try gzip.EncoderWorkspace.create(allocator);
+const encoder = try gzip.encode.Workspace.create(allocator);
 defer encoder.destroy(allocator);
 defer encoder.clear();
-const decoder = try gzip.DecoderWorkspace.create(allocator);
+const decoder = try gzip.decode.Workspace.create(allocator);
 defer decoder.destroy(allocator);
-const options: gzip.EncodeOptions = .{ .name = "sample.txt", .header_crc = true };
-const storage = try allocator.alloc(u8, try gzip.encodeBound(source.len, options));
+const options: gzip.encode.Options = .{ .name = "sample.txt", .header_crc = true };
+const storage = try allocator.alloc(u8, try gzip.encode.bound(source.len, options));
 defer allocator.free(storage);
-const encoded = try gzip.encode(source, storage, encoder, options);
+const encoded = try gzip.encode.into(source, storage, encoder, options);
 const restored = try allocator.alloc(u8, expected_size);
 defer allocator.free(restored);
-const result = try gzip.decode(encoded, restored, .{ .workspace = decoder }, .{
+const result = try gzip.decode.into(encoded, restored, .{ .workspace = decoder }, .{
     .output_size = .exact,
     .trailing_data = .reject,
 });
 // result.members == 1 and result.produced == expected_size.
 ```
 
-The encoded prefix borrows the output reservation. Encoding uses an explicit timestamp and
-metadata; it does not read a clock. `EncodeOptions.deflate` selects compression effort, window and
+The encoded prefix borrows the output reservation. Encoding uses an explicit timestamp and metadata;
+it does not read a clock. `encode.Options` directly selects compression effort, window and
 per-member limits. Preset dictionaries are unsupported in gzip. Optional extra data is limited to
 65,535 bytes; names and comments cannot contain NUL. The encoder copies metadata while initializing
 its state. `header_crc` requests the format's optional FHCRC; the data CRC-32 and original-size
@@ -51,10 +53,10 @@ pricing settings, and their work and output tradeoffs.
 Complete decoding verifies headers, optional FHCRC, data CRC-32 and original size modulo 2³². The
 default decodes one member, accepts bounded output and leaves following input unconsumed. Exact
 output and trailing-data rejection are separate options. Select `.members = .concatenate` to decode
-all supplied members; concatenation rejects trailing garbage. `MemberIterator` instead verifies
-and returns one member at a time, advancing only after successful validation.
-An exact-output mismatch detected in the raw stream returns `InvalidStream`; the member's trailer
-has not necessarily been verified when that error is returned.
+all supplied members; concatenation rejects trailing garbage. `Member.Iterator` instead verifies and
+returns one member at a time, advancing only after successful validation. An exact-output mismatch
+detected in the raw stream returns `InvalidStream`; the member's trailer has not necessarily been
+verified when that error is returned.
 
 Source, output and used workspaces must be disjoint; overlap returns `StorageOverlap`. Failures can
 change output or scratch and publish no progress counts. Do not publish failed output. Complete
@@ -64,21 +66,26 @@ when handling input with an explicit resource policy.
 
 ## Headers and streaming
 
-`parseHeader` validates and returns header facts without decoding the payload. Optional metadata
+`Header.parse` validates and returns header facts without decoding the payload. Optional metadata
 views borrow the encoded source. Names and comments are uninterpreted bytes: the caller owns any
-text decoding, filename handling or path policy. `HeaderLimits` independently bounds field and
+text decoding, filename handling or path policy. `Header.Limits` independently bounds field and
 total header sizes. Header inspection alone does not validate the compressed payload or trailer.
 
-`Encoder` accepts fragments and supports process, flush, full-flush and finish. `nextMember` starts
-another member with independent history while cumulative statistics continue. The caller supplies
-metadata and output; consumed fragments can retire after each step.
+`encode.StreamEncoder` accepts fragments and supports process, flush, full-flush and finish.
+`nextMember` starts another member with independent history while cumulative statistics continue.
+The caller supplies metadata and output; consumed fragments can retire after each step.
 
 An encoder step that fails returns no progress value; `counts()` retains the last successfully
 published counts. Output and workspace may still have changed, and the encoder requires reset.
 
-`Decoder` borrows an exclusive workspace and separate 32 KiB history; optional `HeaderBuffers`
-capture metadata in caller storage. It can stop after one member, return each verified member for
-explicit iteration, or concatenate until EOF. Supply the final-input flag only for the true end of
-the input and retain it with any unconsumed suffix. Streaming output is provisional until its
-member's CRC and size verify. After an error, reset the owner before reuse. Captured header views
-borrow the caller's capture buffers; without capture, lengths and flags are still available.
+`decode.StreamDecoder` borrows an exclusive workspace and separate 32 KiB history; optional
+`Header.CaptureBuffers` capture metadata in caller storage. It can stop after one member, return
+each verified member for explicit iteration, or concatenate until EOF. Supply the final-input flag
+only for the true end of the input and retain it with any unconsumed suffix. Streaming output is
+provisional until its member's CRC and size verify. After an error, reset the owner before reuse.
+Captured header views borrow the caller's capture buffers; without capture, lengths and flags are
+still available.
+
+Encoder and decoder state can transfer between calls with exclusive access to their stable
+workspaces, history and capture storage. Retire the old state after transfer; captured views still
+refer to the same external buffers.

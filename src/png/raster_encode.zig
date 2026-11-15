@@ -57,7 +57,7 @@ pub const Options = struct {
     /// Predictor or adaptive minimum signed-byte score, with lowest selector winning ties.
     filter: Filter = .{ .fixed = .sub },
     /// Zlib compression level and strategy. The default level 3 uses greedy matching.
-    compression: zlib.Compression = .{ .level = 3 },
+    compression: zlib.encode.Compression = .{ .level = 3 },
     /// Each Adam7 pass begins with empty previous-row filter history.
     interlace: Interlace = .none,
 };
@@ -275,13 +275,13 @@ pub fn compressRows(
     scratch_allocator: std.mem.Allocator,
 ) Error!void {
     const row_capacity = try add(layout.row_bytes, 1);
-    if (row_capacity <= zlib.short_stored_max_input_bytes and image.height <= zlib
-        .short_stored_max_input_bytes / row_capacity)
+    if (row_capacity <= zlib.encode.short_stored.max_input_bytes and image.height <= zlib.encode
+        .short_stored.max_input_bytes / row_capacity)
     {
         if (try shortStoredRows(output, image, layout, options, row_capacity)) return;
     }
-    if (row_capacity <= zlib.short_four_byte_run_max_input_bytes and image.height <= zlib
-        .short_four_byte_run_max_input_bytes / row_capacity)
+    if (row_capacity <= zlib.encode.four_byte_runs.short.max_input_bytes and image.height <= zlib
+        .encode.four_byte_runs.short.max_input_bytes / row_capacity)
     {
         if (try shortRunRows(output, image, layout, options, row_capacity)) return;
     }
@@ -505,16 +505,19 @@ noinline fn shortStoredRows(
     row_capacity: usize,
 ) align(64) Error!bool {
     if (options.interlace != .none or options.compression.strategy != .four_byte_runs or
-        row_capacity > zlib.short_stored_max_input_bytes or image.height > zlib
-        .short_stored_max_input_bytes / row_capacity) return false;
+        row_capacity > zlib.encode.short_stored.max_input_bytes or image.height > zlib.encode
+        .short_stored.max_input_bytes / row_capacity) return false;
     const source = switch (image.samples) {
         .packed_bytes => |value| value.bytes,
         .words => return false,
     };
-    var filtered: [zlib.short_stored_max_input_bytes]u8 = undefined;
+    var filtered: [zlib.encode.short_stored.max_input_bytes]u8 = undefined;
     filterShortRows(&filtered, source, image.height, layout, options.filter, row_capacity);
-    var encoded: [zlib.short_stored_output_capacity]u8 = undefined;
-    const wire = try zlib.encodeShortStored(filtered[0 .. image.height * row_capacity], &encoded);
+    var encoded: [zlib.encode.short_stored.output_capacity]u8 = undefined;
+    const wire = try zlib.encode.short_stored.into(
+        filtered[0 .. image.height * row_capacity],
+        &encoded,
+    );
     try output.writeAll(wire);
     return true;
 }
@@ -532,10 +535,10 @@ noinline fn shortRunRows(
         .packed_bytes => |value| value.bytes,
         .words => return false,
     };
-    var filtered: [zlib.short_four_byte_run_max_input_bytes]u8 = undefined;
+    var filtered: [zlib.encode.four_byte_runs.short.max_input_bytes]u8 = undefined;
     filterShortRows(&filtered, source, image.height, layout, options.filter, row_capacity);
-    var encoded: [zlib.short_four_byte_run_output_capacity]u8 = undefined;
-    const wire = try zlib.encodeShortFourByteRuns(
+    var encoded: [zlib.encode.four_byte_runs.short.output_capacity]u8 = undefined;
+    const wire = try zlib.encode.four_byte_runs.short.into(
         filtered[0 .. image.height * row_capacity],
         &encoded,
     );

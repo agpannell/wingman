@@ -14,7 +14,7 @@ const png_raster_vectors = @import("testdata/raster.zig");
 pub fn Storage(comptime Sample: type) type {
     return struct {
         /// Existing DEFLATE workspace constructed at its final address.
-        workspace: *deflate.DecoderWorkspace,
+        workspace: *deflate.decode.Workspace,
         /// At least the generic dependency's 32 KiB history requirement.
         history: []u8,
         /// Two packed full-width filter rows, as reported by requirements.
@@ -48,8 +48,8 @@ pub fn Workspace(comptime Sample: type) type {
         pub fn byteCount(header: Header) Error!usize {
             const required = try raster.requirements(Sample, header);
             var bytes: usize = @sizeOf(
-                deflate.DecoderWorkspace,
-            ) + @alignOf(deflate.DecoderWorkspace) - 1;
+                deflate.decode.Workspace,
+            ) + @alignOf(deflate.decode.Workspace) - 1;
             for (
                 [_]usize{
                     required.history_bytes,
@@ -73,9 +73,9 @@ pub fn Workspace(comptime Sample: type) type {
             const state_offset = std.mem.alignForward(
                 usize,
                 base,
-                @alignOf(deflate.DecoderWorkspace),
+                @alignOf(deflate.decode.Workspace),
             ) - base;
-            const history_offset = state_offset + @sizeOf(deflate.DecoderWorkspace);
+            const history_offset = state_offset + @sizeOf(deflate.decode.Workspace);
             const rows_offset = history_offset + required.history_bytes;
             const after_rows = rows_offset + required.packed_rows_bytes;
             const conversion_offset = std.mem.alignForward(
@@ -138,7 +138,7 @@ pub fn Workspace(comptime Sample: type) type {
             const source = try Source.open(png_raster_vectors.sequential_png, .{});
             const header = source.header();
             const bytes = try byteCount(header);
-            const alignment = @alignOf(deflate.DecoderWorkspace);
+            const alignment = @alignOf(deflate.decode.Workspace);
             const backing = try allocator.alignedAlloc(
                 u8,
                 .fromByteUnits(alignment),

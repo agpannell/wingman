@@ -47,7 +47,7 @@ pub const Metadata = struct {
     }
 
     /// Selected metadata, bounded expansion and compressed-stream failures.
-    pub const Error = deflate.Error || error{
+    pub const Error = deflate.decode.Error || error{
         InvalidPngMetadata,
         UnsupportedPngMetadata,
         MetadataLimitExceeded,
@@ -339,7 +339,7 @@ pub const Metadata = struct {
         pub fn expandInto(
             self: CompressedProfile,
             destination: []u8,
-            workspace: *deflate.DecoderWorkspace,
+            workspace: *deflate.decode.Workspace,
         ) Error![]u8 {
             return expandZlib(self.data, destination, workspace);
         }
@@ -365,7 +365,7 @@ pub const Metadata = struct {
         pub fn expandInto(
             self: Text,
             destination: []u8,
-            workspace: *deflate.DecoderWorkspace,
+            workspace: *deflate.decode.Workspace,
         ) Error![]u8 {
             const result = if (self.compressed) try expandZlib(
                 self.data,
@@ -801,9 +801,9 @@ test "PNG iTXt rejects malformed language syntax for plain and compressed record
 fn expandZlib(
     source: []const u8,
     destination: []u8,
-    workspace: *deflate.DecoderWorkspace,
+    workspace: *deflate.decode.Workspace,
 ) Metadata.Error![]u8 {
-    const decoded = zlib.decode(
+    const decoded = zlib.decode.into(
         source,
         destination,
         .{ .workspace = workspace },
@@ -917,7 +917,7 @@ test "PNG ICC and Exif views share checked payload mechanisms and explicit expan
     try std.testing.expectEqual(.icc, details.colorSource());
     const view = try exif_module.View.open(details.exif_payload.?, .{});
     try std.testing.expectEqual(.right_top, (try view.orientation()).?);
-    const workspace = try deflate.DecoderWorkspace.create(std.testing.allocator);
+    const workspace = try deflate.decode.Workspace.create(std.testing.allocator);
     defer workspace.destroy(std.testing.allocator);
     const expected = try std.testing.allocator.dupe(u8, fixture.srgb_icc);
     defer std.testing.allocator.free(expected);
@@ -956,7 +956,7 @@ test "PNG compressed metadata restores bounded workspace backing after reuse" {
     )).metadata().read(.{});
     const destination = try allocator.alloc(u8, expected.len + 8);
     defer allocator.free(destination);
-    const backing = try allocator.alignedAlloc(u8, .@"8", @sizeOf(deflate.DecoderWorkspace) + 128);
+    const backing = try allocator.alignedAlloc(u8, .@"8", @sizeOf(deflate.decode.Workspace) + 128);
     defer allocator.free(backing);
     for (0..2) |index| {
         @memset(backing, 0xa5);
@@ -966,7 +966,7 @@ test "PNG compressed metadata restores bounded workspace backing after reuse" {
             fixed.allocator(),
             .{ .fail_index = index },
         );
-        if (deflate.DecoderWorkspace.create(failing.allocator())) |workspace| {
+        if (deflate.decode.Workspace.create(failing.allocator())) |workspace| {
             const live = fixed.end_index;
             const requests = failing.alloc_index;
             for (0..2) |_| {
@@ -998,7 +998,7 @@ test "PNG Latin-1 and compressed UTF-8 text match independent expansion controls
     defer std.testing.allocator.free(bytes);
     const reader = (try SourceImage.open(bytes, .{ .maximum_source_extent = 2 })).metadata();
     var texts = reader.texts(.{});
-    const workspace = try deflate.DecoderWorkspace.create(std.testing.allocator);
+    const workspace = try deflate.decode.Workspace.create(std.testing.allocator);
     defer workspace.destroy(std.testing.allocator);
     var destination: [64]u8 = undefined;
     const first = (try texts.next()).?;
@@ -1083,7 +1083,7 @@ test "PNG text byte refusal persists without traversing later chunks" {
 test "PNG iTXt ignores every compression method when its text is uncompressed" {
     const bytes = try std.testing.allocator.dupe(u8, png_metadata_vectors.uncompressed_itxt_png);
     defer std.testing.allocator.free(bytes);
-    const workspace = try deflate.DecoderWorkspace.create(std.testing.allocator);
+    const workspace = try deflate.decode.Workspace.create(std.testing.allocator);
     defer workspace.destroy(std.testing.allocator);
     const limits: Metadata.Limits = .{ .maximum_records = 4, .maximum_bytes = 44 };
     var destination: [32]u8 = undefined;
@@ -1365,7 +1365,7 @@ test "PNG text keywords UTF-8 framing and compressed checksums have explicit fai
             },
         ),
     );
-    const workspace = try deflate.DecoderWorkspace.create(std.testing.allocator);
+    const workspace = try deflate.decode.Workspace.create(std.testing.allocator);
     defer workspace.destroy(std.testing.allocator);
     var destination: [4]u8 = undefined;
     // Independent stored zlib encoding of abc: header, LEN/NLEN, bytes, Adler-32.

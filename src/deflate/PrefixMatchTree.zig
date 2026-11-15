@@ -1,50 +1,62 @@
-//! Bounded prefix-aware offline match search over one slab and its copied history. The tree
-//! organization and short-match table are informed by libdeflate 1.26's `lib/bt_matchfinder.h`; no
-//! upstream implementation is linked or copied.
+//! Find backward matches by inserting each source suffix into a tree ordered by its bytes.
+//! Comparisons reuse the prefixes already shared with the lower and upper search branches; a
+//! separate three-byte hash supplies short matches before the tree search begins. Search depth and
+//! work allowance bound each insertion over one slab and its copied history.
+//!
+//! The tree organization and short-match table are informed by libdeflate 1.26's
+//! `lib/bt_matchfinder.h`; no upstream implementation is linked or copied.
 
 const std = @import("std");
+const MatchCandidates = @import("MatchCandidates.zig");
+const Match = MatchCandidates.Candidate;
 
-pub const alternatives = 16;
+const PrefixMatchTree = @This();
+
 const child_slots = 32768 + 1;
 const sparse_reset_limit = 4096;
 const none = std.math.maxInt(u32);
 
-pub const Match = struct { length: u16, distance: u16 };
-pub const Matches = struct { items: [alternatives]Match, count: u8 };
-pub const Stats = struct { units: u32 = 0, probes: u32 = 0 };
+/// Work completed by one insertion, also published when its allowance is exhausted.
+pub const Stats = struct {
+    /// Prior-candidate probes plus eight-byte comparisons; scalar comparison tails are uncharged.
+    units: u32 = 0,
+    /// Prior positions examined, including the separate three-byte candidate.
+    probes: u32 = 0,
+};
 pub const Error = error{LimitExceeded};
 
-pub const Workspace = struct {
-    short_heads: [65536]u32,
-    long_heads: [65536]u32,
-    // An extra slot keeps the current insertion distinct from the oldest in-window candidate.
-    children: [child_slots][2]u16,
+/// Most recent three-byte hash coordinates, or none for an empty head.
+short_heads: [65536]u32,
+/// Most recent four-byte hash coordinates, or none for an empty head.
+long_heads: [65536]u32,
+/// Lower/upper lexicographic child links as backward byte distances from their parent; zero is
+/// empty. An extra slot keeps the current insertion distinct from the oldest in-window candidate.
+children: [child_slots][2]u16,
 
-    pub fn resetAll(self: *Workspace) void {
+pub fn resetAll(self: *PrefixMatchTree) void {
+    @memset(&self.short_heads, none);
+    @memset(&self.long_heads, none);
+}
+
+pub fn reset(self: *PrefixMatchTree, data: []const u8) void {
+    if (data.len <= sparse_reset_limit) {
+        // Only keys present in this slab can be read, even after another search phase.
+        for (0..data.len -| 2) |position| {
+            const source = data[position..];
+            const first3 = @as(
+                u32,
+                source[0],
+            ) | (@as(u32, source[1]) << 8) | (@as(u32, source[2]) << 16);
+            self.short_heads[hash(first3)] = none;
+            if (source.len >= 4) {
+                self.long_heads[hash(std.mem.readInt(u32, source[0..4], .little))] = none;
+            }
+        }
+    } else {
         @memset(&self.short_heads, none);
         @memset(&self.long_heads, none);
     }
-
-    pub fn reset(self: *Workspace, data: []const u8) void {
-        if (data.len <= sparse_reset_limit) {
-            // Only keys present in this slab can be read, even after another search phase.
-            for (0..data.len -| 2) |position| {
-                const source = data[position..];
-                const first3 = @as(
-                    u32,
-                    source[0],
-                ) | (@as(u32, source[1]) << 8) | (@as(u32, source[2]) << 16);
-                self.short_heads[hash(first3)] = none;
-                if (source.len >= 4) {
-                    self.long_heads[hash(std.mem.readInt(u32, source[0..4], .little))] = none;
-                }
-            }
-        } else {
-            @memset(&self.short_heads, none);
-            @memset(&self.long_heads, none);
-        }
-    }
-};
+}
 
 fn hash(value: u32) u16 {
     return @truncate((value *% 0x1e35a7bd) >> 16);
@@ -70,86 +82,19 @@ fn work(comptime bounded: bool, stats: *Stats, budget: u64) Error!void {
     stats.units += 1;
 }
 
-fn append(matches: ?*Matches, length: usize, distance: usize) void {
-    const row = matches orelse return;
-    if (row.count != 0) {
-        const previous = &row.items[row.count - 1];
-        if (previous.distance == distance) {
-            // A longer match at the same distance covers every length of the earlier match.
-            previous.length = @intCast(length);
-            return;
-        }
-    }
-    const slot = @min(row.count, alternatives - 1);
-    row.items[slot] = .{ .length = @intCast(length), .distance = @intCast(distance) };
-    row.count = @min(alternatives, row.count + 1);
-}
-
-test "longer matches replace dominated alternatives at the same distance" {
-    var row: Matches = .{ .items = undefined, .count = 0 };
-    append(&row, 3, 8);
-    append(&row, 12, 8);
-    try std.testing.expectEqual(1, row.count);
-    try std.testing.expectEqual(Match{ .length = 12, .distance = 8 }, row.items[0]);
-    append(&row, 24, 16);
-    try std.testing.expectEqual(2, row.count);
-    try std.testing.expectEqual(Match{ .length = 24, .distance = 16 }, row.items[1]);
-}
-
-test "coalescing preserves capped usable distances and extends full rows" {
-    const Reference = struct {
-        fn append(row: *Matches, length: usize, distance: usize) void {
-            const slot = @min(row.count, alternatives - 1);
-            row.items[slot] = .{ .length = @intCast(length), .distance = @intCast(distance) };
-            row.count = @min(alternatives, row.count + 1);
-        }
-    };
-    var before: Matches = .{ .items = undefined, .count = 0 };
-    var after: Matches = .{ .items = undefined, .count = 0 };
-    // All distances and lengths below are legal against this repeated history and source.
-    const data: [128]u8 = @splat('a');
-    const position = 64;
-    for (0..20) |i| {
-        const length = 3 + i;
-        const distance = if (i < 2) 8 else 8 + i;
-        try std.testing.expectEqualSlices(
-            u8,
-            data[position..][0..length],
-            data[position - distance ..][0..length],
-        );
-        Reference.append(&before, length, distance);
-        append(&after, length, distance);
-        for (3..length + 1) |usable_length| {
-            for (before.items[0..before.count]) |old| {
-                if (old.length < usable_length) continue;
-                var found = false;
-                for (after.items[0..after.count]) |new| {
-                    if (new.length >= usable_length and new.distance == old.distance) found = true;
-                }
-                try std.testing.expect(found);
-            }
-        }
-    }
-    try std.testing.expectEqual(alternatives, after.count);
-    try std.testing.expect(after.items[14].length > before.items[14].length);
-    const prior = after.items[alternatives - 1];
-    append(&after, prior.length + 1, prior.distance);
-    try std.testing.expectEqual(alternatives, after.count);
-    try std.testing.expectEqual(prior.length + 1, after.items[alternatives - 1].length);
-    try std.testing.expectEqual(prior.distance, after.items[alternatives - 1].distance);
-}
-
-/// Inserts the current position and records increasing match lengths when requested. Each examined
-/// prior candidate and each eight-byte comparison consumes one unit.
+/// Inserts the next source position, optionally recording increasing match lengths. Positions
+/// advance in source order after reset. Each prior-candidate probe and eight-byte comparison costs
+/// one unit. The partial record is updated on success and refusal; refusal may leave a partially
+/// modified tree, which its caller must abandon or restore before reuse.
 pub fn insertAndFind(
     comptime bounded: bool,
-    workspace: *Workspace,
+    workspace: *PrefixMatchTree,
     data: []const u8,
     position: usize,
     window: usize,
     depth: usize,
     nice: usize,
-    matches: ?*Matches,
+    matches: ?*MatchCandidates,
     budget: u64,
     partial: *Stats,
 ) Error!Stats {
@@ -169,17 +114,19 @@ pub fn insertAndFind(
     );
 }
 
-// Retained coordinates survive slab moves; data begins at origin.
+/// Inserts with retained coordinates that survive slab moves: data[0] has coordinate origin.
+/// Position is relative to data; the same ordered-insertion and partial-failure rules apply as for
+/// insertAndFind. The caller rebuilds the tree before its u32 coordinate range is exhausted.
 pub inline fn insertAndFindAt(
     comptime bounded: bool,
-    workspace: *Workspace,
+    workspace: *PrefixMatchTree,
     data: []const u8,
     position: usize,
     origin: usize,
     window: usize,
     depth: usize,
     nice: usize,
-    matches: ?*Matches,
+    matches: ?*MatchCandidates,
     budget: u64,
     partial: *Stats,
 ) Error!Stats {
@@ -202,14 +149,14 @@ pub inline fn insertAndFindAt(
 inline fn findImpl(
     comptime shifted: bool,
     comptime bounded: bool,
-    workspace: *Workspace,
+    workspace: *PrefixMatchTree,
     data: []const u8,
     position: usize,
     origin: usize,
     window: usize,
     depth: usize,
     nice: usize,
-    matches: ?*Matches,
+    matches: ?*MatchCandidates,
     budget: u64,
     partial: *Stats,
 ) Error!Stats {
@@ -232,7 +179,7 @@ inline fn findImpl(
         stats.probes += 1;
         if (std.mem.eql(u8, data[@as(usize, short) - base ..][0..3], source[0..3])) {
             best = 3;
-            append(matches, best, absolute - short);
+            MatchCandidates.append(matches, best, absolute - short);
         }
     }
     if (maximum < 4) return stats;
@@ -268,7 +215,7 @@ inline fn findImpl(
         while (length < maximum and prior[length] == source[length]) : (length += 1) {}
         if (length > best) {
             best = length;
-            append(matches, length, absolute - current);
+            MatchCandidates.append(matches, length, absolute - current);
         }
         if (length >= @min(nice, maximum)) {
             setChild(
@@ -306,7 +253,7 @@ inline fn findImpl(
 
 test "unbounded tree records valid matches and finds four-byte maxima" {
     const allocator = std.testing.allocator;
-    const workspace = try allocator.create(Workspace);
+    const workspace = try allocator.create(PrefixMatchTree);
     defer allocator.destroy(workspace);
     var data: [512]u8 = undefined;
     for (0..4) |pattern| {
@@ -321,7 +268,7 @@ test "unbounded tree records valid matches and finds four-byte maxima" {
         for ([_]usize{ 32, 256, 32768 }) |window| {
             workspace.reset(&data);
             for (0..data.len) |position| {
-                var matches: Matches = .{ .items = undefined, .count = 0 };
+                var matches: MatchCandidates = .{ .items = undefined, .count = 0 };
                 var partial: Stats = undefined;
                 const stats = try insertAndFind(
                     false,
@@ -368,13 +315,13 @@ test "unbounded tree records valid matches and finds four-byte maxima" {
 
 test "finite tree search refuses each smaller allowance" {
     const allocator = std.testing.allocator;
-    const workspace = try allocator.create(Workspace);
+    const workspace = try allocator.create(PrefixMatchTree);
     defer allocator.destroy(workspace);
     var data: [512]u8 = undefined;
     for (&data, 0..) |*byte, i| byte.* = "abcXabcYabcz"[i % 12];
     const position = 255;
     const Helper = struct {
-        fn prepare(tree: *Workspace, bytes: []const u8, end: usize) !void {
+        fn prepare(tree: *PrefixMatchTree, bytes: []const u8, end: usize) !void {
             tree.reset(bytes);
             for (0..end) |i| {
                 var partial: Stats = undefined;
@@ -383,7 +330,7 @@ test "finite tree search refuses each smaller allowance" {
         }
     };
     try Helper.prepare(workspace, &data, position);
-    var expected: Matches = .{ .items = undefined, .count = 0 };
+    var expected: MatchCandidates = .{ .items = undefined, .count = 0 };
     var partial: Stats = undefined;
     const full = try insertAndFind(
         false,
@@ -400,7 +347,7 @@ test "finite tree search refuses each smaller allowance" {
     try std.testing.expect(full.units > 0);
     for (0..@as(usize, full.units) + 1) |budget| {
         try Helper.prepare(workspace, &data, position);
-        var actual: Matches = .{ .items = undefined, .count = 0 };
+        var actual: MatchCandidates = .{ .items = undefined, .count = 0 };
         const result = insertAndFind(
             true,
             workspace,
@@ -432,7 +379,7 @@ test "finite tree search refuses each smaller allowance" {
 }
 
 test "bounded and early-terminated trees emit valid matches after later insertions" {
-    const workspace = try std.testing.allocator.create(Workspace);
+    const workspace = try std.testing.allocator.create(PrefixMatchTree);
     defer std.testing.allocator.destroy(workspace);
     var data: [1024]u8 = undefined;
     for (0..3) |pattern| {
@@ -448,7 +395,7 @@ test "bounded and early-terminated trees emit valid matches after later insertio
                 for ([_]usize{ 16, 75, 150, 258 }) |nice| {
                     workspace.reset(&data);
                     for (0..data.len) |position| {
-                        var row: Matches = .{ .items = undefined, .count = 0 };
+                        var row: MatchCandidates = .{ .items = undefined, .count = 0 };
                         var partial: Stats = undefined;
                         _ = try insertAndFind(
                             false,
@@ -483,7 +430,7 @@ test "bounded and early-terminated trees emit valid matches after later insertio
 }
 
 test "nice-length splice retains both ordered subtrees" {
-    const workspace = try std.testing.allocator.create(Workspace);
+    const workspace = try std.testing.allocator.create(PrefixMatchTree);
     defer std.testing.allocator.destroy(workspace);
     var data: [512]u8 = @splat('z');
     for ([_]usize{ 0, 128, 256, 384 }, "BCDC") |position, next| {
@@ -497,7 +444,7 @@ test "nice-length splice retains both ordered subtrees" {
     }
     try std.testing.expectEqual(@as(u32, 0), childPosition(128, workspace.children[128][0]));
     try std.testing.expectEqual(@as(u32, 128), childPosition(256, workspace.children[256][0]));
-    var row: Matches = .{ .items = undefined, .count = 0 };
+    var row: MatchCandidates = .{ .items = undefined, .count = 0 };
     var partial: Stats = undefined;
     _ = try insertAndFind(false, workspace, &data, 384, 512, 35, 75, &row, 0, &partial);
     try std.testing.expect(row.count > 0);
@@ -508,7 +455,7 @@ test "nice-length splice retains both ordered subtrees" {
 
 test "circular children retain exactly-window matches across slot reuse" {
     const allocator = std.testing.allocator;
-    const workspace = try allocator.create(Workspace);
+    const workspace = try allocator.create(PrefixMatchTree);
     defer allocator.destroy(workspace);
     const data = try allocator.alloc(u8, 65540);
     defer allocator.free(data);
@@ -520,7 +467,7 @@ test "circular children retain exactly-window matches across slot reuse" {
         const active = data[0 .. window * 2 + 4];
         workspace.reset(active);
         for (0..active.len) |position| {
-            var row: Matches = .{ .items = undefined, .count = 0 };
+            var row: MatchCandidates = .{ .items = undefined, .count = 0 };
             var partial: Stats = undefined;
             _ = try insertAndFind(
                 false,
@@ -547,9 +494,9 @@ test "circular children retain exactly-window matches across slot reuse" {
 
 test "sparse reset ignores poisoned heads and agrees with full clearing" {
     const allocator = std.testing.allocator;
-    const candidate = try allocator.create(Workspace);
+    const candidate = try allocator.create(PrefixMatchTree);
     defer allocator.destroy(candidate);
-    const reference = try allocator.create(Workspace);
+    const reference = try allocator.create(PrefixMatchTree);
     defer allocator.destroy(reference);
     var bytes: [4097]u8 = undefined;
     for (0..2) |pattern| {
@@ -565,8 +512,8 @@ test "sparse reset ignores poisoned heads and agrees with full clearing" {
             @memset(&reference.short_heads, none);
             @memset(&reference.long_heads, none);
             for (0..size) |position| {
-                var a: Matches = .{ .items = undefined, .count = 0 };
-                var b: Matches = .{ .items = undefined, .count = 0 };
+                var a: MatchCandidates = .{ .items = undefined, .count = 0 };
+                var b: MatchCandidates = .{ .items = undefined, .count = 0 };
                 var partial_a: Stats = undefined;
                 var partial_b: Stats = undefined;
                 const stats_a = try insertAndFind(
@@ -603,7 +550,7 @@ test "sparse reset ignores poisoned heads and agrees with full clearing" {
 
 test "word mismatch locates the first different byte with bounded work" {
     const allocator = std.testing.allocator;
-    const workspace = try allocator.create(Workspace);
+    const workspace = try allocator.create(PrefixMatchTree);
     defer allocator.destroy(workspace);
     var data: [558]u8 = undefined;
     const position = 300;
@@ -615,7 +562,7 @@ test "word mismatch locates the first different byte with bounded work" {
         workspace.reset(&data);
         var partial: Stats = undefined;
         _ = try insertAndFind(false, workspace, &data, 0, 512, 35, 258, null, 0, &partial);
-        var row: Matches = undefined;
+        var row: MatchCandidates = undefined;
         const complete = try insertAndFind(
             false,
             workspace,
@@ -678,9 +625,9 @@ test "relative links preserve the window boundary and expire stale children" {
 
 test "derived coordinates preserve rows and work across supported windows" {
     const allocator = std.testing.allocator;
-    const baseline = try allocator.create(Workspace);
+    const baseline = try allocator.create(PrefixMatchTree);
     defer allocator.destroy(baseline);
-    const shifted = try allocator.create(Workspace);
+    const shifted = try allocator.create(PrefixMatchTree);
     defer allocator.destroy(shifted);
     const data = try allocator.alloc(u8, 4096);
     defer allocator.free(data);
@@ -697,8 +644,8 @@ test "derived coordinates preserve rows and work across supported windows" {
             baseline.resetAll();
             shifted.resetAll();
             for (0..data.len) |position| {
-                var x: Matches = .{ .items = undefined, .count = 0 };
-                var y: Matches = .{ .items = undefined, .count = 0 };
+                var x: MatchCandidates = .{ .items = undefined, .count = 0 };
+                var y: MatchCandidates = .{ .items = undefined, .count = 0 };
                 var px: Stats = undefined;
                 var py: Stats = undefined;
                 const sx = try insertAndFind(

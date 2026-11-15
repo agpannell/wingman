@@ -1,14 +1,15 @@
-//! Canonical DEFLATE tables, payload leaves and bounded continuation storage.
+//! Canonical DEFLATE Huffman construction and checked lookups. Root tables resolve short codes;
+//! bounded binary continuations cover the remaining widths. Expanded and paired representations
+//! reuse the same explicit extern storage while caching useful token information.
 
 const std = @import("std");
-
-const bit_io = @import("bits.zig");
-const fixture_data = @import("../common/deflate_test_data.zig");
+const BitReader = @import("BitReader.zig");
+const TestWorkspace = @import("DecodeWorkspace.zig"); // Used only by inline backing tests.
+const fixture_data = @import("decode_fixtures.zig");
 const protocol = @import("format.zig");
 
-const Bits = bit_io.Bits;
-const Error = protocol.Error;
-const IndexShift = std.math.Log2Int(usize);
+/// Invalid code lengths, incomplete codewords or reserved symbols.
+pub const Error = error{InvalidStream};
 
 const distance_base = protocol.distance_base;
 const distance_extra = protocol.distance_extra;
@@ -36,7 +37,7 @@ pub const Entry = packed struct(u32) {
 };
 
 /// Resolved leaf and its original low bits, retained until extra payload extraction completes.
-pub const PayloadLeaf = struct { entry: Entry, saved_value: u64 };
+const PayloadLeaf = struct { entry: Entry, saved_value: u64 };
 
 /// Whether canonical symbols remain ordinals or become literal/length and distance bases.
 pub const TableKind = enum { symbols, literal_length, distance };
@@ -71,7 +72,7 @@ fn ExpandedLiteral(comptime root_bits: u5) type {
 
         /// Reads one checked leaf through at most one flat continuation. Every consumed bit must
         /// exist, even when zero-filled lookahead selects a replicated leaf near EOF.
-        pub fn decode(self: *const Self, bits: *Bits, comptime mode: DecodeMode) Error!Entry {
+        pub fn decode(self: *const Self, bits: *BitReader, comptime mode: DecodeMode) Error!Entry {
             _ = mode;
             bits.refill(root_bits);
             var entry = self.root[@as(usize, @truncate(bits.value)) & (self.root.len - 1)];
@@ -125,6 +126,52 @@ pub fn leaf(comptime kind: TableKind, symbol: usize, bits: u5) Entry {
     };
 }
 
+/// Admitted code-length histogram and its coverage of the canonical prefix space.
+const CodeCounts = struct {
+    /// Symbols of each width from zero (absent) through fifteen bits.
+    counts: [16]u16,
+    /// True when the codes cover the complete prefix space without holes.
+    complete: bool,
+};
+
+/// Counts and validates lengths for a caller-bounded alphabet. Empty and single one-bit books are
+/// explicit format exceptions; other incomplete or oversubscribed books reject. The caller proves
+/// lengths.len <= symbols before construction. Both canonical and packed representations use this
+/// admission.
+pub fn countCodeLengths(
+    comptime symbols: usize,
+    lengths: []const u8,
+    allow_empty: bool,
+    allow_single: bool,
+) Error!CodeCounts {
+    std.debug.assert(lengths.len <= symbols);
+    var counts: [16]u16 = @splat(0);
+    var used: usize = 0;
+    for (lengths) |length| {
+        if (length > 15) return error.InvalidStream;
+        // Sparse alphabets contain long runs of absent symbols. Count their complement in a
+        // register instead of serializing increments through the same histogram slot.
+        if (length == 0) continue;
+        used += 1;
+        counts[length] += 1;
+    }
+    counts[0] = @intCast(lengths.len - used);
+    var space: i32 = 1;
+    for (1..16) |length| {
+        space = space * 2 - counts[length];
+        if (space < 0) return error.InvalidStream;
+    }
+    if (space != 0) {
+        const incomplete_allowed = blk: {
+            if (allow_empty and used == 0) break :blk true;
+            break :blk allow_single and used == 1 and counts[1] == 1;
+        };
+        if (!incomplete_allowed) return error.InvalidStream;
+    }
+
+    return .{ .counts = counts, .complete = space == 0 };
+}
+
 /// Bounded canonical table type for a selected root width, alphabet size and leaf interpretation.
 /// Root lookups collapse early code bits; each remaining binary node stores both children.
 pub fn Huffman(comptime root_bits: u5, comptime symbols: usize, comptime kind: TableKind) type {
@@ -146,37 +193,6 @@ pub fn Huffman(comptime root_bits: u5, comptime symbols: usize, comptime kind: T
             self.nodes += 1;
             self.children[index] = .{ .{}, .{} };
             return @intCast(index);
-        }
-
-        const CodeCounts = struct { counts: [16]u16, complete: bool };
-
-        fn countCodes(lengths: []const u8, allow_empty: bool, allow_single: bool) Error!CodeCounts {
-            std.debug.assert(lengths.len <= symbols);
-            var counts: [16]u16 = @splat(0);
-            var used: usize = 0;
-            for (lengths) |length| {
-                if (length > 15) return error.InvalidStream;
-                // Sparse alphabets contain long runs of absent symbols. Count their complement in a
-                // register instead of serializing increments through the same histogram slot.
-                if (length == 0) continue;
-                used += 1;
-                counts[length] += 1;
-            }
-            counts[0] = @intCast(lengths.len - used);
-            var space: i32 = 1;
-            for (1..16) |length| {
-                space = space * 2 - counts[length];
-                if (space < 0) return error.InvalidStream;
-            }
-            if (space != 0) {
-                const incomplete_allowed = blk: {
-                    if (allow_empty and used == 0) break :blk true;
-                    break :blk allow_single and used == 1 and counts[1] == 1;
-                };
-                if (!incomplete_allowed) return error.InvalidStream;
-            }
-
-            return .{ .counts = counts, .complete = space == 0 };
         }
 
         fn canonicalStarts(counts: *const [16]u16) [16]u16 {
@@ -230,7 +246,7 @@ pub fn Huffman(comptime root_bits: u5, comptime symbols: usize, comptime kind: T
             allow_single: bool,
         ) Error!bool {
             if (lengths.len > symbols) return error.InvalidStream;
-            const admitted = try countCodes(lengths, allow_empty, allow_single);
+            const admitted = try countCodeLengths(symbols, lengths, allow_empty, allow_single);
             if (kind == .literal_length and root_bits == 11) {
                 // Sorted symbols temporarily occupy continuation backing. Complete short-code
                 // levels grow by copying the preceding level, including any invalid singleton half.
@@ -296,7 +312,7 @@ pub fn Huffman(comptime root_bits: u5, comptime symbols: usize, comptime kind: T
         /// codes; it is reused only after primary construction ends.
         pub fn buildPaired(self: *Self, lengths: []const u8) Error!void {
             if (kind != .literal_length) @compileError("paired construction needs literals");
-            const admitted = try countCodes(lengths, false, false);
+            const admitted = try countCodeLengths(symbols, lengths, false, false);
             const counts = &admitted.counts;
             var offsets: [16]u16 = @splat(0);
             for (1..15) |length| offsets[length + 1] = offsets[length] + counts[length];
@@ -368,7 +384,11 @@ pub fn Huffman(comptime root_bits: u5, comptime symbols: usize, comptime kind: T
         /// returned copy stores total/code widths for deferred extraction from saved_value.
         // Keep the packed result: separate scalar widths change LLVM scheduling without reducing
         // complete-token or complete-buffer decoding costs.
-        pub fn decodePayloadBuffered(self: *const Self, bits: *Bits, first: Entry) PayloadLeaf {
+        pub fn decodePayloadBuffered(
+            self: *const Self,
+            bits: *BitReader,
+            first: Entry,
+        ) PayloadLeaf {
             if (kind == .symbols) @compileError("payload lookup needs base-valued entries");
             var entry = first;
             while (entry.node) {
@@ -389,7 +409,7 @@ pub fn Huffman(comptime root_bits: u5, comptime symbols: usize, comptime kind: T
         /// literal.
         pub fn decode(
             self: *const Self,
-            bits: *Bits,
+            bits: *BitReader,
             comptime mode: DecodeMode,
         ) Error!(if (kind == .symbols) u16 else Entry) {
             const buffered = mode == .buffered_paired or mode == .buffered_distance;
@@ -423,246 +443,13 @@ pub fn Huffman(comptime root_bits: u5, comptime symbols: usize, comptime kind: T
     };
 }
 
-/// Packed canonical tables and bounded construction scratch for complete books. The decoder admits
-/// this representation only for whole-buffer, full-window calls. Primary and secondary entries
-/// cache bases and consumed/code widths.
-pub const CommonTables = extern struct {
-    const Self = @This();
-
-    /// Direct literal leaf; bits 16..23 contain its byte value.
-    pub const literal_flag: u32 = 0x80000000;
-    /// Entry carries a continuation or end-of-block marker rather than a match base.
-    pub const exceptional: u32 = 0x8000;
-    /// Continuation entry; its high halfword indexes a flat secondary table.
-    pub const subtable: u32 = 0x4000;
-    /// End-of-block marker, combined with exceptional.
-    pub const end_flag: u32 = 0x2000;
-
-    const Built = struct { bits: u8, used: u16 };
-
-    literal: [2342]u32,
-    distance: [402]u32,
-    sorted: [288]u16,
-    offsets: [16]u16,
-    literal_used: u16,
-    distance_used: u16,
-    literal_bits: u8,
-
-    /// Resolved packed leaf with the original low bits available for payload extraction.
-    pub const Decoded = struct {
-        entry: u32,
-        saved: u64,
-
-        /// Adds the extra payload to a resolved length/distance base. Literal, continuation and
-        /// end-of-block entries must be handled before calling.
-        pub fn matchValue(self: Decoded) usize {
-            std.debug.assert(self.entry & (literal_flag | exceptional) == 0);
-            const total: u8 = @truncate(self.entry);
-            const code: u8 = @truncate(self.entry >> 8);
-            const mask = (@as(u64, 1) << @as(u6, @intCast(total))) - 1;
-            const payload: usize = @intCast((self.saved & mask) >> @as(u6, @intCast(code)));
-            const base: usize = self.entry >> 16;
-            return base + payload;
-        }
-    };
-
-    /// Reads one checked leaf, retaining its original bits for extra payload. Zero-filled lookahead
-    /// may select a replicated leaf near EOF; every consumed code and payload bit must be present
-    /// in the supplied input.
-    pub fn read(self: *const Self, comptime distances: bool, bits: *Bits) Error!Decoded {
-        const table: []const u32 = if (distances) &self.distance else &self.literal;
-        const root_bits: u8 = if (distances) 8 else self.literal_bits;
-        bits.refill(root_bits);
-        const root_mask = (@as(usize, 1) << @as(IndexShift, @intCast(root_bits))) - 1;
-        var value = table[@as(usize, @truncate(bits.value)) & root_mask];
-        if (value & subtable != 0) {
-            if (bits.count < root_bits) return error.InvalidStream;
-            bits.drop(root_bits);
-            const suffix: u8 = @intCast((value >> 8) & 63);
-            bits.refill(suffix);
-            const mask = (@as(usize, 1) << @as(IndexShift, @intCast(suffix))) - 1;
-            value = table[(value >> 16) + (@as(usize, @truncate(bits.value)) & mask)];
-        }
-        const consumed: u8 = @truncate(value);
-        bits.refill(consumed);
-        if (bits.count < consumed) return error.InvalidStream;
-        const saved = bits.value;
-        bits.drop(consumed);
-        return .{ .entry = value, .saved = saved };
-    }
-
-    /// Builds both tables without allocation. False declines a valid book that needs another
-    /// representation; invalid code lengths return InvalidStream. A refusal may change scratch, so
-    /// read only after successful construction.
-    pub fn build(self: *Self, lengths: []const u8, distances: []const u8) Error!bool {
-        if (lengths.len < 257 or lengths.len > 286 or distances.len == 0 or distances.len > 32)
-            return error.InvalidStream;
-        if (lengths[256] == 0) return error.InvalidStream;
-        const literal_counts = try LiteralTable.countCodes(lengths, false, true);
-        const distance_counts = try DistanceTable.countCodes(distances, true, true);
-        if (!literal_counts.complete or !distance_counts.complete) return false;
-        if (distances.len > 30 and distances[30] != 0) return false;
-        if (distances.len > 31 and distances[31] != 0) return false;
-
-        const built_distance = self.buildFlat(
-            &self.distance,
-            distances,
-            distance_counts.counts,
-            .distance,
-            8,
-            false,
-        ) orelse return false;
-        const built_literal = self.buildFlat(
-            &self.literal,
-            lengths,
-            literal_counts.counts,
-            .literal_length,
-            11,
-            true,
-        ) orelse return false;
-        self.literal_bits = built_literal.bits;
-        self.literal_used = built_literal.used;
-        self.distance_used = built_distance.used;
-        return true;
-    }
-
-    fn entry(comptime kind: TableKind, symbol: usize, width: u8) u32 {
-        if (kind == .distance) {
-            std.debug.assert(symbol < 30);
-            const base = @as(u32, distance_base[symbol]) << 16;
-            const code = @as(u32, width) << 8;
-            const total = @as(u32, width) + distance_extra[symbol];
-            return base | code | total;
-        }
-        if (symbol < 256) return literal_flag | (@as(u32, @intCast(symbol)) << 16) | width;
-        if (symbol == 256) return exceptional | end_flag | width;
-        std.debug.assert(symbol < 286);
-        const index = symbol - 257;
-        const base = @as(u32, length_base[index]) << 16;
-        const code = @as(u32, width) << 8;
-        const total = @as(u32, width) + length_extra[index];
-        return base | code | total;
-    }
-
-    // The caller has already excluded the all-ones final codeword.
-    fn advance(word: usize, width: u8) usize {
-        const mask = (@as(usize, 1) << @as(IndexShift, @intCast(width))) - 1;
-        const flipped = word ^ mask;
-        std.debug.assert(flipped != 0);
-        const shift: IndexShift = @intCast(@bitSizeOf(usize) - 1 - @clz(flipped));
-        const bit = @as(usize, 1) << shift;
-        return (word & (bit - 1)) | bit;
-    }
-
-    fn buildFlat(
-        self: *Self,
-        table: []u32,
-        lengths: []const u8,
-        counts: [16]u16,
-        comptime kind: TableKind,
-        comptime root_max: u8,
-        comptime shrink: bool,
-    ) ?Built {
-        var maximum: u8 = 15;
-        while (maximum > 1 and counts[maximum] == 0) maximum -= 1;
-        const root_bits = if (shrink) @min(root_max, maximum) else root_max;
-        const root_size = @as(usize, 1) << @as(IndexShift, @intCast(root_bits));
-        if (root_size > table.len) return null;
-        // Skip the zero bucket when at least three quarters of the alphabet has no code. Denser
-        // books keep a branchless scan; both spans preserve canonical order among active symbols.
-        const sparse = lengths.len - counts[0] <= lengths.len / 4;
-        self.offsets[0] = 0;
-        self.offsets[1] = if (sparse) 0 else counts[0];
-        for (2..16) |i| self.offsets[i] = self.offsets[i - 1] + counts[i - 1];
-        if (sparse) {
-            for (lengths, 0..) |width, symbol| {
-                if (width == 0) continue;
-                self.sorted[self.offsets[width]] = @intCast(symbol);
-                self.offsets[width] += 1;
-            }
-        } else {
-            for (lengths, 0..) |width, symbol| {
-                self.sorted[self.offsets[width]] = @intCast(symbol);
-                self.offsets[width] += 1;
-            }
-        }
-        var sorted: usize = self.offsets[0];
-        var width: u8 = 1;
-        while (counts[width] == 0) width += 1;
-        var remaining: usize = counts[width];
-        var word: usize = 0;
-        var table_end = @as(usize, 1) << @as(IndexShift, @intCast(width));
-        while (width <= root_bits) {
-            while (remaining != 0) : (remaining -= 1) {
-                table[word] = entry(kind, self.sorted[sorted], width);
-                sorted += 1;
-                if (word == table_end - 1) {
-                    while (width < root_bits) : (width += 1) {
-                        @memcpy(table[table_end..][0..table_end], table[0..table_end]);
-                        table_end *= 2;
-                    }
-                    return .{ .bits = root_bits, .used = @intCast(table_end) };
-                }
-                word = advance(word, width);
-            }
-            while (true) {
-                width += 1;
-                if (width <= root_bits) {
-                    // As-yet-unfilled words may be transported by this byte copy. Complete Kraft
-                    // coverage fills every reachable word before use.
-                    @memcpy(table[table_end..][0..table_end], table[0..table_end]);
-                    table_end *= 2;
-                }
-                remaining = counts[width];
-                if (remaining != 0) break;
-            }
-        }
-        table_end = root_size;
-        var prefix: usize = std.math.maxInt(usize);
-        var start: usize = 0;
-        while (true) {
-            const next_prefix = word & (root_size - 1);
-            if (next_prefix != prefix) {
-                prefix = next_prefix;
-                start = table_end;
-                var suffix_bits = width - root_bits;
-                var space = remaining;
-                while (space < (@as(usize, 1) << @as(IndexShift, @intCast(suffix_bits)))) {
-                    suffix_bits += 1;
-                    space = space * 2 + counts[root_bits + suffix_bits];
-                }
-                const slots = @as(usize, 1) << @as(IndexShift, @intCast(suffix_bits));
-                if (slots > table.len - start) return null;
-                table_end = start + slots;
-                const child_index = @as(u32, @intCast(start)) << 16;
-                const child_width = @as(u32, suffix_bits) << 8;
-                table[prefix] = child_index | exceptional | subtable | child_width | root_bits;
-            }
-            const suffix = width - root_bits;
-            const value = entry(kind, self.sorted[sorted], suffix);
-            sorted += 1;
-            var index = start + (word >> @as(IndexShift, @intCast(root_bits)));
-            const stride = @as(usize, 1) << @as(IndexShift, @intCast(suffix));
-            while (index < table_end) : (index += stride) table[index] = value;
-            const last_word = (@as(usize, 1) << @as(IndexShift, @intCast(width))) - 1;
-            if (word == last_word) return .{ .bits = root_bits, .used = @intCast(table_end) };
-            word = advance(word, width);
-            remaining -= 1;
-            while (remaining == 0) {
-                width += 1;
-                remaining = counts[width];
-            }
-        }
-    }
-};
-
 /// Appends each length payload to its canonical code, mapping to exact lengths. A valid book can
 /// exceed secondary capacity: returns false without allocating, then the caller reconstructs its
 /// ordinary representation in the same union. Read table only after successful construction.
 pub fn buildExpandedLiteral(table: anytype, lengths: []const u8) Error!bool {
     const root_bits: u5 = if (@TypeOf(table.*) == ExpandedLiteralTable) 9 else 11;
     if (lengths.len > 286) return error.InvalidStream;
-    const admitted = try LiteralTable.countCodes(lengths, false, false);
+    const admitted = try countCodeLengths(288, lengths, false, false);
     var next = LiteralTable.canonicalStarts(&admitted.counts);
     @memset(&table.root, .{});
     table.nodes = 0;
@@ -812,7 +599,7 @@ pub fn transformPayloadTable(
 }
 
 /// Prepares or restores leaves in one span. Continuations and zero-width unused entries stay exact.
-pub fn transformPayloadSpan(
+fn transformPayloadSpan(
     comptime format: PayloadFormat,
     comptime prepare: bool,
     entries: []Entry,
@@ -829,7 +616,7 @@ pub fn transformPayloadSpan(
 }
 
 /// Converts packed entry lanes without changing continuation nodes or unused backing.
-pub fn payloadWords(
+fn payloadWords(
     comptime format: PayloadFormat,
     comptime prepare: bool,
     comptime lanes: usize,
@@ -882,7 +669,7 @@ pub fn payloadWords(
 
 /// Consumes one prepared leaf while retaining its original bits for payload extraction. The caller
 /// proves whole-token availability. Continuations keep ordinary widths and precede the leaf.
-pub fn decodeCombinedPayloadBuffered(table: anytype, bits: *Bits, first: Entry) PayloadLeaf {
+pub fn decodeCombinedPayloadBuffered(table: anytype, bits: *BitReader, first: Entry) PayloadLeaf {
     var entry = first;
     const Table = @TypeOf(table.*);
     const expanded = Table == ExpandedLiteralTable or Table == ExpandedWideLiteralTable;
@@ -935,7 +722,11 @@ test "complete root lookups preserve every short code and real input boundary" {
             for (0..8) |available| {
                 // No refill bytes exist. High lookahead may select a leaf, but cannot authorize
                 // consuming bits beyond the real buffered prefix.
-                var bits = Bits{ .source = &.{}, .value = prefix, .count = @intCast(available) };
+                var bits = BitReader{
+                    .source = &.{},
+                    .value = prefix,
+                    .count = @intCast(available),
+                };
                 const result = table.decode(&bits, .root);
                 if (available < width) {
                     try std.testing.expectError(error.InvalidStream, result);
@@ -1074,7 +865,7 @@ test "canonical continuation trees reach all fifteen code bits" {
         const wire = if (symbol == 15) 0x7fff else (@as(u16, 1) << (length - 1)) - 1;
         var source: [2]u8 = undefined;
         std.mem.writeInt(u16, &source, wire, .little);
-        var bits = Bits{ .source = &source };
+        var bits = BitReader{ .source = &source };
         const entry = try tables.decode(&bits, .complete);
         try std.testing.expectEqual(symbol, entry.value);
         try std.testing.expectEqual(16 - @as(u8, length), bits.count);
@@ -1090,7 +881,7 @@ test "maximum-leaf canonical tree fits its bounded continuation storage" {
     defer allocator.destroy(table);
     try std.testing.expect(try table.build(&@as([16]u8, @splat(4)), false, false));
     try std.testing.expectEqual(14, table.nodes);
-    var bits = Bits{ .source = &.{ 0x80, 0xc4, 0xa2, 0xe6, 0x91, 0xd5, 0xb3, 0xf7 } };
+    var bits = BitReader{ .source = &.{ 0x80, 0xc4, 0xa2, 0xe6, 0x91, 0xd5, 0xb3, 0xf7 } };
     for (0..16) |symbol| try std.testing.expectEqual(symbol, try table.decode(&bits, .complete));
     try std.testing.expectEqual(8, bits.consumed());
 }
@@ -1108,7 +899,7 @@ test "canonical tables reject oversubscription and invalid incomplete trees" {
     try std.testing.expectError(error.InvalidStream, tables.literal.build(&.{16}, false, true));
     _ = try tables.literal.build(&.{1}, false, true);
     _ = try tables.distance.build(&.{0}, true, true);
-    var bits = Bits{ .source = &.{0} };
+    var bits = BitReader{ .source = &.{0} };
     const invalid = try tables.distance.decode(&bits, .distance);
     try std.testing.expectEqual(0, invalid.value);
     try std.testing.expectEqual(8, bits.count);
@@ -1148,7 +939,7 @@ test "canonical fifteen-bit literal and distance chains retain every prefix and 
                 if (ordinal < 14) break :blk extras[ordinal];
                 break :blk if (ordinal == 14) 13 else 0;
             };
-            var bits = Bits{ .source = &.{}, .value = prefix, .count = 15 };
+            var bits = BitReader{ .source = &.{}, .value = prefix, .count = 15 };
             const entry = try table.decode(
                 &bits,
                 if (kind == .literal_length) .complete else .distance,
@@ -1169,7 +960,7 @@ test "canonical fifteen-bit literal and distance chains retain every prefix and 
                 break :blk if (ordinal == 14) 13 else 0;
             };
             const wire = @as(u64, prefix) | (@as(u64, 0x1234) << 15) | (@as(u64, 0xa5) << 28);
-            var bits = Bits{ .source = &.{}, .value = wire, .count = 63 };
+            var bits = BitReader{ .source = &.{}, .value = wire, .count = 63 };
             const decoded = decodeCombinedPayloadBuffered(
                 table,
                 &bits,
@@ -1201,320 +992,172 @@ test "canonical fifteen-bit literal and distance chains retain every prefix and 
     }
 }
 
-fn checkCommonTable(
-    table: []const u32,
-    root_bits: u8,
-    lengths: []const u8,
-    comptime distances: bool,
-) !void {
-    var counts: [16]u32 = @splat(0);
-    for (lengths) |width| counts[width] += 1;
-    var code: u32 = 0;
-    for (1..16) |width| {
-        code = (code + if (width == 1) 0 else counts[width - 1]) * 2;
-        for (lengths, 0..) |actual_width, symbol| {
-            if (actual_width != width) continue;
-            const reversed = @bitReverse(@as(u16, @intCast(code))) >> @as(u4, @intCast(16 - width));
-            code += 1;
-            const extra: u8 = blk: {
-                if (distances) break :blk if (symbol < 4) 0 else @intCast(symbol / 2 - 1);
-                if (symbol < 265 or symbol == 285) break :blk 0;
-                break :blk @intCast((symbol - 265) / 4 + 1);
-            };
-            const base: u32 = blk: {
-                if (distances) {
-                    if (symbol < 4) break :blk @intCast(symbol + 1);
-                    const group = @as(u32, 1) << @as(u5, @intCast(extra + 1));
-                    const side = @as(u32, @intCast(symbol & 1)) << @as(u5, @intCast(extra));
-                    break :blk group + 1 + side;
-                }
-                if (symbol < 257) break :blk @intCast(symbol);
-                if (symbol < 265) break :blk @intCast(symbol - 254);
-                if (symbol == 285) break :blk 258;
-                const group = @as(u32, 1) << @as(u5, @intCast(extra + 2));
-                const offset = @as(u32, @intCast((symbol - 265) % 4)) << @as(u5, @intCast(extra));
-                break :blk group + 3 + offset;
-            };
-            for (0..@as(usize, 1) << @as(IndexShift, @intCast(extra))) |payload| {
-                const payload_bits = @as(u64, @intCast(payload)) << @as(u6, @intCast(width));
-                const following = @as(u64, 0xd7a9) << @as(u6, @intCast(width + extra));
-                const lookahead: u64 = reversed | payload_bits | following;
-                const root_mask = (@as(usize, 1) << @as(IndexShift, @intCast(root_bits))) - 1;
-                var value = table[@as(usize, @truncate(lookahead)) & root_mask];
-                var consumed: u8 = 0;
-                if (value & 0x4000 != 0) {
-                    try std.testing.expect(value & 0x8000 != 0);
-                    consumed = @truncate(value);
-                    try std.testing.expectEqual(root_bits, consumed);
-                    const suffix_bits: u8 = @intCast((value >> 8) & 63);
-                    const suffix_mask = (@as(
-                        usize,
-                        1,
-                    ) << @as(IndexShift, @intCast(suffix_bits))) - 1;
-                    const suffix: usize = @truncate(lookahead >> @as(u6, @intCast(root_bits)));
-                    const index = (value >> 16) + (suffix & suffix_mask);
-                    try std.testing.expect(index < table.len);
-                    value = table[index];
-                }
-                consumed += @as(u8, @truncate(value));
-                try std.testing.expectEqual(@as(u8, @intCast(width)) + extra, consumed);
-                if (!distances and symbol < 256) {
-                    try std.testing.expectEqual(
-                        @as(u32, 0x80000000),
-                        value & 0xffff0000 & 0x80000000,
-                    );
-                    try std.testing.expectEqual(base, (value >> 16) & 255);
-                } else if (!distances and symbol == 256) {
-                    try std.testing.expectEqual(@as(u32, 0xa000), value & 0xe000);
-                } else {
-                    try std.testing.expectEqual(@as(u32, 0), value & 0xe000);
-                    try std.testing.expectEqual(base, value >> 16);
-                    const code_bits: u8 = @intCast((value >> 8) & 255);
-                    try std.testing.expectEqual(
-                        @as(u8, @intCast(width)),
-                        code_bits + consumed - @as(u8, @truncate(value)),
-                    );
-                    const mask = (@as(u64, 1) << @as(u6, @intCast(extra))) - 1;
-                    const extracted = (lookahead >> @as(u6, @intCast(width))) & mask;
-                    try std.testing.expectEqual(
-                        base + @as(u32, @intCast(payload)),
-                        (value >> 16) + @as(u32, @intCast(extracted)),
-                    );
-                }
-            }
-        }
-        // The next length starts after all codes of this width, not after a second count addition:
-        // code already includes the symbols above.
-        if (width < 15) code -= counts[width];
+test "eight-bit distance roots preserve replicated payload bits and reserved leaves" {
+    const workspace = try TestWorkspace.create(std.testing.allocator);
+    defer workspace.destroy(std.testing.allocator);
+    const table = &workspace.distance;
+    const lengths: [32]u8 = @splat(5);
+    try std.testing.expect(try table.build(&lengths, false, false));
+    // RFC 1951 bases; canonical equal-length codes are reversed five-bit symbols.
+    const bases = [_]u16{
+        1,   2,   3,   4,   5,    7,    9,    13,   17,   25,   33,   49,    65,    97,    129, 193,
+        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0,   0,
+    };
+    try std.testing.expectEqual(256, table.root.len);
+    for (table.root, 0..) |entry, index| {
+        const symbol = @bitReverse(@as(u5, @truncate(index)));
+        try std.testing.expectEqual(@as(u8, 5), entry.bits);
+        try std.testing.expect(!entry.node);
+        try std.testing.expectEqual(bases[symbol], entry.value);
     }
-}
-
-fn completeCommonLengths(lengths: []u8, seed: u32) void {
-    @memset(lengths, 0);
-    lengths[0] = 1;
-    lengths[1] = 1;
-    var state = seed;
-    var used: usize = 2;
-    while (used < lengths.len) : (used += 1) {
-        var choice: usize = 0;
-        if (seed == 0) {
-            for (lengths[0..used], 0..) |width, index| {
-                if (width < lengths[choice]) choice = index;
-            }
-        } else if (used < 16) {
-            choice = used - 1;
-        } else {
-            state = state *% 1664525 +% 1013904223;
-            choice = state % used;
-            while (lengths[choice] == 15) choice = (choice + 1) % used;
-        }
-        const child = lengths[choice] + 1;
-        lengths[choice] = child;
-        lengths[used] = child;
-    }
-}
-
-fn commonPackedAt(table: []const u32, root_bits: u8, lookahead: u64) !u64 {
-    const mask = (@as(usize, 1) << @as(IndexShift, @intCast(root_bits))) - 1;
-    var value = table[@as(usize, @truncate(lookahead)) & mask];
-    var consumed: u8 = 0;
-    if (value & 0x4000 != 0) {
-        consumed = @truncate(value);
-        try std.testing.expectEqual(root_bits, consumed);
-        const suffix: u8 = @intCast((value >> 8) & 63);
-        const suffix_mask = (@as(usize, 1) << @as(IndexShift, @intCast(suffix))) - 1;
-        const following: usize = @truncate(lookahead >> @as(u6, @intCast(root_bits)));
-        const index = (value >> 16) + (following & suffix_mask);
-        try std.testing.expect(index < table.len);
-        value = table[index];
-    }
-    return (@as(u64, consumed) << 32) | value;
-}
-
-fn checkCommonCoverage(
-    expected: []u64,
-    table: []const u32,
-    root_bits: u8,
-    lengths: []const u8,
-    comptime distances: bool,
-) !void {
-    @memset(expected, std.math.maxInt(u64));
-    var counts: [16]u32 = @splat(0);
-    for (lengths) |width| counts[width] += 1;
-    var start: u32 = 0;
-    var previous: u32 = 0;
-    for (1..16) |width| {
-        start = (start + previous) * 2;
-        var code = start;
-        for (lengths, 0..) |actual, symbol| {
-            if (actual != width) continue;
-            const reversed = @bitReverse(@as(u16, @intCast(code))) >> @as(u4, @intCast(16 - width));
-            code += 1;
-            const extra: u8 = blk: {
-                if (distances) break :blk if (symbol < 4) 0 else @intCast(symbol / 2 - 1);
-                if (symbol < 265 or symbol == 285) break :blk 0;
-                break :blk @intCast((symbol - 265) / 4 + 1);
-            };
-            const anchor = try commonPackedAt(
+    transformPayloadTable(.widths, true, table);
+    for (0..32) |symbol| {
+        const payload_width: u4 = if (symbol < 4 or symbol >= 30) 0 else @intCast(symbol / 2 - 1);
+        const mask = (@as(u16, 1) << payload_width) - 1;
+        for ([_]u16{ 0, mask }) |payload| {
+            const code = @bitReverse(@as(u5, @intCast(symbol)));
+            const used: u6 = 5 + @as(u6, payload_width);
+            const wire = @as(u64, code) | (@as(u64, payload) << 5) | (@as(u64, 0xa5) << used);
+            var bits: BitReader = .{ .source = &.{}, .value = wire, .count = 56 };
+            const decoded = decodeCombinedPayloadBuffered(
                 table,
-                root_bits,
-                reversed | (@as(u64, 0xd7a9) << @as(u6, @intCast(width + extra))),
+                &bits,
+                table.root[@as(usize, @truncate(wire)) & 255],
             );
-            const stride = @as(usize, 1) << @as(IndexShift, @intCast(width));
-            var index: usize = reversed;
-            while (index < expected.len) : (index += stride) {
-                try std.testing.expectEqual(std.math.maxInt(u64), expected[index]);
-                expected[index] = anchor;
-            }
+            try std.testing.expectEqual(bases[symbol], decoded.entry.value);
+            try std.testing.expectEqual(payload, payloadValue(decoded));
+            try std.testing.expectEqual(@as(u64, 0xa5), bits.value);
+            try std.testing.expectEqual(56 - @as(u8, used), bits.count);
         }
-        previous = counts[width];
     }
-    for (expected, 0..) |value, lookahead| {
-        try std.testing.expect(value != std.math.maxInt(u64));
-        try std.testing.expectEqual(
-            value,
-            try commonPackedAt(table, root_bits, lookahead | (@as(u64, 0xc3) << 15)),
-        );
+    transformPayloadTable(.widths, false, table);
+    for (table.root, 0..) |entry, index| {
+        const symbol = @bitReverse(@as(u5, @truncate(index)));
+        try std.testing.expectEqual(@as(u8, 5), entry.bits);
+        try std.testing.expectEqual(bases[symbol], entry.value);
     }
 }
 
-test "common packed tables preserve canonical symbols payloads and storage bounds" {
+test "payload conversion covers active continuations and preserves spare backing" {
     const allocator = std.testing.allocator;
-    const tables = try allocator.create(CommonTables);
-    defer allocator.destroy(tables);
-    var lengths: [286]u8 = undefined;
-    var distances: [32]u8 = @splat(0);
-    for (0..17) |seed| {
-        completeCommonLengths(&lengths, @intCast(seed));
-        completeCommonLengths(distances[0..30], @intCast(seed));
-        try std.testing.expect(try tables.build(&lengths, &distances));
-        try std.testing.expect(tables.literal_used <= tables.literal.len);
-        try std.testing.expect(tables.distance_used <= tables.distance.len);
-        try checkCommonTable(
-            tables.literal[0..tables.literal_used],
-            tables.literal_bits,
-            &lengths,
-            false,
-        );
-        try checkCommonTable(tables.distance[0..tables.distance_used], 8, &distances, true);
+    const workspace = try TestWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    const table = &workspace.literal.ordinary;
+    @memset(&table.root, Entry{ .bits = 1, .value = 65 });
+    table.nodes = 3;
+    const original_pair = [2]Entry{
+        .{ .bits = 1, .extra = 1, .value = 267 },
+        .{ .bits = 1, .value = 256 },
+    };
+    for (table.children[0..4]) |*pair| pair.* = original_pair;
+    transformPayloadTable(.tagged, true, table);
+    for (table.children[0..3]) |pair| {
+        try std.testing.expectEqual(Entry{ .bits = 2, .extra = 1, .value = 11 }, pair[0]);
+        try std.testing.expectEqual(Entry{ .bits = 1, .extra = 1, .unused = 1 }, pair[1]);
     }
-    // Complete books on either side of the sparse-sort boundary retain independent canonical
-    // expectations while reusing scratch from the preceding dense books.
-    for ([_]usize{ 71, 72 }) |active| {
-        @memset(&lengths, 0);
-        completeCommonLengths(lengths[0..active], 0);
-        lengths[256] = lengths[active - 1];
-        lengths[active - 1] = 0;
-        try std.testing.expect(try tables.build(&lengths, &distances));
-        try checkCommonTable(
-            tables.literal[0..tables.literal_used],
-            tables.literal_bits,
-            &lengths,
-            false,
-        );
-        try checkCommonTable(tables.distance[0..tables.distance_used], 8, &distances, true);
+    try std.testing.expectEqual(Entry{ .bits = 1, .extra = 1, .value = 267 }, table.children[3][0]);
+    try std.testing.expectEqual(Entry{ .bits = 1, .value = 256 }, table.children[3][1]);
+    transformPayloadTable(.tagged, false, table);
+    for (table.children[0..4]) |pair| {
+        try std.testing.expectEqual(Entry{ .bits = 1, .extra = 1, .value = 267 }, pair[0]);
+        try std.testing.expectEqual(Entry{ .bits = 1, .value = 256 }, pair[1]);
     }
-    @memset(&lengths, 0);
-    lengths[0] = 1;
-    lengths[256] = 2;
-    lengths[257] = 2;
-    distances = @splat(0);
-    distances[0] = 1;
-    distances[1] = 1;
-    try std.testing.expect(try tables.build(&lengths, &distances));
-    try std.testing.expectEqual(@as(u8, 2), tables.literal_bits);
-    try checkCommonTable(
-        tables.literal[0..tables.literal_used],
-        tables.literal_bits,
-        &lengths,
-        false,
+}
+
+test "expanded large complete book stays within caller table backing" {
+    // A deterministic independent canonical-tree search found this complete book requiring 3396
+    // secondary slots. This exercises substantial occupancy, without claiming the search proves the
+    // maximum or reaches capacity decline.
+    const widths = [_]u8{
+        15, 15, 15, 15, 0,  15, 8,  10, 15, 3,  15, 10, 12, 15, 0,  15, 15, 15, 15, 4,  15, 15, 15,
+        15, 15, 15, 9,  12, 15, 15, 15, 10, 7,  15, 15, 15, 10, 8,  15, 15, 15, 15, 15, 15, 15, 15,
+        15, 9,  15, 15, 0,  15, 8,  15, 8,  0,  15, 15, 13, 15, 7,  10, 0,  10, 0,  15, 15, 15, 15,
+        0,  15, 15, 6,  15, 15, 15, 10, 15, 15, 15, 15, 0,  15, 15, 5,  8,  15, 15, 15, 15, 6,  15,
+        15, 8,  15, 15, 15, 15, 15, 15, 15, 15, 15, 6,  15, 15, 8,  7,  15, 4,  0,  15, 9,  15, 15,
+        15, 7,  12, 15, 0,  7,  15, 9,  15, 9,  14, 0,  15, 15, 15, 15, 7,  15, 15, 15, 15, 15, 15,
+        15, 11, 15, 15, 11, 8,  15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 9,  7,  15,
+        15, 15, 15, 10, 15, 10, 15, 0,  15, 15, 7,  11, 15, 15, 8,  15, 15, 15, 10, 0,  10, 15, 15,
+        15, 15, 15, 15, 10, 15, 15, 15, 11, 0,  7,  0,  6,  15, 8,  15, 15, 15, 15, 8,  15, 15, 15,
+        15, 15, 10, 0,  15, 15, 15, 7,  0,  15, 0,  4,  15, 15, 9,  15, 6,  15, 15, 15, 15, 15, 15,
+        15, 15, 10, 0,  10, 15, 15, 11, 15, 15, 6,  15, 10, 8,  11, 15, 15, 15, 9,  15, 9,  0,  10,
+        15, 9,  8,  8,  15, 15, 15, 15, 3,  15, 9,  15, 15, 15, 15, 15, 15, 3,  15, 15, 15, 15, 15,
+        15, 15, 8,  12, 15, 9,  14, 15, 10, 3,
+    };
+    const allocator = std.testing.allocator;
+    const workspace = try TestWorkspace.create(allocator);
+    defer workspace.destroy(allocator);
+    try std.testing.expect(try buildExpandedLiteral(&workspace.literal.expanded, &widths));
+    try std.testing.expectEqual(@as(usize, 3396), workspace.literal.expanded.nodes);
+    // Reconstruct the ordinary representation in the same union after expansion. This checks the
+    // representation transition without a second memory owner.
+    try std.testing.expect(try workspace.literal.ordinary.build(&widths, false, false));
+    var invalid = widths;
+    invalid[256] = 16;
+    try std.testing.expectError(
+        error.InvalidStream,
+        buildExpandedLiteral(&workspace.literal.expanded, &invalid),
     );
-    try checkCommonTable(tables.distance[0..tables.distance_used], 8, &distances, true);
 }
 
-test "common packed admission preserves strict incomplete and reserved fallbacks" {
+fn expectExpandedLiteralLengths(comptime Table: type) !void {
     const allocator = std.testing.allocator;
-    const tables = try allocator.create(CommonTables);
-    defer allocator.destroy(tables);
-    @memset(std.mem.asBytes(tables), 0x5a);
-    const untouched = std.hash.Wyhash.hash(0, std.mem.asBytes(tables));
+    const table = try allocator.create(Table);
+    defer allocator.destroy(table);
+    const ordinary = try allocator.create(LiteralTable);
+    defer allocator.destroy(ordinary);
     var lengths: [286]u8 = @splat(0);
-    lengths[0] = 1;
-    lengths[256] = 2;
-    lengths[257] = 2;
-    try std.testing.expect(!try tables.build(&lengths, &.{ 0, 0 }));
-    try std.testing.expect(!try tables.build(&lengths, &.{ 1, 0 }));
-    var reserved: [32]u8 = @splat(5);
-    try std.testing.expect(!try tables.build(&lengths, &reserved));
-    reserved[0] = 16;
-    try std.testing.expectError(error.InvalidStream, tables.build(&lengths, &reserved));
-    try std.testing.expectError(error.InvalidStream, tables.build(&lengths, &.{ 1, 1, 1 }));
-    try std.testing.expectError(error.InvalidStream, tables.build(&lengths, &.{ 2, 2 }));
+    for (0..14) |symbol| lengths[symbol] = @intCast(symbol + 1);
+    lengths[256] = 15;
+    lengths[284] = 15;
+    _ = try ordinary.build(&lengths, false, false);
+    try std.testing.expect(try buildExpandedLiteral(table, &lengths));
+    try std.testing.expectEqual(
+        @as(usize, if (@sizeOf(usize) == 8) 20952 else 20940),
+        @sizeOf(TestWorkspace),
+    );
+    for (0..32768) |prefix| {
+        for ([_]u5{ 0, 15, 31 }) |payload| {
+            const ordinal: usize = @ctz(~@as(u16, @intCast(prefix)));
+            const width: u8 = @intCast(@min(ordinal + 1, 15));
+            const used = width + @as(u8, if (ordinal == 15) 5 else 0);
+            const wire = @as(u64, prefix) | (@as(u64, payload) << 15) | (@as(u64, 0xa5) << 20);
+            var expanded_bits = BitReader{ .source = &.{}, .value = wire, .count = 56 };
+            var ordinary_bits = expanded_bits;
+            const expanded = try table.decode(&expanded_bits, .complete);
+            const original = try ordinary.decode(&ordinary_bits, .complete);
+            const value = original.value + try ordinary_bits.take(original.extra);
+            const expected: u16 = blk: {
+                if (ordinal < 14) break :blk @intCast(ordinal);
+                if (ordinal == 14) break :blk 256;
+                break :blk 483 + @as(u16, payload);
+            };
+            try std.testing.expectEqual(expected, value);
+            // Expected original symbols/biased lengths above come from the independent canonical
+            // wire; tags distinguish cached exact lengths.
+            try std.testing.expectEqual(@as(u2, @intFromBool(ordinal < 14)), expanded.literals);
+            try std.testing.expectEqual(@as(u1, @intFromBool(ordinal == 14)), expanded.unused);
+            const expected_base: u16 = blk: {
+                if (ordinal < 14) break :blk expected;
+                break :blk if (ordinal == 14) 0 else expected - 256;
+            };
+            try std.testing.expectEqual(expected_base, expanded.value);
+            try std.testing.expectEqual(0, expanded.extra);
+            try std.testing.expectEqual(56 - used, expanded_bits.count);
+            try std.testing.expectEqual(expanded_bits.count, ordinary_bits.count);
+            try std.testing.expectEqual(expanded_bits.value, ordinary_bits.value);
+        }
+    }
     @memset(&lengths, 0);
     lengths[256] = 1;
-    try std.testing.expect(!try tables.build(&lengths, &.{ 1, 1 }));
-    lengths[256] = 0;
-    try std.testing.expectError(error.InvalidStream, tables.build(&lengths, &.{ 1, 1 }));
-    try std.testing.expectEqual(untouched, std.hash.Wyhash.hash(0, std.mem.asBytes(tables)));
+    try std.testing.expectError(error.InvalidStream, buildExpandedLiteral(table, &lengths));
+    lengths[65] = 16;
+    try std.testing.expectError(error.InvalidStream, buildExpandedLiteral(table, &lengths));
 }
 
-test "common packed secondary capacity refusal stays inside supplied backing" {
-    const allocator = std.testing.allocator;
-    const tables = try allocator.create(CommonTables);
-    defer allocator.destroy(tables);
-    var lengths: [286]u8 = undefined;
-    completeCommonLengths(&lengths, 1);
-    const counts = try LiteralTable.countCodes(&lengths, false, false);
-    const backing = try allocator.alloc(u32, 2048 + 16);
-    defer allocator.free(backing);
-    @memset(backing, 0xfaceb00c);
-    try std.testing.expect(
-        tables.buildFlat(
-            backing[8..][0..2048],
-            &lengths,
-            counts.counts,
-            .literal_length,
-            11,
-            true,
-        ) == null,
-    );
-    for (backing[0..8]) |word| try std.testing.expectEqual(@as(u32, 0xfaceb00c), word);
-    for (backing[2056..]) |word| try std.testing.expectEqual(@as(u32, 0xfaceb00c), word);
-    // Reusing the same constructor scratch after a refusal reconstructs a full book.
-    try std.testing.expect(try tables.build(&lengths, &.{ 1, 1 }));
-    try checkCommonTable(
-        tables.literal[0..tables.literal_used],
-        tables.literal_bits,
-        &lengths,
-        false,
-    );
+test "expanded length codebooks preserve tagged exact lengths and twenty-bit retirement" {
+    try expectExpandedLiteralLengths(ExpandedLiteralTable);
 }
 
-test "common packed exhaustive lookahead covers every replicated leaf" {
-    const allocator = std.testing.allocator;
-    const tables = try allocator.create(CommonTables);
-    defer allocator.destroy(tables);
-    const expected = try allocator.alloc(u64, 32768);
-    defer allocator.free(expected);
-    var lengths: [286]u8 = undefined;
-    var distances: [30]u8 = undefined;
-    for (0..17) |seed| {
-        completeCommonLengths(&lengths, @intCast(seed));
-        completeCommonLengths(&distances, @intCast(seed));
-        try std.testing.expect(try tables.build(&lengths, &distances));
-        try checkCommonCoverage(
-            expected,
-            tables.literal[0..tables.literal_used],
-            tables.literal_bits,
-            &lengths,
-            false,
-        );
-        try checkCommonCoverage(
-            expected,
-            tables.distance[0..tables.distance_used],
-            8,
-            &distances,
-            true,
-        );
-    }
+test "wide expanded tables preserve tagged exact lengths and twenty-bit retirement" {
+    try expectExpandedLiteralLengths(ExpandedWideLiteralTable);
 }
