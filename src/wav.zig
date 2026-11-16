@@ -20,7 +20,7 @@ const spans = @import("common/byte_ranges.zig");
 const builtin = @import("builtin");
 const riff = @import("riff.zig");
 const lpcm = @import("lpcm.zig");
-const memory = @import("wav/storage.zig");
+const allocation = @import("common/allocation.zig");
 const container = @import("wav/container.zig");
 const format = @import("wav/format.zig");
 const parallel = @import("wav/parallel.zig");
@@ -296,7 +296,9 @@ fn decodeOwned(
         var chunks = try view.iterator(index);
         break :blk try inspectDataChunks(&chunks, null);
     };
-    const owner = try memory.allocateSamples(allocator, requirements.samples);
+    const owner = try allocation.AlignedAllocation(
+        f32,
+    ).initStorage(allocator, requirements.samples);
     errdefer allocator.free(owner.storage);
     // Retire inspection scratch before samples exist, then reacquire conversion scratch above them.
     // This order lets a tail-reclaiming allocator free both the index and all sample padding.

@@ -137,6 +137,50 @@ pub fn AlignedAllocation(comptime Sample: type) type {
     };
 }
 
+test "sample storage restores misaligned bounded backing after success or replacement refusal" {
+    var backing: [256]u8 align(8) = undefined;
+    for (0..8) |residue| {
+        for ([_]usize{ 0, 1, 2 }) |fail_index| {
+            for ([_]bool{ false, true }) |refuse_resize| {
+                @memset(&backing, 0xa5);
+                var fixed = std.heap.FixedBufferAllocator.init(backing[residue..]);
+                @memset(try fixed.allocator().alloc(u8, 37), 0x3c);
+                var failing = std.testing.FailingAllocator.init(
+                    fixed.allocator(),
+                    .{
+                        .fail_index = fail_index,
+                        .resize_fail_index = if (refuse_resize) 0 else std.math.maxInt(usize),
+                    },
+                );
+                if (AlignedAllocation(f32).initStorage(failing.allocator(), 7)) |owner| {
+                    try std.testing.expectEqual(7, owner.samples.len);
+                    try std.testing.expectEqual(0, @intFromPtr(owner.samples.ptr) % @alignOf(f32));
+                    @memset(owner.samples, 1);
+                    failing.allocator().free(owner.storage);
+                } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expectEqual(37, fixed.end_index);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                try std.testing.expect(std.mem.allEqual(u8, fixed.buffer[0..37], 0x3c));
+                try std.testing.expect(std.mem.allEqual(u8, backing[0..residue], 0xa5));
+            }
+        }
+    }
+}
+
+test "empty and overflowing sample requests publish no allocation" {
+    const empty = try AlignedAllocation(f32).initStorage(std.testing.failing_allocator, 0);
+    try std.testing.expectEqual(0, empty.samples.len);
+    try std.testing.expectEqual(0, empty.storage.len);
+    try std.testing.expectError(
+        error.SizeOverflow,
+        AlignedAllocation(f32).initStorage(std.testing.failing_allocator, std.math.maxInt(usize)),
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        AlignedAllocation(f32).initStorage(std.testing.failing_allocator, 1),
+    );
+}
+
 /// Constructs undefined storage for an address-stable value, retaining no allocator. A private
 /// header owns the complete byte reservation, including alignment padding. Initializing or
 /// resetting the entire value cannot overwrite that ownership record. Initialize the returned value
