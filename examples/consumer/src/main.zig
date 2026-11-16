@@ -855,8 +855,12 @@ test "PCM packed precision and finite float words from outside the module" {
         result,
     );
     try std.testing.expectEqualSlices(f32, &.{ 123, 123 }, destination[4..]);
-    try std.testing.expectEqual(3, lpcm.Encoding.signed24.byteCount());
-    try std.testing.expectError(error.InvalidData, lpcm.sampleCount(5, .{ .encoding = .signed24 }));
+    try std.testing.expectEqual(3, lpcm.Format.Encoding.signed24.byteCount());
+    const format: lpcm.Format = .{ .encoding = .signed24 };
+    const bit_count: lpcm.Format.Error!u16 = format.validBitCount();
+    const count: lpcm.Format.CountError!usize = format.sampleCount(5);
+    try std.testing.expectEqual(24, try bit_count);
+    try std.testing.expectError(error.InvalidData, count);
     const float_bytes = [_]u8{ 0, 0, 0, 128, 0, 0, 0, 64 };
     const floats = try lpcm.decodeInto(&float_bytes, &destination, .{ .encoding = .float32 });
     try std.testing.expectEqual(0x80000000, @as(u32, @bitCast(floats[0])));
@@ -885,14 +889,14 @@ test "PCM16 caller storage and Writer validate before output" {
     try std.testing.expectEqualSlices(u8, &before, &bytes);
 }
 
-test "PCM unsigned wide exact samples and binary64 round trip" {
+test "PCM unsigned24 conversion preserves exact sample values" {
     const pcm_format: lpcm.Format = .{ .encoding = .unsigned24, .valid_bits = 20, .endian = .big };
     const source = [_]u8{ 0, 0, 15, 0x80, 0, 15, 0xff, 0xff, 0xff };
     var values: [3]i32 = undefined;
     const result = try lpcm.int32.decodeInto(&source, &values, pcm_format);
     try std.testing.expectEqualSlices(i32, &.{ std.math.minInt(i32), 0, 0x7ffff000 }, result);
     var canonical: [9]u8 = undefined;
-    const bytes = try lpcm.int32.encodeInto(result, &canonical, .{ .format = pcm_format });
+    const bytes = try lpcm.int32.encodeInto(result, &canonical, pcm_format);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0x80, 0, 0, 0xff, 0xff, 0xf0 }, bytes);
     var wide: [3]f64 = undefined;
     _ = try lpcm.float64.decodeInto(bytes, &wide, pcm_format);

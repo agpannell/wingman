@@ -6,25 +6,21 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const lpcm = @import("../lpcm.zig");
-const rounding = @import("round.zig");
+const float32_narrowing = @import("float32_narrowing.zig");
 const sample_rounding = @import("../common/round.zig");
 const float = @import("../common/float.zig");
 const memory = @import("../common/byte_ranges.zig");
 const testing = std.testing;
-const Format = lpcm.Format;
+const Format = @import("Format.zig");
 
 /// Invalid representation or extent, insufficient or overlapping output, or invalid float input.
-pub const DecodeError = lpcm.DecodeError;
+pub const DecodeError = Format.CountError || error{ DestinationTooSmall, Aliasing, InvalidSamples };
 
 /// Invalid representation, unrepresentable extent, or invalid or unrepresentable samples.
-pub const ValidateError = lpcm.ValidateError;
+pub const ValidateError = Format.Error || error{ InvalidSamples, SizeOverflow };
 
 /// Encoding also rejects insufficient or aliased output.
-pub const EncodeError = lpcm.EncodeError;
-
-/// The wire representation used for encoding.
-pub const EncodeOptions = struct { format: Format };
+pub const EncodeError = ValidateError || error{ DestinationTooSmall, Aliasing };
 
 /// Decodes into a borrowed f64 prefix. Integer and finite float32 inputs are exact. Float64 wire
 /// values retain their bits, including signed zero. Format, extent, capacity and used-output
@@ -32,7 +28,7 @@ pub const EncodeOptions = struct { format: Format };
 /// preceding samples may have been written.
 pub fn decodeInto(source: []const u8, destination: []f64, format: Format) DecodeError![]f64 {
     // Reject shape and used-prefix overlap first; finite-value checks can stop after a prefix.
-    const bits = try precision(format);
+    const bits = try format.validBitCount();
     const width = format.encoding.byteCount();
     if (source.len % width != 0) return error.InvalidData;
     const count = source.len / width;
@@ -205,14 +201,14 @@ test "signed32 widening covers unaligned input, vector batches and tails" {
 /// Checks the representation, encoded extent and every sample without writing. Integer samples must
 /// be finite and in [-1, 1]. Float samples must be finite; binary32 output also rejects a sample
 /// whose nearest-even f32 result is nonfinite. Tiny values may round to signed zero.
-pub fn validate(source: []const f64, options: EncodeOptions) ValidateError!void {
-    _ = try precision(options.format);
-    const width = options.format.encoding.byteCount();
+pub fn validate(source: []const f64, format: Format) ValidateError!void {
+    _ = try format.validBitCount();
+    const width = format.encoding.byteCount();
     if (source.len > std.math.maxInt(usize) / width) return error.SizeOverflow;
-    if (options.format.encoding == .float64) return validateFinite(source);
-    if (options.format.encoding == .float32) {
+    if (format.encoding == .float64) return validateFinite(source);
+    if (format.encoding == .float32) {
         for (source) |sample| {
-            if (!rounding.isFiniteResult(@bitCast(sample))) return error.InvalidSamples;
+            if (!float32_narrowing.isFiniteResult(@bitCast(sample))) return error.InvalidSamples;
         }
         return;
     }
@@ -222,11 +218,8 @@ pub fn validate(source: []const f64, options: EncodeOptions) ValidateError!void 
 }
 
 test validate {
-    try validate(&.{ -1, 0, 1 }, .{ .format = .{ .encoding = .signed32 } });
-    try testing.expectError(
-        error.InvalidSamples,
-        validate(&.{2}, .{ .format = .{ .encoding = .signed32 } }),
-    );
+    try validate(&.{ -1, 0, 1 }, .{ .encoding = .signed32 });
+    try testing.expectError(error.InvalidSamples, validate(&.{2}, .{ .encoding = .signed32 }));
 }
 
 fn validateFinite(source: []const f64) error{InvalidSamples}!void {
@@ -248,7 +241,7 @@ fn validateFinite(source: []const f64) error{InvalidSamples}!void {
 test "binary64 vector validation rejects every invalid position before output" {
     const lanes = std.simd.suggestVectorLength(u64) orelse 1;
     const count = lanes * 2 + 3;
-    const options: EncodeOptions = .{ .format = .{ .encoding = .float64 } };
+    const format: Format = .{ .encoding = .float64 };
     const invalid = [_]u64{
         0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000, 0x7ff8_0000_0000_0001, 0x7ff0_0000_0000_0001,
     };
@@ -258,16 +251,16 @@ test "binary64 vector validation rejects every invalid position before output" {
         for (0..count) |index| {
             samples[index] = @bitCast(bits);
             @memset(&bytes, 0xa5);
-            try testing.expectError(error.InvalidSamples, validate(&samples, options));
-            try testing.expectError(error.InvalidSamples, encodeInto(&samples, &bytes, options));
+            try testing.expectError(error.InvalidSamples, validate(&samples, format));
+            try testing.expectError(error.InvalidSamples, encodeInto(&samples, &bytes, format));
             try testing.expectError(
                 error.InvalidSamples,
-                encodeInto(&samples, bytes[0..0], options),
+                encodeInto(&samples, bytes[0..0], format),
             );
             try testing.expect(std.mem.allEqual(u8, &bytes, 0xa5));
             var writer: std.Io.Writer = .fixed(&bytes);
             try writer.writeByte(0x42);
-            try testing.expectError(error.InvalidSamples, writeAll(&samples, &writer, options));
+            try testing.expectError(error.InvalidSamples, writeAll(&samples, &writer, format));
             try testing.expectEqualSlices(u8, &.{0x42}, writer.buffered());
             try testing.expect(std.mem.allEqual(u8, bytes[1..], 0xa5));
             samples[index] = 0.5;
@@ -278,20 +271,20 @@ test "binary64 vector validation rejects every invalid position before output" {
 /// Encodes a borrowed byte prefix after validating the whole source. Format, size, sample validity,
 /// capacity and used-prefix overlap are checked in that order. Admission failure leaves the whole
 /// destination unchanged. Binary32 output uses nearest-even rounding, including signed underflow.
-pub fn encodeInto(source: []const f64, destination: []u8, options: EncodeOptions) EncodeError![]u8 {
+pub fn encodeInto(source: []const f64, destination: []u8, format: Format) EncodeError![]u8 {
     // Check every input before writing, including values that would narrow to infinity.
-    try validate(source, options);
-    const bytes = source.len * options.format.encoding.byteCount();
+    try validate(source, format);
+    const bytes = source.len * format.encoding.byteCount();
     if (destination.len < bytes) return error.DestinationTooSmall;
     const output = destination[0..bytes];
     if (memory.overlaps(std.mem.sliceAsBytes(source), output)) return error.Aliasing;
-    encodeSamples(source, output, options.format);
+    encodeSamples(source, output, format);
     return output;
 }
 
 test encodeInto {
     var bytes: [8]u8 = undefined;
-    const output = try encodeInto(&.{-0.0}, &bytes, .{ .format = .{ .encoding = .float64 } });
+    const output = try encodeInto(&.{-0.0}, &bytes, .{ .encoding = .float64 });
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x80 }, output);
 }
 
@@ -300,22 +293,22 @@ test encodeInto {
 pub fn writeAll(
     source: []const f64,
     writer: *std.Io.Writer,
-    options: EncodeOptions,
+    format: Format,
 ) (ValidateError || std.Io.Writer.Error)!void {
-    try validate(source, options);
-    const width = options.format.encoding.byteCount();
+    try validate(source, format);
+    const width = format.encoding.byteCount();
     var index: usize = 0;
     while (index < source.len) {
         const available = writer.unusedCapacitySlice();
         const count = @min(available.len / width, source.len - index);
         if (count == 0) {
             var bytes: [8]u8 = undefined;
-            encodeSamples(source[index..][0..1], bytes[0..width], options.format);
+            encodeSamples(source[index..][0..1], bytes[0..width], format);
             try writer.writeAll(bytes[0..width]);
             index += 1;
             continue;
         }
-        encodeSamples(source[index..][0..count], available[0 .. count * width], options.format);
+        encodeSamples(source[index..][0..count], available[0 .. count * width], format);
         writer.advance(count * width);
         index += count;
     }
@@ -324,19 +317,8 @@ pub fn writeAll(
 test writeAll {
     var bytes: [4]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&bytes);
-    try writeAll(&.{0.5}, &writer, .{ .format = .{ .encoding = .float32, .endian = .big } });
+    try writeAll(&.{0.5}, &writer, .{ .encoding = .float32, .endian = .big });
     try testing.expectEqualSlices(u8, &.{ 0x3f, 0, 0, 0 }, writer.buffered());
-}
-
-fn precision(format: Format) error{InvalidFormat}!u16 {
-    const width: u16 = @intCast(format.encoding.byteCount() * 8);
-    const bits: u16 = format.valid_bits orelse @intCast(width);
-    if (bits == 0 or bits > width) return error.InvalidFormat;
-    switch (format.encoding) {
-        .float32, .float64 => if (bits != width) return error.InvalidFormat,
-        else => {},
-    }
-    return bits;
 }
 
 fn encodeSamples(source: []const f64, output: []u8, format: Format) void {
@@ -362,7 +344,7 @@ fn encodeSamples(source: []const f64, output: []u8, format: Format) void {
         return;
     }
     const width = format.encoding.byteCount();
-    const bits = precision(format) catch unreachable;
+    const bits = format.validBitCount() catch unreachable;
     if (format.encoding == .signed32 and bits == 32) {
         switch (format.endian) {
             .little => encodeSigned32(source, output, .little),
@@ -479,7 +461,7 @@ test "finite binary64 bits round trip and nonfinite input leaves its slot" {
         try testing.expectEqual(@as(f64, 42), output[3]);
 
         var encoded: [24]u8 = undefined;
-        _ = try encodeInto(output[0..3], &encoded, .{ .format = format });
+        _ = try encodeInto(output[0..3], &encoded, format);
         try testing.expectEqualSlices(u8, bytes[0..24], &encoded);
     }
 }
@@ -492,23 +474,19 @@ test "binary64 writing handles unaligned storage, overlap and Writer prefixes" {
         @bitCast(@as(u64, 0x7fef_ffff_ffff_ffff)),
     };
     for ([_]std.lang.Endian{ .little, .big }) |endian| {
-        const options: EncodeOptions = .{ .format = .{ .encoding = .float64, .endian = endian } };
+        const format: Format = .{ .encoding = .float64, .endian = endian };
         var expected: [source.len * 8]u8 = undefined;
         for (source, 0..) |sample, index| {
             std.mem.writeInt(u64, expected[index * 8 ..][0..8], @bitCast(sample), endian);
         }
         var storage: [expected.len + 1]u8 = @splat(0xa5);
-        try testing.expectEqualSlices(
-            u8,
-            &expected,
-            try encodeInto(&source, storage[1..], options),
-        );
+        try testing.expectEqualSlices(u8, &expected, try encodeInto(&source, storage[1..], format));
         try testing.expectEqual(@as(u8, 0xa5), storage[0]);
         var overlap = source;
         const before = overlap;
         try testing.expectError(
             error.Aliasing,
-            encodeInto(&overlap, std.mem.sliceAsBytes(&overlap), options),
+            encodeInto(&overlap, std.mem.sliceAsBytes(&overlap), format),
         );
         try testing.expectEqualSlices(
             u8,
@@ -519,9 +497,9 @@ test "binary64 writing handles unaligned storage, overlap and Writer prefixes" {
             @memset(&storage, 0xa5);
             var writer: std.Io.Writer = .fixed(storage[1..][0..capacity]);
             if (capacity == expected.len) {
-                try writeAll(&source, &writer, options);
+                try writeAll(&source, &writer, format);
             } else {
-                try testing.expectError(error.WriteFailed, writeAll(&source, &writer, options));
+                try testing.expectError(error.WriteFailed, writeAll(&source, &writer, format));
             }
             try testing.expectEqualSlices(u8, expected[0..capacity], writer.buffered());
             try testing.expectEqual(@as(u8, 0xa5), storage[0]);
@@ -536,10 +514,10 @@ test "binary64 writing covers vector lengths and odd tails" {
         sample.* = @bitCast(@as(u64, 0x8000_0000_0000_0000) | @as(u64, @intCast(index)));
     }
     for ([_]std.lang.Endian{ .little, .big }) |endian| {
-        const options: EncodeOptions = .{ .format = .{ .encoding = .float64, .endian = endian } };
+        const format: Format = .{ .encoding = .float64, .endian = endian };
         for (0..source.len + 1) |count| {
             var storage: [source.len * 8 + 2]u8 = @splat(0xa5);
-            const result = try encodeInto(source[0..count], storage[1..], options);
+            const result = try encodeInto(source[0..count], storage[1..], format);
             try testing.expectEqual(count * 8, result.len);
             for (source[0..count], 0..) |sample, index| {
                 try testing.expectEqual(
@@ -563,11 +541,7 @@ test "signed 8-bit samples round trip through f64" {
         try decodeInto(&source, &samples, format),
     );
     var encoded: [source.len]u8 = undefined;
-    try testing.expectEqualSlices(
-        u8,
-        &source,
-        try encodeInto(&samples, &encoded, .{ .format = format }),
-    );
+    try testing.expectEqualSlices(u8, &source, try encodeInto(&samples, &encoded, format));
 }
 
 test "binary32 narrowing validates the complete source before output" {
@@ -575,18 +549,18 @@ test "binary32 narrowing validates the complete source before output" {
     const below: f64 = @bitCast(@as(u64, 0x47ef_ffff_efff_ffff));
     const midpoint: f64 = @bitCast(@as(u64, 0x47ef_ffff_f000_0000));
     const tiny_negative: f64 = -0x1p-150;
-    const options: EncodeOptions = .{ .format = .{ .encoding = .float32 } };
+    const format: Format = .{ .encoding = .float32 };
     var storage: [8]u8 = @splat(0xa5);
-    const bytes = try encodeInto(&.{ below, tiny_negative }, &storage, options);
+    const bytes = try encodeInto(&.{ below, tiny_negative }, &storage, format);
     try testing.expectEqual(@as(u32, 0x7f7f_ffff), std.mem.readInt(u32, bytes[0..4], .little));
     try testing.expectEqual(@as(u32, 0x8000_0000), std.mem.readInt(u32, bytes[4..8], .little));
     const before = storage;
-    try testing.expectError(error.InvalidSamples, encodeInto(&.{ 0, midpoint }, &storage, options));
+    try testing.expectError(error.InvalidSamples, encodeInto(&.{ 0, midpoint }, &storage, format));
     try testing.expectEqualSlices(u8, &before, &storage);
     var writer: std.Io.Writer = .fixed(&storage);
     try writer.writeByte(0x42);
     const written = storage;
-    try testing.expectError(error.InvalidSamples, writeAll(&.{ 0, midpoint }, &writer, options));
+    try testing.expectError(error.InvalidSamples, writeAll(&.{ 0, midpoint }, &writer, format));
     try testing.expectEqual(@as(usize, 1), writer.buffered().len);
     try testing.expectEqualSlices(u8, &written, &storage);
 }
@@ -600,10 +574,10 @@ test "signed32 f64 encoding preserves endpoints and half-away rounding" {
     const values = [_]f64{ -1, 1, -above, -half, -below, -0.0, 0.0, below, half, above };
     const expected = [_]i32{ std.math.minInt(i32), std.math.maxInt(i32), -1, -1, 0, 0, 0, 0, 1, 1 };
     for ([_]std.lang.Endian{ .little, .big }) |endian| {
-        const options: EncodeOptions = .{ .format = .{ .encoding = .signed32, .endian = endian } };
+        const format: Format = .{ .encoding = .signed32, .endian = endian };
         for (0..values.len + 1) |count| {
             var bytes: [values.len * 4 + 2]u8 = @splat(0xa5);
-            const encoded = try encodeInto(values[0..count], bytes[1..], options);
+            const encoded = try encodeInto(values[0..count], bytes[1..], format);
             for (expected[0..count], 0..) |word, index| {
                 try testing.expectEqual(
                     word,

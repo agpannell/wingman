@@ -6,28 +6,24 @@
 //! storage.
 
 const std = @import("std");
-const lpcm = @import("../lpcm.zig");
 const memory = @import("../common/byte_ranges.zig");
 const testing = std.testing;
-const Format = lpcm.Format;
+const Format = @import("Format.zig");
 
 /// Invalid representation or extent, insufficient output, or overlapping used storage.
-pub const DecodeError = error{ InvalidFormat, InvalidData, DestinationTooSmall, Aliasing };
+pub const DecodeError = Format.CountError || error{ DestinationTooSmall, Aliasing };
 
 /// Invalid representation, unrepresentable encoded extent, or nonzero discarded sample bits.
-pub const ValidateError = error{ InvalidFormat, SizeOverflow, PrecisionLoss };
+pub const ValidateError = Format.Error || error{ SizeOverflow, PrecisionLoss };
 
 /// Encoding also rejects insufficient or aliased caller output.
 pub const EncodeError = ValidateError || error{ DestinationTooSmall, Aliasing };
-
-/// The integer wire representation used for exact encoding.
-pub const EncodeOptions = struct { format: Format };
 
 /// Decodes complete integer containers into a borrowed i32 prefix. Low padding bits are ignored.
 /// Format, extent, capacity and used-prefix overlap failures occur before any output is written.
 pub fn decodeInto(source: []const u8, destination: []i32, format: Format) DecodeError![]i32 {
     // All geometry and overlap checks precede writes; integer conversion has no later value error.
-    const bits = try integerPrecision(format);
+    const bits = try integerPrecisionBits(format);
     const width = format.encoding.byteCount();
     if (source.len % width != 0) return error.InvalidData;
     const count = source.len / width;
@@ -121,10 +117,10 @@ fn decodeWords(
 
 /// Checks format, output extent and every sample before writing. A sample is refused if the
 /// selected precision would discard any nonzero low bit. No input or allocator is retained.
-pub fn validate(source: []const i32, options: EncodeOptions) ValidateError!void {
+pub fn validate(source: []const i32, format: Format) ValidateError!void {
     // Exact conversion refuses any discarded meaningful bit rather than silently quantizing it.
-    const bits = try integerPrecision(options.format);
-    const width = options.format.encoding.byteCount();
+    const bits = try integerPrecisionBits(format);
+    const width = format.encoding.byteCount();
     if (source.len > std.math.maxInt(usize) / width) return error.SizeOverflow;
     const shift: u5 = @intCast(32 - bits);
     const discarded = ~(@as(u32, std.math.maxInt(u32)) << shift);
@@ -135,20 +131,20 @@ pub fn validate(source: []const i32, options: EncodeOptions) ValidateError!void 
 }
 
 test validate {
-    const options: EncodeOptions = .{ .format = .{ .encoding = .signed24 } };
-    try validate(&.{ std.math.minInt(i32), 0, 0x7fff_ff00 }, options);
-    try testing.expectError(error.PrecisionLoss, validate(&.{1}, options));
+    const format: Format = .{ .encoding = .signed24 };
+    try validate(&.{ std.math.minInt(i32), 0, 0x7fff_ff00 }, format);
+    try testing.expectError(error.PrecisionLoss, validate(&.{1}, format));
 }
 
 test "unsigned precision refusal precedes output and writer mutation" {
     // The pre-existing byte and untouched suffix show refusal before publishing more bytes.
-    for ([_]lpcm.Encoding{ .unsigned16, .unsigned24, .unsigned32 }) |encoding| {
-        const options: EncodeOptions = .{ .format = .{ .encoding = encoding, .valid_bits = 7 } };
+    for ([_]Format.Encoding{ .unsigned16, .unsigned24, .unsigned32 }) |encoding| {
+        const format: Format = .{ .encoding = encoding, .valid_bits = 7 };
         var bytes: [4]u8 = @splat(0xa5);
-        try testing.expectError(error.PrecisionLoss, encodeInto(&.{1}, &.{}, options));
+        try testing.expectError(error.PrecisionLoss, encodeInto(&.{1}, &.{}, format));
         var writer: std.Io.Writer = .fixed(&bytes);
         try writer.writeByte(0x42);
-        try testing.expectError(error.PrecisionLoss, writeAll(&.{1}, &writer, options));
+        try testing.expectError(error.PrecisionLoss, writeAll(&.{1}, &writer, format));
         try testing.expectEqualSlices(u8, &.{0x42}, writer.buffered());
         try testing.expect(std.mem.allEqual(u8, bytes[1..], 0xa5));
     }
@@ -156,13 +152,13 @@ test "unsigned precision refusal precedes output and writer mutation" {
 
 /// Encodes a borrowed byte prefix. Format, size, precision, capacity and used-prefix overlap are
 /// checked in that order; any admission failure preserves the whole destination.
-pub fn encodeInto(source: []const i32, destination: []u8, options: EncodeOptions) EncodeError![]u8 {
-    try validate(source, options);
-    const bytes = source.len * options.format.encoding.byteCount();
+pub fn encodeInto(source: []const i32, destination: []u8, format: Format) EncodeError![]u8 {
+    try validate(source, format);
+    const bytes = source.len * format.encoding.byteCount();
     if (destination.len < bytes) return error.DestinationTooSmall;
     const output = destination[0..bytes];
     if (memory.overlaps(std.mem.sliceAsBytes(source), output)) return error.Aliasing;
-    encodeSamples(source, output, options.format);
+    encodeSamples(source, output, format);
     return output;
 }
 
@@ -171,7 +167,7 @@ test encodeInto {
     const bytes = try encodeInto(
         &.{ std.math.minInt(i32), 0x7fff_ff00 },
         &storage,
-        .{ .format = .{ .encoding = .signed24, .endian = .big } },
+        .{ .encoding = .signed24, .endian = .big },
     );
     try testing.expectEqualSlices(u8, &.{ 0x80, 0, 0, 0x7f, 0xff, 0xff }, bytes);
 }
@@ -181,22 +177,22 @@ test encodeInto {
 pub fn writeAll(
     source: []const i32,
     writer: *std.Io.Writer,
-    options: EncodeOptions,
+    format: Format,
 ) (ValidateError || std.Io.Writer.Error)!void {
-    try validate(source, options);
-    const width = options.format.encoding.byteCount();
+    try validate(source, format);
+    const width = format.encoding.byteCount();
     var index: usize = 0;
     while (index < source.len) {
         const available = writer.unusedCapacitySlice();
         const count = @min(available.len / width, source.len - index);
         if (count == 0) {
             var bytes: [4]u8 = undefined;
-            encodeSamples(source[index..][0..1], bytes[0..width], options.format);
+            encodeSamples(source[index..][0..1], bytes[0..width], format);
             try writer.writeAll(bytes[0..width]);
             index += 1;
             continue;
         }
-        encodeSamples(source[index..][0..count], available[0 .. count * width], options.format);
+        encodeSamples(source[index..][0..count], available[0 .. count * width], format);
         writer.advance(count * width);
         index += count;
     }
@@ -205,11 +201,7 @@ pub fn writeAll(
 test writeAll {
     var storage: [3]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&storage);
-    try writeAll(
-        &.{std.math.minInt(i32)},
-        &writer,
-        .{ .format = .{ .encoding = .signed24, .endian = .big } },
-    );
+    try writeAll(&.{std.math.minInt(i32)}, &writer, .{ .encoding = .signed24, .endian = .big });
     try testing.expectEqualSlices(u8, &.{ 0x80, 0, 0 }, writer.buffered());
 }
 
@@ -221,11 +213,11 @@ test "Writer exhaustion publishes only the encoded byte prefix" {
         var storage: [expected.len + 1]u8 = @splat(0xa5);
         var writer: std.Io.Writer = .fixed(storage[0..capacity]);
         if (capacity == expected.len) {
-            try writeAll(&source, &writer, .{ .format = .{ .encoding = .signed24 } });
+            try writeAll(&source, &writer, .{ .encoding = .signed24 });
         } else {
             try testing.expectError(
                 error.WriteFailed,
-                writeAll(&source, &writer, .{ .format = .{ .encoding = .signed24 } }),
+                writeAll(&source, &writer, .{ .encoding = .signed24 }),
             );
         }
         try testing.expectEqualSlices(u8, expected[0..capacity], writer.buffered());
@@ -233,12 +225,9 @@ test "Writer exhaustion publishes only the encoded byte prefix" {
     }
 }
 
-fn integerPrecision(format: Format) error{InvalidFormat}!u16 {
+fn integerPrecisionBits(format: Format) Format.Error!u16 {
     if (format.encoding == .float32 or format.encoding == .float64) return error.InvalidFormat;
-    const width: u16 = @intCast(format.encoding.byteCount() * 8);
-    const bits: u16 = format.valid_bits orelse @intCast(width);
-    if (bits == 0 or bits > width) return error.InvalidFormat;
-    return bits;
+    return format.validBitCount();
 }
 
 fn encodeSamples(source: []const i32, output: []u8, format: Format) void {
@@ -274,7 +263,7 @@ test "dirty padding is ignored on decode and cleared on encode" {
     _ = try decodeInto(&source, &samples, format);
     try testing.expectEqualSlices(i32, &.{ std.math.minInt(i32), 0x7fff_f000 }, &samples);
     var bytes: [6]u8 = undefined;
-    _ = try encodeInto(&samples, &bytes, .{ .format = format });
+    _ = try encodeInto(&samples, &bytes, format);
     try testing.expectEqualSlices(u8, &.{ 0x80, 0, 0, 0x7f, 0xff, 0xf0 }, &bytes);
 }
 
@@ -292,27 +281,23 @@ test "signed 8-bit decoding covers vector batches and tails" {
         var samples: [37]i32 = undefined;
         try testing.expectEqualSlices(i32, &wanted, try decodeInto(&source, &samples, format));
         var encoded: [37]u8 = undefined;
-        try testing.expectEqualSlices(
-            u8,
-            &source,
-            try encodeInto(&samples, &encoded, .{ .format = format }),
-        );
+        try testing.expectEqualSlices(u8, &source, try encodeInto(&samples, &encoded, format));
     }
 }
 
 test "admission errors precede output and Writer mutation" {
     var destination: [8]u8 = @splat(0xa5);
-    const bad: EncodeOptions = .{ .format = .{ .encoding = .signed24 } };
+    const bad: Format = .{ .encoding = .signed24 };
     try testing.expectError(error.PrecisionLoss, encodeInto(&.{1}, destination[0..1], bad));
     try testing.expect(std.mem.allEqual(u8, &destination, 0xa5));
     try testing.expectError(
         error.InvalidFormat,
-        encodeInto(&.{}, &destination, .{ .format = .{ .encoding = .float32 } }),
+        encodeInto(&.{}, &destination, .{ .encoding = .float32 }),
     );
     try testing.expectError(error.InvalidFormat, decodeInto(&.{}, &.{}, .{ .encoding = .float64 }));
     try testing.expectError(
         error.InvalidFormat,
-        encodeInto(&.{}, &destination, .{ .format = .{ .encoding = .float64 } }),
+        encodeInto(&.{}, &destination, .{ .encoding = .float64 }),
     );
     var writer: std.Io.Writer = .fixed(&destination);
     try writer.writeByte(0x3c);
@@ -338,12 +323,12 @@ test "overlap is checked against used output only" {
     try testing.expectEqualSlices(i32, &before, &storage);
 
     storage[2] = 0x1234_0000;
-    const encoded = try encodeInto(storage[2..3], all, .{ .format = .{ .encoding = .signed16 } });
+    const encoded = try encodeInto(storage[2..3], all, .{ .encoding = .signed16 });
     try testing.expectEqualSlices(u8, &.{ 0x34, 0x12 }, encoded);
     const current = storage;
     try testing.expectError(
         error.Aliasing,
-        encodeInto(storage[2..3], all[8..], .{ .format = .{ .encoding = .signed16 } }),
+        encodeInto(storage[2..3], all[8..], .{ .encoding = .signed16 }),
     );
     try testing.expectEqualSlices(i32, &current, &storage);
 }

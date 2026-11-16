@@ -10,124 +10,48 @@
 const std = @import("std");
 const memory = @import("common/byte_ranges.zig");
 const binary_float = @import("common/float.zig");
-const rounding = @import("lpcm/round.zig");
+const float32_narrowing = @import("lpcm/float32_narrowing.zig");
 const sample_rounding = @import("common/round.zig");
 const testing = std.testing;
+const FloatControl = binary_float.test_support.FloatControl;
 
-/// Encoded sample containers. Unsigned integers use a midpoint bias; signed integers use two's
-/// complement. The sample's meaningful bits occupy the high end of its container.
-pub const Encoding = enum {
-    unsigned8,
-    signed16,
-    signed24,
-    signed32,
-    float32,
-    float64,
-    signed8,
-    unsigned16,
-    unsigned24,
-    unsigned32,
-
-    /// Byte width of one encoded sample, independent of its meaningful precision.
-    pub fn byteCount(self: Encoding) usize {
-        return switch (self) {
-            .unsigned8, .signed8 => 1,
-            .unsigned16, .signed16 => 2,
-            .unsigned24, .signed24 => 3,
-            .unsigned32, .signed32, .float32 => 4,
-            .float64 => 8,
-        };
-    }
-};
-
-/// Sample representation and byte order. Byte order applies to the numerical container; meaningful
-/// integer bits occupy its high end. Null precision uses every container bit. Integer precision is
-/// 1 through the container width; floating-point formats require their full width. One-byte samples
-/// ignore byte order. No rate or interleaving metadata is retained.
-pub const Format = struct {
-    encoding: Encoding,
-    valid_bits: ?u7 = null,
-    endian: std.lang.Endian = .little,
-
-    fn precision(self: Format) error{InvalidFormat}!u16 {
-        const width: u16 = @intCast(self.encoding.byteCount() * 8);
-        const bits: u16 = self.valid_bits orelse @intCast(width);
-        if (bits == 0 or bits > width) return error.InvalidFormat;
-        switch (self.encoding) {
-            .float32, .float64 => if (bits != width) return error.InvalidFormat,
-            else => {},
-        }
-        return bits;
-    }
-};
+pub const Format = @import("lpcm/Format.zig");
+const Encoding = Format.Encoding;
 
 /// Invalid representation, incomplete source, insufficient/aliased output or invalid float input.
-pub const DecodeError = error{
-    InvalidFormat,
-    InvalidData,
-    DestinationTooSmall,
-    Aliasing,
-    InvalidSamples,
-};
+pub const DecodeError = Format.CountError || error{ DestinationTooSmall, Aliasing, InvalidSamples };
 
 /// Invalid representation, nonfinite/out-of-range samples or unrepresentable encoded extent.
-pub const ValidateError = error{ InvalidFormat, InvalidSamples, SizeOverflow };
+pub const ValidateError = Format.Error || error{ InvalidSamples, SizeOverflow };
 
 /// Encoding admission also rejects insufficient or aliased caller output.
 pub const EncodeError = ValidateError || error{ DestinationTooSmall, Aliasing };
 
-/// Exact integer PCM conversion with signed, left-aligned i32 samples.
 pub const int32 = @import("lpcm/int32.zig");
 
-/// PCM conversion with binary64 samples, including exact finite binary64 wire values.
 pub const float64 = @import("lpcm/float64.zig");
 
 test {
+    _ = Format;
     _ = int32;
     _ = float64;
-    _ = rounding;
+    _ = float32_narrowing;
     _ = sample_rounding;
 }
 
-/// Counts whole encoded samples after validating the representation. Does not inspect float values.
-pub fn sampleCount(byte_count: usize, format: Format) DecodeError!usize {
-    _ = try format.precision();
-    const width = format.encoding.byteCount();
-    if (byte_count % width != 0) return error.InvalidData;
-    return byte_count / width;
-}
-
-test sampleCount {
-    try testing.expectEqual(2, try sampleCount(6, .{ .encoding = .signed24 }));
-    try testing.expectEqual(0, try sampleCount(0, .{ .encoding = .unsigned8 }));
-    try testing.expectError(error.InvalidData, sampleCount(5, .{ .encoding = .signed24 }));
-    try testing.expectError(
-        error.InvalidFormat,
-        sampleCount(0, .{ .encoding = .unsigned8, .valid_bits = 0 }),
-    );
-    try testing.expectError(
-        error.InvalidFormat,
-        sampleCount(0, .{ .encoding = .float32, .valid_bits = 24 }),
-    );
-
-    // Counting only inspects geometry; even the largest complete container needs no allocation.
-    const largest_complete = std.math.maxInt(usize) - 3;
-    try testing.expectEqual(
-        largest_complete / 4,
-        try sampleCount(largest_complete, .{ .encoding = .signed32 }),
-    );
-}
-
-/// Converts all source samples into a used destination prefix. Capacity, format and alias failures
-/// precede writes; a nonfinite float may leave partial output, which remains unpublished on error.
-/// Source and the used destination must stay live and disjoint until return, and source must remain
-/// unchanged. Integer samples with more than 25 meaningful bits can round to f32; the result can
-/// depend on the executing thread's floating-point rounding mode and target. Binary64 samples
-/// narrow to f32 using nearest-even rounding; very small values can become signed zero. A nonfinite
-/// binary64 source or narrowed result fails before writing its destination slot.
+/// Converts all source samples into a used destination prefix. Format, complete-sample extent,
+/// capacity and alias failures precede writes; a nonfinite float may leave partial output, which
+/// remains unpublished on error. Source and the used destination must stay live and disjoint until
+/// return, and source must remain unchanged. Integer samples with more than 25 meaningful bits can
+/// round to f32; the result can depend on the executing thread's floating-point rounding mode and
+/// target. Binary64 samples narrow to f32 using nearest-even rounding; very small values can become
+/// signed zero. A nonfinite binary64 source or narrowed result fails before writing its destination
+/// slot.
 pub fn decodeInto(source: []const u8, destination: []f32, format: Format) DecodeError![]f32 {
     // Establish shape and disjoint storage before decoding; a later bad float can leave writes.
-    const count = try sampleCount(source.len, format);
+    // Keep geometry admission inline. This avoids a wider load across the caller's separate format
+    // stores, which can stall short conversions before sample work starts.
+    const count = try @call(.always_inline, Format.sampleCount, .{ format, source.len });
     if (destination.len < count) return error.DestinationTooSmall;
 
     const output = destination[0..count];
@@ -199,15 +123,7 @@ test "binary64 narrowing checks the rounded value and preserves the failing slot
     }
 }
 
-test "binary64 format validates precision and widens finite f32 values" {
-    try testing.expectEqual(
-        @as(usize, 1),
-        try sampleCount(8, .{ .encoding = .float64, .valid_bits = 64 }),
-    );
-    try testing.expectError(
-        error.InvalidFormat,
-        sampleCount(0, .{ .encoding = .float64, .valid_bits = 32 }),
-    );
+test "binary64 encoding widens finite f32 values" {
     const samples = [_]f32{ -0.0, 0.5, -2 };
     var bytes: [24]u8 = undefined;
     const output = try encodeInto(&samples, &bytes, .{ .encoding = .float64, .endian = .big });
@@ -247,12 +163,16 @@ test "signed 8-bit PCM uses two's complement without an unsigned bias" {
 
         const reduced: Format = .{ .encoding = .signed8, .valid_bits = 3, .endian = endian };
         const dirty = [_]u8{ 0x9f, 0xff, 0x1f, 0x7f };
-        try testing.expectEqualSlices(f32, &.{
-            -1, -0.25, 0, 0.75,
-        }, try decodeInto(&dirty, &samples, reduced));
-        try testing.expectEqualSlices(u8, &.{
-            0x80, 0xe0, 0, 0x60,
-        }, try encodeInto(&samples, &bytes, reduced));
+        try testing.expectEqualSlices(
+            f32,
+            &.{ -1, -0.25, 0, 0.75 },
+            try decodeInto(&dirty, &samples, reduced),
+        );
+        try testing.expectEqualSlices(
+            u8,
+            &.{ 0x80, 0xe0, 0, 0x60 },
+            try encodeInto(&samples, &bytes, reduced),
+        );
     }
 }
 
@@ -354,7 +274,7 @@ test "PCM finite binary32 words survive exactly and failed output remains unpubl
 /// Validates the representation, output extent and all input without writing or retaining storage.
 /// Integer input must be finite and in [-1, 1]; floating-point formats accept any finite f32.
 pub fn validate(source: []const f32, format: Format) ValidateError!void {
-    _ = try format.precision();
+    _ = try format.validBitCount();
     const width = format.encoding.byteCount();
     if (source.len > std.math.maxInt(usize) / width) return error.SizeOverflow;
 
@@ -393,13 +313,16 @@ test "PCM16 encoding validates every sample before changing caller bytes" {
         encodeInto(&.{ 0, std.math.nan(f32) }, &bytes, .{ .encoding = .signed16 }),
     );
     try testing.expect(std.mem.allEqual(u8, &bytes, 0xa5));
-    try testing.expectError(error.DestinationTooSmall, encodeInto(&.{
-        -1, 1,
-    }, bytes[0..3], .{ .encoding = .signed16 }));
+    try testing.expectError(
+        error.DestinationTooSmall,
+        encodeInto(&.{ -1, 1 }, bytes[0..3], .{ .encoding = .signed16 }),
+    );
     try testing.expect(std.mem.allEqual(u8, &bytes, 0xa5));
-    const output = try encodeInto(&.{
-        -1, 1, -0.5, 0.5, 0, 0.25,
-    }, &bytes, .{ .encoding = .signed16 });
+    const output = try encodeInto(
+        &.{ -1, 1, -0.5, 0.5, 0, 0.25 },
+        &bytes,
+        .{ .encoding = .signed16 },
+    );
     try testing.expectEqualSlices(u8, &.{ 0, 128, 255, 127, 0, 192, 0, 64, 0, 0, 0, 32 }, output);
 }
 
@@ -437,7 +360,7 @@ test "vector validation rejects every invalid lane and preserves caller output" 
 pub fn encodeInto(source: []const f32, destination: []u8, format: Format) EncodeError![]u8 {
     // Validate before capacity and overlap checks, preserving admission order and output bytes.
     try validate(source, format);
-    const bits = format.precision() catch unreachable;
+    const bits = format.validBitCount() catch unreachable;
     const bytes = source.len * format.encoding.byteCount();
     if (destination.len < bytes) return error.DestinationTooSmall;
 
@@ -451,9 +374,11 @@ pub fn encodeInto(source: []const f32, destination: []u8, format: Format) Encode
 
 test encodeInto {
     var storage: [6]u8 = undefined;
-    const bytes = try encodeInto(&.{
-        -1, 1,
-    }, &storage, .{ .encoding = .signed24, .valid_bits = 20, .endian = .big });
+    const bytes = try encodeInto(
+        &.{ -1, 1 },
+        &storage,
+        .{ .encoding = .signed24, .valid_bits = 20, .endian = .big },
+    );
     try testing.expectEqualSlices(u8, &.{ 0x80, 0, 0, 0x7f, 0xff, 0xf0 }, bytes);
 }
 
@@ -507,25 +432,23 @@ test "full-width output preserves endpoints across vector boundaries and tails" 
     const count = pcm_vector_lanes * 2 + 3;
     var samples: [count]f32 = undefined;
     for (&samples, 0..) |*sample, i| sample.* = ([_]f32{ -1, 0, 1 })[i % 3];
-    const cases = .{ .{ Encoding.unsigned8, 1, [3][4]u8{ .{
-        0, 0, 0, 0,
-    }, .{
-        128, 0, 0, 0,
-    }, .{
-        255, 0, 0, 0,
-    } } }, .{ Encoding.signed24, 3, [3][4]u8{ .{
-        0, 0, 128, 0,
-    }, .{
-        0, 0, 0, 0,
-    }, .{
-        255, 255, 127, 0,
-    } } }, .{ Encoding.signed32, 4, [3][4]u8{ .{
-        0, 0, 0, 128,
-    }, .{
-        0, 0, 0, 0,
-    }, .{
-        255, 255, 255, 127,
-    } } } };
+    const cases = .{
+        .{
+            Encoding.unsigned8,
+            1,
+            [3][4]u8{ .{ 0, 0, 0, 0 }, .{ 128, 0, 0, 0 }, .{ 255, 0, 0, 0 } },
+        },
+        .{
+            Encoding.signed24,
+            3,
+            [3][4]u8{ .{ 0, 0, 128, 0 }, .{ 0, 0, 0, 0 }, .{ 255, 255, 127, 0 } },
+        },
+        .{
+            Encoding.signed32,
+            4,
+            [3][4]u8{ .{ 0, 0, 0, 128 }, .{ 0, 0, 0, 0 }, .{ 255, 255, 255, 127 } },
+        },
+    };
     inline for (cases) |case| {
         const expected: [3][4]u8 = case[2];
         for ([_]std.lang.Endian{ .little, .big }) |endian| {
@@ -550,13 +473,17 @@ test "full-width output preserves endpoints across vector boundaries and tails" 
 
 test "symmetric PCM encoding preserves endpoints, byte order and finite float bits" {
     var storage: [16]u8 = @splat(0xa5);
-    const signed32 = try encodeInto(&.{
-        -1, 1,
-    }, &storage, .{ .encoding = .signed32, .endian = .big });
+    const signed32 = try encodeInto(
+        &.{ -1, 1 },
+        &storage,
+        .{ .encoding = .signed32, .endian = .big },
+    );
     try testing.expectEqualSlices(u8, &.{ 0x80, 0, 0, 0, 0x7f, 0xff, 0xff, 0xff }, signed32);
-    const one_bit = try encodeInto(&.{
-        -1, 0, 1,
-    }, &storage, .{ .encoding = .unsigned8, .valid_bits = 1 });
+    const one_bit = try encodeInto(
+        &.{ -1, 0, 1 },
+        &storage,
+        .{ .encoding = .unsigned8, .valid_bits = 1 },
+    );
     try testing.expectEqualSlices(u8, &.{ 0, 128, 128 }, one_bit);
     const input = [_]f32{ @bitCast(@as(u32, 0x8000_0000)), 2, @bitCast(@as(u32, 1)) };
     const float = try encodeInto(&input, &storage, .{ .encoding = .float32, .endian = .big });
@@ -581,7 +508,7 @@ pub fn writeAll(
     format: Format,
 ) (ValidateError || std.Io.Writer.Error)!void {
     try validate(source, format);
-    const bits = format.precision() catch unreachable;
+    const bits = format.validBitCount() catch unreachable;
     const width = format.encoding.byteCount();
     var index: usize = 0;
     while (index < source.len) {
@@ -631,9 +558,11 @@ test "PCM16 ties round away from zero and backend failure follows validation" {
     const source = [_]f32{ 1.0 / 65536.0, -1.0 / 65536.0, 3.0 / 65536.0, -3.0 / 65536.0, 1, -1 };
     var bytes: [12]u8 = undefined;
     const encoded = try encodeInto(&source, &bytes, .{ .encoding = .signed16 });
-    try testing.expectEqualSlices(u8, &.{
-        1, 0, 255, 255, 2, 0, 254, 255, 255, 127, 0, 128,
-    }, encoded);
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 1, 0, 255, 255, 2, 0, 254, 255, 255, 127, 0, 128 },
+        encoded,
+    );
 
     var failing: std.Io.Writer = .failing;
     try testing.expectError(
@@ -979,7 +908,7 @@ fn decodeUnsignedPcm(raw: u8, valid_bits_per_sample: u16) f32 {
 }
 
 fn decodeSamples(format: Format, data: []const u8, output: []f32) DecodeError!void {
-    const bits = try format.precision();
+    const bits = try format.validBitCount();
     // Full-width vector paths handle common formats; the scalar path also handles reduced precision
     // and either wire byte order without requiring aligned input.
     if (format.encoding == .unsigned8 and bits == 8) {
@@ -1088,7 +1017,7 @@ fn decodeFloat64Samples(
 ) error{InvalidSamples}!void {
     for (output, 0..) |*sample, index| {
         const wide = std.mem.readInt(u64, data[index * 8 ..][0..8], endian);
-        const narrowed = rounding.toF32Bits(wide) orelse return error.InvalidSamples;
+        const narrowed = float32_narrowing.toF32Bits(wide) orelse return error.InvalidSamples;
         sample.* = @bitCast(narrowed);
     }
 }
@@ -1307,10 +1236,12 @@ test "integer precision ignores low padding and normalizes both signed endpoints
 
 fn verifyInteger() !void {
     const count = 35;
-    for ([_]Encoding{
-        .unsigned8, .unsigned16, .unsigned24, .unsigned32, .signed8, .signed16, .signed24,
-        .signed32,
-    }) |encoding| {
+    for (
+        [_]Encoding{
+            .unsigned8, .unsigned16, .unsigned24, .unsigned32, .signed8, .signed16, .signed24,
+            .signed32,
+        },
+    ) |encoding| {
         const width = encoding.byteCount();
         for (1..width * 8 + 1) |bits| {
             const midpoint: i64 = @as(i64, 1) << @intCast(bits - 1);
@@ -1415,7 +1346,7 @@ fn verifyInteger() !void {
                         const output = if (use_wide) try float64.encodeInto(
                             wide[0..n],
                             out[1..],
-                            .{ .format = format },
+                            format,
                         ) else try encodeInto(root[0..n], out[1..], format);
                         try testing.expectEqualSlices(u8, expected[0 .. n * width], output);
                         try testing.expectEqual(@as(u8, 0xa5), out[0]);
@@ -1426,7 +1357,7 @@ fn verifyInteger() !void {
                         if (use_wide) try float64.writeAll(
                             wide[0..n],
                             &writer,
-                            .{ .format = format },
+                            format,
                         ) else try writeAll(root[0..n], &writer, format);
                         try testing.expectEqualSlices(
                             u8,
@@ -1457,11 +1388,10 @@ test "integer PCM half neighbors across every valid precision" {
 }
 
 test "integer PCM half neighbors ignore all x86-64 rounding modes" {
-    const Control = @import("common/float.zig").test_support.FloatControl;
-    const original = try Control.read();
-    defer Control.set(original);
+    const original = try FloatControl.read();
+    defer FloatControl.set(original);
     for (0..4) |mode| {
-        Control.set((original & ~@as(u32, 3 << 13)) | (@as(u32, @intCast(mode)) << 13));
+        FloatControl.set((original & ~@as(u32, 3 << 13)) | (@as(u32, @intCast(mode)) << 13));
         try verifyInteger();
     }
 }
@@ -1495,27 +1425,22 @@ fn verifyNarrow() !void {
 
         var expected: [bits.len * 4]u8 = undefined;
         for (words, 0..) |word, i| std.mem.writeInt(u32, expected[i * 4 ..][0..4], word, endian);
-        const options: float64.EncodeOptions = .{
-            .format = .{ .encoding = .float32, .endian = endian },
-        };
+        const format: Format = .{ .encoding = .float32, .endian = endian };
         var output: [values.len * 4]u8 = @splat(0xa5);
-        const result = try float64.encodeInto(values[0..bits.len], &output, options);
+        const result = try float64.encodeInto(values[0..bits.len], &output, format);
         try testing.expectEqualSlices(u8, &expected, result);
 
         @memset(&output, 0xa5);
         var writer: std.Io.Writer = .fixed(&output);
-        try float64.writeAll(values[0..bits.len], &writer, options);
+        try float64.writeAll(values[0..bits.len], &writer, format);
         try testing.expectEqualSlices(u8, &expected, writer.buffered());
 
         @memset(&output, 0xa5);
-        try testing.expectError(
-            error.InvalidSamples,
-            float64.encodeInto(&values, &output, options),
-        );
+        try testing.expectError(error.InvalidSamples, float64.encodeInto(&values, &output, format));
         try testing.expect(std.mem.allEqual(u8, &output, 0xa5));
         writer = .fixed(&output);
         try writer.writeByte(0x42);
-        try testing.expectError(error.InvalidSamples, float64.writeAll(&values, &writer, options));
+        try testing.expectError(error.InvalidSamples, float64.writeAll(&values, &writer, format));
         try testing.expectEqualSlices(u8, &.{0x42}, writer.buffered());
         try testing.expect(std.mem.allEqual(u8, output[1..], 0xa5));
     }
@@ -1523,11 +1448,10 @@ fn verifyNarrow() !void {
 
 test "binary32 narrowing preserves output and errors in every x86-64 rounding mode" {
     // Changing caller rounding mode must not change nearest-even narrowing or failure placement.
-    const Control = @import("common/float.zig").test_support.FloatControl;
-    const original = try Control.read();
-    defer Control.set(original);
+    const original = try FloatControl.read();
+    defer FloatControl.set(original);
     for (0..4) |mode| {
-        Control.set((original & ~@as(u32, 3 << 13)) | (@as(u32, @intCast(mode)) << 13));
+        FloatControl.set((original & ~@as(u32, 3 << 13)) | (@as(u32, @intCast(mode)) << 13));
         try verifyNarrow();
     }
 }
@@ -1549,22 +1473,32 @@ test "unsigned wide endpoints, dirty padding and exact integer round trip" {
         dirty: [3]u32,
         clean: [3]u32,
         maximum: i32,
-    }{ .{ .encoding = .unsigned16, .width = 2, .bits = 12, .dirty = .{
-        0x000f, 0x800f,
-        0xffff,
-    }, .clean = .{
-        0, 0x8000, 0xfff0,
-    }, .maximum = 0x7ff0_0000 }, .{ .encoding = .unsigned24, .width = 3, .bits = 20, .dirty = .{
-        0x00000f, 0x80000f,
-        0xffffff,
-    }, .clean = .{
-        0, 0x800000, 0xfffff0,
-    }, .maximum = 0x7ffff000 }, .{ .encoding = .unsigned32, .width = 4, .bits = 28, .dirty = .{
-        0x0000000f, 0x8000000f,
-        0xffffffff,
-    }, .clean = .{
-        0, 0x80000000, 0xfffffff0,
-    }, .maximum = 0x7ffffff0 } };
+    }{
+        .{
+            .encoding = .unsigned16,
+            .width = 2,
+            .bits = 12,
+            .dirty = .{ 0x000f, 0x800f, 0xffff },
+            .clean = .{ 0, 0x8000, 0xfff0 },
+            .maximum = 0x7ff0_0000,
+        },
+        .{
+            .encoding = .unsigned24,
+            .width = 3,
+            .bits = 20,
+            .dirty = .{ 0x00000f, 0x80000f, 0xffffff },
+            .clean = .{ 0, 0x800000, 0xfffff0 },
+            .maximum = 0x7ffff000,
+        },
+        .{
+            .encoding = .unsigned32,
+            .width = 4,
+            .bits = 28,
+            .dirty = .{ 0x0000000f, 0x8000000f, 0xffffffff },
+            .clean = .{ 0, 0x80000000, 0xfffffff0 },
+            .maximum = 0x7ffffff0,
+        },
+    };
     for (cases) |case| for ([_]std.lang.Endian{ .little, .big }) |endian| {
         const format: Format = .{
             .encoding = case.encoding,
@@ -1589,15 +1523,12 @@ test "unsigned wide endpoints, dirty padding and exact integer round trip" {
         try testing.expectEqualSlices(
             u8,
             clean[0..length],
-            try int32.encodeInto(&integers, &bytes, .{ .format = format }),
+            try int32.encodeInto(&integers, &bytes, format),
         );
         var writer: std.Io.Writer = .fixed(&bytes);
-        try int32.writeAll(&integers, &writer, .{ .format = format });
+        try int32.writeAll(&integers, &writer, format);
         try testing.expectEqualSlices(u8, clean[0..length], writer.buffered());
-        try testing.expectError(
-            error.PrecisionLoss,
-            int32.encodeInto(&.{1}, &bytes, .{ .format = format }),
-        );
+        try testing.expectError(error.PrecisionLoss, int32.encodeInto(&.{1}, &bytes, format));
         const midpoint: f64 = @floatFromInt(@as(u32, 1) << @intCast(case.bits - 1));
         const values = [_]f64{ -1, 0, (midpoint - 1) / midpoint };
         var f64_out: [3]f64 = undefined;
@@ -1609,10 +1540,10 @@ test "unsigned wide endpoints, dirty padding and exact integer round trip" {
         try testing.expectEqualSlices(
             u8,
             clean[0..length],
-            try float64.encodeInto(&values, &bytes, .{ .format = format }),
+            try float64.encodeInto(&values, &bytes, format),
         );
         writer = .fixed(&bytes);
-        try float64.writeAll(&values, &writer, .{ .format = format });
+        try float64.writeAll(&values, &writer, format);
         try testing.expectEqualSlices(u8, clean[0..length], writer.buffered());
         var f32_out: [3]f32 = undefined;
         const expected_f32 = [_]f32{ -1, 0, @floatCast(values[2]) };
@@ -1640,19 +1571,22 @@ test "unsigned32 binary32 rounding and exact integer precision" {
             std.mem.writeInt(u32, bytes[i * 4 ..][0..4], word, endian);
         }
         var wide: [3]f64 = undefined;
-        try testing.expectEqualSlices(f64, &.{
-            0x1p-7, 0x1.000001p-7, 0x1.000003p-7,
-        }, try float64.decodeInto(&bytes, &wide, format));
+        try testing.expectEqualSlices(
+            f64,
+            &.{ 0x1p-7, 0x1.000001p-7, 0x1.000003p-7 },
+            try float64.decodeInto(&bytes, &wide, format),
+        );
         var narrow: [3]f32 = undefined;
         _ = try decodeInto(&bytes, &narrow, format);
         try testing.expectEqual(@as(u32, 0x3c00_0000), @as(u32, @bitCast(narrow[0])));
         try testing.expectEqual(@as(u32, 0x3c00_0000), @as(u32, @bitCast(narrow[1])));
         try testing.expectEqual(@as(u32, 0x3c00_0002), @as(u32, @bitCast(narrow[2])));
         var exact: [3]i32 = undefined;
-        try testing.expectEqualSlices(i32, &.{
-            0x0100_0000, 0x0100_0001,
-            0x0100_0003,
-        }, try int32.decodeInto(&bytes, &exact, format));
+        try testing.expectEqualSlices(
+            i32,
+            &.{ 0x0100_0000, 0x0100_0001, 0x0100_0003 },
+            try int32.decodeInto(&bytes, &exact, format),
+        );
     }
 }
 
@@ -1727,9 +1661,8 @@ fn checkExactFloat32Widening() !void {
 test "binary32 widening preserves encoded values and failure prefixes in caller float modes" {
     // DAZ and FTZ can flush subnormal inputs in hardware, so exercise both independently.
     try checkExactFloat32Widening();
-    const Control = @import("common/float.zig").test_support.FloatControl;
-    const original = Control.read() catch return;
-    defer Control.set(original);
+    const original = FloatControl.read() catch return;
+    defer FloatControl.set(original);
     const flush_mask: u32 = (1 << 6) | (1 << 15);
     const round_mask: u32 = 3 << 13;
     for (0..4) |rounding_mode| {
@@ -1738,7 +1671,7 @@ test "binary32 widening preserves encoded values and failure prefixes in caller 
                 u32,
                 @intCast(rounding_mode),
             ) << 13) | flush;
-            Control.set(control);
+            FloatControl.set(control);
             try checkExactFloat32Widening();
         }
     }

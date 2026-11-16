@@ -1,9 +1,10 @@
-//! Deterministic binary floating-point rounding for PCM conversion.
+//! Binary64-to-binary32 narrowing with nearest-even rounding and finite-result admission.
 
 const testing = @import("std").testing;
 const float = @import("../common/float.zig");
 
 const magnitude_mask: u64 = 0x7fff_ffff_ffff_ffff;
+// First positive binary64 value that rounds to binary32 infinity.
 const overflow_midpoint: u64 = 0x47ef_ffff_f000_0000;
 
 /// Reports whether the input bits narrow to a finite binary32 value under nearest-even rounding.

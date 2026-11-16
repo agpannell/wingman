@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
 
     // A complete sample occupies bytes_per_sample bytes. Counting validates the byte extent before
     // we size the f32 destination; the returned slice identifies the samples actually written.
-    const sample_count = try lpcm.sampleCount(encoded_bytes.len, format);
+    const sample_count = try format.sampleCount(encoded_bytes.len);
     var decoded_storage: [input_samples.len]f32 = undefined;
     if (decoded_storage.len < sample_count) return error.DestinationTooSmall;
     const decoded_samples = try lpcm.decodeInto(encoded_bytes, &decoded_storage, format);
@@ -47,11 +47,7 @@ pub fn main(init: std.process.Init) !void {
     var exact_storage: [2]i32 = undefined;
     const exact_samples = try lpcm.int32.decodeInto(&source_24, &exact_storage, source_format);
     var little_24_storage: [source_24.len]u8 = undefined;
-    const little_24 = try lpcm.int32.encodeInto(
-        exact_samples,
-        &little_24_storage,
-        .{ .format = target_format },
-    );
+    const little_24 = try lpcm.int32.encodeInto(exact_samples, &little_24_storage, target_format);
     const expected_24 = [_]u8{ 0, 0, 0x80, 0xff, 0xff, 0x7f };
     if (!std.mem.eql(u8, &expected_24, little_24)) return error.EncodedSampleMismatch;
 
@@ -60,11 +56,7 @@ pub fn main(init: std.process.Init) !void {
     const float_format: lpcm.Format = .{ .encoding = .float64, .endian = .little };
     const float_samples = [_]f64{ -0.0, 1.5 };
     var float_storage: [float_samples.len * @sizeOf(f64)]u8 = undefined;
-    const float_bytes = try lpcm.float64.encodeInto(
-        &float_samples,
-        &float_storage,
-        .{ .format = float_format },
-    );
+    const float_bytes = try lpcm.float64.encodeInto(&float_samples, &float_storage, float_format);
     var float_decoded_storage: [float_samples.len]f64 = undefined;
     const float_decoded = try lpcm.float64.decodeInto(
         float_bytes,
@@ -80,9 +72,10 @@ pub fn main(init: std.process.Init) !void {
     // The stdout writer has its own buffer; flush it after printing so the output reaches the sink.
     var output_storage: [512]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &output_storage);
-    try output.interface.print("PCM16: {d} samples, {d} bytes\n", .{
-        decoded_samples.len, encoded_bytes.len,
-    });
+    try output.interface.print(
+        "PCM16: {d} samples, {d} bytes\n",
+        .{ decoded_samples.len, encoded_bytes.len },
+    );
     for (input_samples, decoded_samples) |before, after| {
         try output.interface.print("{d:.6} -> {d:.6}\n", .{ before, after });
     }

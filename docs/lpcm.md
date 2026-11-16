@@ -12,8 +12,10 @@ order; the caller supplies the channel layout and controls any resampling, gain,
 
 ## Choose the representation
 
-`Format` chooses an `Encoding`, an optional `valid_bits` count and an `endian` byte order. The
-default byte order is little-endian. Byte order has no effect on one-byte samples.
+`Format` chooses a `Format.Encoding` value, an optional `valid_bits` count and an `endian` byte
+order. The default byte order is little-endian. Byte order has no effect on one-byte samples.
+`format.validBitCount()` validates and resolves the encoded bit count;
+`format.encoding.byteCount()` gives the container width in bytes.
 
 | Encoding | Container | Interpretation |
 | --- | --- | --- |
@@ -28,10 +30,10 @@ padding. A format that requires zero padding in its input must check that separa
 
 ## Decode normalized samples
 
-`sampleCount` validates format and complete-sample geometry; it does not inspect sample values.
-Provide that many `f32` elements to `decodeInto`. Its result borrows the used destination prefix;
-the source can retire after the call and spare destination elements remain untouched. Encoded bytes
-can be unaligned. Integer samples are normalized by their precision's power-of-two midpoint. The
+`format.sampleCount(byte_count)` validates format and complete-sample geometry without inspecting
+sample values. Provide that many `f32` elements to `decodeInto`. Its result borrows the used
+destination prefix; the source can retire after the call and spare destination elements remain
+untouched. Encoded bytes can be unaligned. Integer samples are normalized by their precision's power-of-two midpoint. The
 negative endpoint becomes -1. A full-scale signed32 value can round to +1 because not every 32-bit
 integer is representable in `f32`.
 
@@ -46,7 +48,7 @@ const lpcm = @import("wingman").lpcm;
 test "decode big-endian signed PCM24" {
     const format: lpcm.Format = .{ .encoding = .signed24, .endian = .big };
     const bytes = [_]u8{ 0x80, 0, 0, 0, 0, 0, 0x7f, 0xff, 0xff };
-    try std.testing.expectEqual(3, try lpcm.sampleCount(bytes.len, format));
+    try std.testing.expectEqual(3, try format.sampleCount(bytes.len));
     var storage: [4]f32 = @splat(42);
     const samples = try lpcm.decodeInto(&bytes, &storage, format);
     try std.testing.expectEqualSlices(f32, &.{ -1, 0, 8388607.0 / 8388608.0 }, samples);
@@ -88,6 +90,9 @@ test "write normalized PCM16" {
 
 ## Exact integer and binary64 samples
 
+All three sample families accept the same `Format` directly in `decodeInto`, `validate`,
+`encodeInto` and `writeAll`. Choose the operations by the sample values you need to preserve.
+
 `lpcm.int32` converts integer wire formats to and from left-aligned signed `i32` samples. A sample
 represents its integer value divided by 2^31; unsigned midpoint bias is removed. Encoding rejects
 `PrecisionLoss` if the requested representation would discard nonzero low sample bits. It does not
@@ -97,8 +102,7 @@ recovered from the sample values alone.
 `lpcm.float64` converts through `f64` samples. All supported integer and finite binary32 inputs are
 represented exactly; finite binary64 input retains its bits. Encoding to integer uses the same
 half-away rule as `f32` conversion. Binary32 output narrows nearest-even and rejects a result that
-would be nonfinite. Both namespaces offer `decodeInto`, `validate`, `encodeInto` and `writeAll`;
-their encoding operations take `.{ .format = format }` options.
+would be nonfinite.
 
 ```zig
 const std = @import("std");
@@ -116,7 +120,7 @@ test "rewrite unsigned PCM24 with exact integer samples" {
     try std.testing.expectEqualSlices(i32, &.{ 0, 0x7fff_f000 }, decoded);
 
     var storage: [6]u8 = undefined;
-    const canonical = try lpcm.int32.encodeInto(decoded, &storage, .{ .format = source_format });
+    const canonical = try lpcm.int32.encodeInto(decoded, &storage, source_format);
     try std.testing.expectEqualSlices(u8, &.{ 0x80, 0, 0, 0xff, 0xff, 0xf0 }, canonical);
 }
 ```
@@ -133,7 +137,7 @@ test "encode binary64 samples as binary32" {
     const encoded = try lpcm.float64.encodeInto(
         &samples,
         &bytes,
-        .{ .format = .{ .encoding = .float32 } },
+        .{ .encoding = .float32 },
     );
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0xc0, 0x3f, 0, 0, 0, 0x80 }, encoded);
 }
@@ -147,8 +151,9 @@ capacity and overlap. Buffer admission failures preserve the complete destinatio
 capacity is left untouched on success. Touching spans are disjoint; source overlap confined to
 unused destination capacity is permitted.
 
-`sampleCount` reports `InvalidFormat` for an unsupported format or precision and `InvalidData`
-for an incomplete sample. Decoders also report `DestinationTooSmall` or `Aliasing` before
+`Format.sampleCount` returns `Format.CountError`: `InvalidFormat` for an invalid bit count and
+`InvalidData` for an incomplete sample. `Format.validBitCount` returns the valid encoded bit count or
+`Format.Error` (`InvalidFormat`). Decoders also report `DestinationTooSmall` or `Aliasing` before
 writing; the `f32` and `f64` decoders report `InvalidSamples` for invalid float content.
 `lpcm.int32` rejects float wire formats as `InvalidFormat`.
 
