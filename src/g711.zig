@@ -33,8 +33,8 @@ pub fn decodeInto(source: []const u8, destination: []f32, law: Law) Error![]f32 
     const output = destination[0..source.len];
     if (overlaps(source, std.mem.sliceAsBytes(output))) return error.Aliasing;
     const table = switch (law) {
-        .alaw => &alaw_table,
-        .mulaw => &mulaw_table,
+        .alaw => &alaw_normalized_samples,
+        .mulaw => &mulaw_normalized_samples,
     };
     for (source, output) |byte, *sample| sample.* = table[byte];
     return output;
@@ -110,14 +110,15 @@ test encodeAlaw {
 /// is preserved; network zero-code suppression is caller policy.
 pub fn encodeMulaw(sample: i16) u8 {
     const magnitude: u16 = @intCast(if (sample < 0) ~sample else sample);
-    // The mu-law bias shifts segment boundaries; clamping keeps the largest input in segment 8.
+    // G.191 discards two low PCM bits before applying the quarter-scale mu-law bias.
     const biased: u16 = @min((magnitude >> 2) + 33, 0x1fff);
-    // The leading bit of the biased value identifies the segment without a search loop.
-    const segment: u4 = @intCast(@max(1, 11 - @as(i16, @intCast(@clz(biased)))));
-    const exponent: u8 = @intCast(8 - segment);
-    const mantissa: u8 = @intCast(15 - ((biased >> segment) & 15));
+    // The highest bit gives a mantissa shift of 1..8. Compute the inverted three-bit segment and
+    // four-bit mantissa directly; the sign bit already has its transmitted polarity.
+    const mantissa_shift: u4 = @intCast(@max(1, 11 - @as(i16, @intCast(@clz(biased)))));
+    const wire_exponent: u8 = @intCast(8 - mantissa_shift);
+    const wire_mantissa: u8 = @intCast(15 - ((biased >> mantissa_shift) & 15));
     const sign: u8 = if (sample >= 0) 0x80 else 0;
-    return sign | (exponent << 4) | mantissa;
+    return sign | (wire_exponent << 4) | wire_mantissa;
 }
 
 test encodeMulaw {
@@ -125,6 +126,51 @@ test encodeMulaw {
     try testing.expectEqual(@as(u8, 0xff), encodeMulaw(0));
     try testing.expectEqual(@as(u8, 0), encodeMulaw(-32768));
     try testing.expectEqual(@as(u8, 0x80), encodeMulaw(32767));
+}
+
+test "G.191 encoder decisions cover segment edges and both polarities" {
+    // Independent decision intervals pin the first quantizer step, wider segment starts and mu-law
+    // clipping. The negative intervals reflect around -0.5 because G.191 uses one's complement.
+    const cases = [_]struct {
+        law: Law,
+        boundary: i16,
+        below: u8,
+        at: u8,
+    }{
+        .{ .law = .alaw, .boundary = 16, .below = 0xd5, .at = 0xd4 },
+        .{ .law = .alaw, .boundary = 256, .below = 0xda, .at = 0xc5 },
+        .{ .law = .alaw, .boundary = 512, .below = 0xca, .at = 0xf5 },
+        .{ .law = .alaw, .boundary = 1024, .below = 0xfa, .at = 0xe5 },
+        .{ .law = .alaw, .boundary = 2048, .below = 0xea, .at = 0x95 },
+        .{ .law = .alaw, .boundary = 4096, .below = 0x9a, .at = 0x85 },
+        .{ .law = .alaw, .boundary = 8192, .below = 0x8a, .at = 0xb5 },
+        .{ .law = .alaw, .boundary = 16384, .below = 0xba, .at = 0xa5 },
+        .{ .law = .mulaw, .boundary = 4, .below = 0xff, .at = 0xfe },
+        .{ .law = .mulaw, .boundary = 124, .below = 0xf0, .at = 0xef },
+        .{ .law = .mulaw, .boundary = 380, .below = 0xe0, .at = 0xdf },
+        .{ .law = .mulaw, .boundary = 892, .below = 0xd0, .at = 0xcf },
+        .{ .law = .mulaw, .boundary = 1916, .below = 0xc0, .at = 0xbf },
+        .{ .law = .mulaw, .boundary = 3964, .below = 0xb0, .at = 0xaf },
+        .{ .law = .mulaw, .boundary = 8060, .below = 0xa0, .at = 0x9f },
+        .{ .law = .mulaw, .boundary = 16252, .below = 0x90, .at = 0x8f },
+        .{ .law = .mulaw, .boundary = 32636, .below = 0x80, .at = 0x80 },
+    };
+    for (cases) |case| {
+        const values = [_]i16{ case.boundary - 1, case.boundary, case.boundary + 1 };
+        const codes = [_]u8{ case.below, case.at, case.at };
+        for (values, codes) |value, code| {
+            for ([_]i16{ value, -value - 1 }, [_]u8{ code, code ^ 0x80 }) |sample, expected| {
+                const actual = switch (case.law) {
+                    .alaw => encodeAlaw(sample),
+                    .mulaw => encodeMulaw(sample),
+                };
+                try testing.expectEqual(expected, actual);
+                var output: [1]u8 = undefined;
+                const bytes = try encodeInto(&.{sample}, &output, case.law);
+                try testing.expectEqual(expected, bytes[0]);
+            }
+        }
+    }
 }
 
 /// Encodes signed PCM16 samples into a used destination prefix using the G.191 decision-boundary
@@ -194,10 +240,13 @@ pub const TranscodeDirection = enum {
 pub fn alawToMulaw(encoded: u8) u8 {
     // Remove A-law alternating-bit inversion before applying the magnitude table.
     const raw = encoded ^ 0x55;
-    const number = raw & 0x7f;
-    const converted = if (number < a_to_mu.len) a_to_mu[number] else number;
+    const alaw_index = raw & 0x7f;
+    const mulaw_number = if (alaw_index < alaw_to_mulaw_numbers.len)
+        alaw_to_mulaw_numbers[alaw_index]
+    else
+        alaw_index;
     const sign: u8 = if (raw & 0x80 != 0) 0 else 0x80;
-    return ~(converted | sign);
+    return ~(mulaw_number | sign);
 }
 
 test alawToMulaw {
@@ -209,13 +258,12 @@ test alawToMulaw {
 /// equivalent to decoding and re-encoding.
 pub fn mulawToAlaw(encoded: u8) u8 {
     const raw = ~encoded;
-    const number = raw & 0x7f;
-    const converted: u8 = if (number < mu_to_a.len) mu_to_a[number] else if (number < 80)
-        number
-    else
-        number + 1;
+    const mulaw_number = raw & 0x7f;
+    const alaw_number: u8 = if (mulaw_number < mulaw_to_alaw_numbers.len)
+        mulaw_to_alaw_numbers[mulaw_number]
+    else if (mulaw_number < 80) mulaw_number else mulaw_number + 1;
     const sign: u8 = if (raw & 0x80 == 0) 0x80 else 0;
-    const fields = (converted - 1) | sign;
+    const fields = (alaw_number - 1) | sign;
     return fields ^ 0x55;
 }
 
@@ -270,12 +318,12 @@ fn transcodeTable(comptime direction: TranscodeDirection) [256]u8 {
 
 // G.711 Tables 3 and 4 use one-based A-law and zero-based mu-law decoder value numbers. Above these
 // explicit nonuniform ranges the conversion is linear, except the specified tandem pair.
-const mu_to_a = [_]u8{
+const mulaw_to_alaw_numbers = [_]u8{
     1,  1,  2,  2,  3,  3,  4,  4,  5,  5,  6,  6,  7,  7,  8,  8,  9,  10, 11, 12, 13, 14, 15, 16,
     17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 29, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
     46, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
 };
-const a_to_mu = [_]u8{
+const alaw_to_mulaw_numbers = [_]u8{
     1,  3,  5,  7,  9,  11, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
     32, 32, 33, 33, 34, 34, 35, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 48, 49, 49,
     50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 64, 65, 66, 67, 68, 69, 70, 71, 72,
@@ -317,8 +365,8 @@ fn pcm16Samples(comptime law: Law) [256]i16 {
 }
 
 // Normalizing the exact integer expansion once also preserves positive zero for both mu-law zeros.
-const alaw_table = normalizedSamples(.alaw);
-const mulaw_table = normalizedSamples(.mulaw);
+const alaw_normalized_samples = normalizedSamples(.alaw);
+const mulaw_normalized_samples = normalizedSamples(.mulaw);
 
 fn normalizedSamples(comptime law: Law) [256]f32 {
     @setEvalBranchQuota(10_000);
