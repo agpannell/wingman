@@ -22,7 +22,11 @@ const std = @import("std");
 const riff = @import("wingman").riff;
 
 test "inspect a bounded RIFF form" {
-    const bytes = "RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00tail";
+    const bytes = &[_]u8{
+        'R', 'I', 'F', 'F', 0x0e, 0x00, 0x00, 0x00, 'D', 'E', 'M', 'O',
+        'n', 'o', 't', 'e', 0x01, 0x00, 0x00, 0x00, 'x', 0x00, 't', 'a',
+        'i', 'l',
+    };
     const form = try riff.parse(bytes);
     try std.testing.expectEqualStrings("DEMO", &form.form_type);
     try std.testing.expectEqual(22, form.source.len);
@@ -77,8 +81,10 @@ test "write a RIFF form into fixed storage" {
     var writer: std.Io.Writer = .fixed(&bytes);
     try riff.writeHeader("DEMO".*, body_size, &writer, .{});
     try riff.writeChunk("note".*, "x", &writer, .{});
-    try std.testing.expectEqualStrings(
-        "RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00",
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+            'R', 'I', 'F', 'F', 0x0e, 0x00, 0x00, 0x00, 'D', 'E', 'M', 'O',
+            'n', 'o', 't', 'e', 0x01, 0x00, 0x00, 0x00, 'x', 0x00,
+        },
         writer.buffered(),
     );
 }
@@ -103,7 +109,10 @@ const riff = @import("wingman").riff;
 
 test "select one nested list" {
     var outer: riff.ChunkIterator = .{
-        .source = "LIST\x0e\x00\x00\x00INFOnote\x01\x00\x00\x00x\x00",
+        .source = &[_]u8{
+            'L', 'I', 'S', 'T', 0x0e, 0x00, 0x00, 0x00, 'I', 'N', 'F', 'O',
+            'n', 'o', 't', 'e', 0x01, 0x00, 0x00, 0x00, 'x', 0x00,
+        },
     };
     const list = try (try outer.next()).?.list();
     try std.testing.expectEqualStrings("INFO", &list.list_type);
@@ -131,8 +140,8 @@ or a truncated chunk returns an error.
 | `chunkSize` | Checked complete chunk extent, including padding |
 | `writeHeader`, `writeChunkHeader`, `writeChunk` | Checked framing through `std.Io.Writer` |
 
-`ParseError` distinguishes invalid/truncated framing from an extent that overflows the address
-space. `WriteError` combines `SizeOverflow` with the writer's `WriteFailed`. No operation implicitly
+`HeaderError` reports a header shorter than eight bytes. `ParseError` also includes `SizeOverflow`
+for an extent that cannot fit the address space. `WriteError` combines `SizeOverflow` with the writer's `WriteFailed`. No operation implicitly
 recurses, decodes media, validates every format rule or retains hidden allocation state. RF64 outer
 headers are rejected. WAVE payload decoding remains the separate `wav` library and does not accept
 RIFX. A complete immutable input span is required; fragmented input recovery is outside this API.
@@ -142,7 +151,7 @@ optional text argument changes the `note` payload: `zig build riff-example -- he
 allocates its own storage; the framing calls do not. Generate the declaration reference with
 `zig build docs`.
 Tests cover fixed independent bytes, malformed extents, cursor behavior, exact IDs and padding,
-copied/borrowed lifetimes, writer capacity and size limits. No throughput claim is made.
+copied/borrowed lifetimes, writer capacity and size limits.
 
 The format geometry follows Microsoft's
 [RIFF layout](https://learn.microsoft.com/en-us/windows/win32/xaudio2/resource-interchange-file-format--riff-)

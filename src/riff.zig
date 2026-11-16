@@ -10,8 +10,8 @@
 //!
 //! RIFF sizes are little-endian; RIFX sizes are big-endian. IDs and payload bytes are unchanged.
 //! This module does not decode media or resolve RF64 directories. See `parse` and `writeChunk` for
-//! examples using the named package. Linked declaration tests run within this module. Reference:
-//! https://learn.microsoft.com/en-us/windows/win32/multimedia/resource-interchange-file-format-services
+//! examples. Reference:
+//! https://learn.microsoft.com/windows/win32/multimedia/resource-interchange-file-format-services
 
 const std = @import("std");
 const testing = std.testing;
@@ -19,9 +19,12 @@ const testing = std.testing;
 /// Four exact bytes, including significant spaces and case. No character normalization is applied.
 pub const FourCc = [4]u8;
 
+/// A header shorter than its eight-byte ID and size fields.
+pub const HeaderError = error{InvalidRiff};
+
 /// `InvalidRiff` indicates invalid or truncated framing. `SizeOverflow` indicates a declared extent
 /// that cannot fit the selected address space.
-pub const ParseError = error{ InvalidRiff, SizeOverflow };
+pub const ParseError = HeaderError || error{SizeOverflow};
 
 /// `SizeOverflow` means a payload cannot fit its size field or address space. `WriteFailed` comes
 /// from the supplied writer and can leave a written prefix.
@@ -58,9 +61,10 @@ pub const Chunk = struct {
     byte_order: ByteOrder = .little,
 
     /// Admits a RIFF, RIFX or LIST parent and returns its copied type and bounded child region.
-    /// Child chunks inherit byte order and remain unchecked until iteration. An unrecognized ID or
-    /// payload shorter than the four-byte type returns `InvalidRiff`.
-    pub fn list(self: Chunk) ParseError!List {
+    /// Child chunks inherit byte order and remain unchecked until iteration; RIFF/RIFX IDs do not
+    /// select a new byte order. An unrecognized ID or payload shorter than the four-byte type
+    /// returns `InvalidRiff`.
+    pub fn list(self: Chunk) error{InvalidRiff}!List {
         const is_list = std.mem.eql(u8, self.id, "LIST");
         const is_riff = std.mem.eql(u8, self.id, "RIFF");
         const is_rifx = std.mem.eql(u8, self.id, "RIFX");
@@ -76,7 +80,9 @@ pub const Chunk = struct {
 };
 
 test "nested form views retain the enclosing byte order" {
-    const body = "DEMOdata\x00\x00\x00\x01x\x00";
+    const body = &[_]u8{
+        'D', 'E', 'M', 'O', 'd', 'a', 't', 'a', 0x00, 0x00, 0x00, 0x01, 'x', 0x00,
+    };
     for ([_][]const u8{ "RIFF", "RIFX", "LIST" }) |id| {
         const view = try (Chunk{ .id = id, .data = body, .byte_order = .big }).list();
         var children = view.iterator();
@@ -86,7 +92,10 @@ test "nested form views retain the enclosing byte order" {
 }
 
 test "bounded lists preserve exact IDs padding and child extents" {
-    const bytes = "LIST\x0e\x00\x00\x00INFOaBc \x01\x00\x00\x00x\xa5NEXT\x00\x00\x00\x00";
+    const bytes = &[_]u8{
+        'L',  'I',  'S',  'T',  0x0e, 0x00, 0x00, 0x00, 'I', 'N', 'F',  'O',  'a',  'B',  'c', ' ',
+        0x01, 0x00, 0x00, 0x00, 'x',  0xa5, 'N',  'E',  'X', 'T', 0x00, 0x00, 0x00, 0x00,
+    };
     var outer: ChunkIterator = .{ .source = bytes };
     const parent = (try outer.next()).?;
     const view = try parent.list();
@@ -146,7 +155,10 @@ pub const Container = struct {
 /// const riff = @import("wingman").riff;
 ///
 /// test "inspect a RIFF chunk" {
-///     const bytes = "RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00";
+///     const bytes = &[_]u8{
+///         'R', 'I', 'F', 'F', 0x0e, 0x00, 0x00, 0x00, 'D', 'E', 'M', 'O',
+///         'n', 'o', 't', 'e', 0x01, 0x00, 0x00, 0x00, 'x', 0x00,
+///     };
 ///     const form = try riff.parse(bytes);
 ///     var chunks = form.iterator();
 ///     const chunk = (try chunks.next()).?;
@@ -171,23 +183,27 @@ pub fn parse(source: []const u8) ParseError!Container {
 }
 
 test parse {
-    const checks = @import("std").testing;
-    const bytes = "RIFF\x10\x00\x00\x00WEBPVP8 \x03\x00\x00\x00abc\x00tail";
+    const bytes = &[_]u8{
+        'R',  'I',  'F',  'F', 0x10, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P', 'V', 'P', '8', ' ', 0x03,
+        0x00, 0x00, 0x00, 'a', 'b',  'c',  0x00, 't',  'a', 'i', 'l',
+    };
     const container = try parse(bytes);
-    try checks.expectEqualStrings("WEBP", &container.form_type);
-    try checks.expectEqual(24, container.source.len);
+    try testing.expectEqualStrings("WEBP", &container.form_type);
+    try testing.expectEqual(24, container.source.len);
     var chunks = container.iterator();
     const chunk = (try chunks.next()).?;
-    try checks.expectEqualStrings("VP8 ", chunk.id);
-    try checks.expectEqualStrings("abc", chunk.data);
-    try checks.expectEqual(0, chunk.padding.?);
-    try checks.expectEqual(null, try chunks.next());
+    try testing.expectEqualStrings("VP8 ", chunk.id);
+    try testing.expectEqualStrings("abc", chunk.data);
+    try testing.expectEqual(0, chunk.padding.?);
+    try testing.expectEqual(null, try chunks.next());
 }
 
 test "RIFX traversal inherits byte order through lists and preserves padding" {
-    const bytes =
-        "RIFX\x00\x00\x00\x22DEMOLIST\x00\x00\x00\x0eINFOxtra\x00\x00\x00\x01z\xa5ZERO\x00\x00" ++
-        "\x00\x00";
+    const bytes = &[_]u8{
+        'R',  'I',  'F',  'X',  0x00, 0x00, 0x00, 0x22, 'D',  'E',  'M',  'O',  'L', 'I',  'S',
+        'T',  0x00, 0x00, 0x00, 0x0e, 'I',  'N',  'F',  'O',  'x',  't',  'r',  'a', 0x00, 0x00,
+        0x00, 0x01, 'z',  0xa5, 'Z',  'E',  'R',  'O',  0x00, 0x00, 0x00, 0x00,
+    };
     const form = try parse(bytes);
     try testing.expectEqual(.big, form.byte_order);
     var chunks = form.iterator();
@@ -204,7 +220,10 @@ test "RIFX traversal inherits byte order through lists and preserves padding" {
 }
 
 test "RIFF outer admission leaves malformed children lazy and trailing bytes outside" {
-    const bytes = "RIFF\x05\x00\x00\x00TESTxignored";
+    const bytes = &[_]u8{
+        'R', 'I', 'F', 'F', 0x05, 0x00, 0x00, 0x00, 'T', 'E', 'S', 'T', 'x', 'i', 'g', 'n', 'o',
+        'r', 'e', 'd',
+    };
     const form = try parse(bytes);
     try testing.expectEqualStrings("TEST", &form.form_type);
     try testing.expectEqual(13, form.source.len);
@@ -214,23 +233,25 @@ test "RIFF outer admission leaves malformed children lazy and trailing bytes out
     for (0..form.source.len) |cut| {
         try testing.expectError(error.InvalidRiff, parse(bytes[0..cut]));
     }
-    try testing.expectError(error.InvalidRiff, parse("RF64\x04\x00\x00\x00TEST"));
+    try testing.expectError(
+        error.InvalidRiff,
+        parse(&[_]u8{ 'R', 'F', '6', '4', 0x04, 0x00, 0x00, 0x00, 'T', 'E', 'S', 'T' }),
+    );
 }
 
 /// Reads copied ID and size fields in the supplied byte order; does not admit the payload extent.
 /// Returns `InvalidRiff` when fewer than eight header bytes are available.
-pub fn readHeader(source: []const u8, byte_order: ByteOrder) ParseError!ChunkHeader {
+pub fn readHeader(source: []const u8, byte_order: ByteOrder) HeaderError!ChunkHeader {
     if (source.len < 8) return error.InvalidRiff;
     return .{ .id = source[0..4].*, .size = std.mem.readInt(u32, source[4..8], byte_order) };
 }
 
 test readHeader {
-    const checks = @import("std").testing;
     var bytes = [_]u8{ 0, 0xff, ' ', 'a', 0x78, 0x56, 0x34, 0x12 };
     const header = try readHeader(&bytes, .little);
     @memset(&bytes, 0);
-    try checks.expectEqual(FourCc{ 0, 0xff, ' ', 'a' }, header.id);
-    try checks.expectEqual(0x12345678, header.size);
+    try testing.expectEqual(FourCc{ 0, 0xff, ' ', 'a' }, header.id);
+    try testing.expectEqual(0x12345678, header.size);
 }
 
 /// One bounded traversal of borrowed child bytes. Obtain it from a container or list, or initialize
@@ -280,13 +301,19 @@ pub const ChunkIterator = struct {
 };
 
 test "truncated and resolved chunk extents refuse without advancing" {
-    const malformed = [_][]const u8{ "x", "ABCD\x02\x00\x00\x00x", "ABCD\x01\x00\x00\x00x" };
+    const malformed = [_][]const u8{
+        "x",
+        &[_]u8{ 'A', 'B', 'C', 'D', 0x02, 0x00, 0x00, 0x00, 'x' },
+        &[_]u8{ 'A', 'B', 'C', 'D', 0x01, 0x00, 0x00, 0x00, 'x' },
+    };
     for (malformed) |bytes| {
         var chunks: ChunkIterator = .{ .source = bytes };
         try testing.expectError(error.InvalidRiff, chunks.next());
         try testing.expectEqual(0, chunks.offset);
     }
-    var resolved: ChunkIterator = .{ .source = "ABCD\xff\xff\xff\xffx\x00" };
+    var resolved: ChunkIterator = .{
+        .source = &[_]u8{ 'A', 'B', 'C', 'D', 0xff, 0xff, 0xff, 0xff, 'x', 0x00 },
+    };
     try testing.expectError(error.SizeOverflow, resolved.nextResolved(std.math.maxInt(u64)));
     try testing.expectEqual(0, resolved.offset);
     try testing.expectEqualStrings("x", (try resolved.nextResolved(1)).?.data);
@@ -294,7 +321,10 @@ test "truncated and resolved chunk extents refuse without advancing" {
 }
 
 test "RIFF borrowed chunks survive independent iterator advancement" {
-    const bytes = "aBc \x01\x00\x00\x00x\xa5ZERO\x00\x00\x00\x00";
+    const bytes = &[_]u8{
+        'a',  'B',  'c', ' ', 0x01, 0x00, 0x00, 0x00, 'x', 0xa5, 'Z', 'E', 'R', 'O', 0x00, 0x00,
+        0x00, 0x00,
+    };
     var chunks: ChunkIterator = .{ .source = bytes };
     var independent = chunks;
     const first = (try chunks.next()).?;
@@ -313,7 +343,7 @@ test "RIFF borrowed chunks survive independent iterator advancement" {
 }
 
 test "RIFF externally resolved lengths preserve the failed cursor and exact end" {
-    const bytes = "data\xff\xff\xff\xffx\x00";
+    const bytes = &[_]u8{ 'd', 'a', 't', 'a', 0xff, 0xff, 0xff, 0xff, 'x', 0x00 };
     var chunks: ChunkIterator = .{ .source = bytes };
     try testing.expectError(error.InvalidRiff, chunks.nextResolved(3));
     try testing.expectEqual(0, chunks.offset);
@@ -376,7 +406,9 @@ pub fn writeChunkHeader(
 ///     var bytes: [10]u8 = undefined;
 ///     var writer: std.Io.Writer = .fixed(&bytes);
 ///     try riff.writeChunk("note".*, "x", &writer, .{});
-///     try std.testing.expectEqualStrings("note\x01\x00\x00\x00x\x00", writer.buffered());
+///     try std.testing.expectEqualSlices(u8, &[_]u8{
+///         'n', 'o', 't', 'e', 0x01, 0x00, 0x00, 0x00, 'x', 0x00,
+///     }, writer.buffered());
 /// }
 /// ```
 pub fn writeChunk(
@@ -391,12 +423,14 @@ pub fn writeChunk(
 }
 
 test writeChunk {
-    const zig = @import("std");
-    const checks = zig.testing;
     var bytes: [10]u8 = undefined;
-    var writer: zig.Io.Writer = .fixed(&bytes);
+    var writer: std.Io.Writer = .fixed(&bytes);
     try writeChunk("note".*, "x", &writer, .{});
-    try checks.expectEqualStrings("note\x01\x00\x00\x00x\x00", writer.buffered());
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{ 'n', 'o', 't', 'e', 0x01, 0x00, 0x00, 0x00, 'x', 0x00 },
+        writer.buffered(),
+    );
 }
 
 test "RIFX writers emit big-endian sizes and reject truncated children" {
@@ -405,15 +439,28 @@ test "RIFX writers emit big-endian sizes and reject truncated children" {
     const options: WriteOptions = .{ .byte_order = .big };
     try writeHeader("DEMO".*, try chunkSize(1), &writer, options);
     try writeChunk("note".*, "x", &writer, options);
-    try testing.expectEqualStrings("RIFX\x00\x00\x00\x0eDEMOnote\x00\x00\x00\x01x\x00", &bytes);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            'R',  'I',  'F',  'X',  0x00, 0x00, 0x00, 0x0e, 'D', 'E', 'M', 'O', 'n', 'o', 't', 'e',
+            0x00, 0x00, 0x00, 0x01, 'x',  0x00,
+        },
+        &bytes,
+    );
     const header = try readHeader(bytes[12..], .big);
     try testing.expectEqual(1, header.size);
     var chunks = (try parse(&bytes)).iterator();
     try testing.expectEqualStrings("x", (try chunks.next()).?.data);
-    var truncated: ChunkIterator = .{ .source = "note\x00\x00\x00\x01x", .byte_order = .big };
+    var truncated: ChunkIterator = .{
+        .source = &[_]u8{ 'n', 'o', 't', 'e', 0x00, 0x00, 0x00, 0x01, 'x' },
+        .byte_order = .big,
+    };
     try testing.expectError(error.InvalidRiff, truncated.next());
     try testing.expectEqual(0, truncated.offset);
-    var resolved: ChunkIterator = .{ .source = "note\xff\xff\xff\xffx\x00", .byte_order = .big };
+    var resolved: ChunkIterator = .{
+        .source = &[_]u8{ 'n', 'o', 't', 'e', 0xff, 0xff, 0xff, 0xff, 'x', 0x00 },
+        .byte_order = .big,
+    };
     const is_32_bit = @sizeOf(usize) == 4;
     const oversized_error: ParseError = if (is_32_bit) error.SizeOverflow else error.InvalidRiff;
     try testing.expectError(oversized_error, resolved.next());
@@ -450,16 +497,32 @@ test "headers and writing share checked RIFF framing" {
     var writer = std.Io.Writer.fixed(&output);
     try writeHeader("TEST".*, try chunkSize(1), &writer, .{});
     try writeChunk("raw ".*, "x", &writer, .{});
-    try testing.expectEqualStrings("RIFF\x0e\x00\x00\x00TESTraw \x01\x00\x00\x00x\x00", &output);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            'R',  'I',  'F',  'F',  0x0e, 0x00, 0x00, 0x00, 'T', 'E', 'S', 'T', 'r', 'a', 'w', ' ',
+            0x01, 0x00, 0x00, 0x00, 'x',  0x00,
+        },
+        &output,
+    );
     const form = try parse(&output);
     var chunks = form.iterator();
     const chunk = (try chunks.next()).?;
     try testing.expectEqualStrings("raw ", chunk.id);
     try testing.expectEqualStrings("x", chunk.data);
     try testing.expectEqual(0, chunk.padding.?);
-    try testing.expectError(error.InvalidRiff, parse("RIFF\x03\x00\x00\x00TEST"));
-    try testing.expectError(error.InvalidRiff, parse("RIFF\x05\x00\x00\x00TEST"));
-    try testing.expectError(error.InvalidRiff, parse("RIFX\x00\x00\x00\x03TEST"));
+    try testing.expectError(
+        error.InvalidRiff,
+        parse(&[_]u8{ 'R', 'I', 'F', 'F', 0x03, 0x00, 0x00, 0x00, 'T', 'E', 'S', 'T' }),
+    );
+    try testing.expectError(
+        error.InvalidRiff,
+        parse(&[_]u8{ 'R', 'I', 'F', 'F', 0x05, 0x00, 0x00, 0x00, 'T', 'E', 'S', 'T' }),
+    );
+    try testing.expectError(
+        error.InvalidRiff,
+        parse(&[_]u8{ 'R', 'I', 'F', 'X', 0x00, 0x00, 0x00, 0x03, 'T', 'E', 'S', 'T' }),
+    );
 }
 
 test "RIFF and RIFX fixed writer failures preserve guards and an honest output prefix" {
@@ -467,9 +530,18 @@ test "RIFF and RIFX fixed writer failures preserve guards and an honest output p
         bytes: []const u8,
         options: WriteOptions,
     }{
-        .{ .bytes = "RIFF\x0e\x00\x00\x00TESTnote\x01\x00\x00\x00x\x00", .options = .{} },
         .{
-            .bytes = "RIFX\x00\x00\x00\x0eTESTnote\x00\x00\x00\x01x\x00",
+            .bytes = &[_]u8{
+                'R', 'I',  'F',  'F',  0x0e, 0x00, 0x00, 0x00, 'T', 'E', 'S', 'T', 'n', 'o', 't',
+                'e', 0x01, 0x00, 0x00, 0x00, 'x',  0x00,
+            },
+            .options = .{},
+        },
+        .{
+            .bytes = &[_]u8{
+                'R', 'I',  'F',  'X',  0x00, 0x00, 0x00, 0x0e, 'T', 'E', 'S', 'T', 'n', 'o', 't',
+                'e', 0x00, 0x00, 0x00, 0x01, 'x',  0x00,
+            },
             .options = .{ .byte_order = .big },
         },
     };

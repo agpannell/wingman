@@ -823,7 +823,10 @@ test "WAVE chunk inspection and inline std.Io conversion use the public namespac
 }
 
 test "RIFF borrowed chunks and externally resolved geometry" {
-    const bytes = "RIFF\x0e\x00\x00\x00TESTdata\x01\x00\x00\x00x\xa5tail";
+    const bytes = &[_]u8{
+        'R',  'I',  'F',  'F', 0x0e, 0x00, 0x00, 0x00, 'T', 'E', 'S', 'T', 'd', 'a', 't', 'a', 0x01,
+        0x00, 0x00, 0x00, 'x', 0xa5, 't',  'a',  'i',  'l',
+    };
     const form = try riff.parse(bytes);
     try std.testing.expectEqualStrings("TEST", &form.form_type);
     try std.testing.expectEqual(22, form.source.len);
@@ -833,7 +836,9 @@ test "RIFF borrowed chunks and externally resolved geometry" {
     try std.testing.expectEqualStrings("x", chunk.data);
     try std.testing.expectEqual(0xa5, chunk.padding.?);
     try std.testing.expectEqual(null, try chunks.next());
-    var resolved: riff.ChunkIterator = .{ .source = "data\xff\xff\xff\xffx\x00" };
+    var resolved: riff.ChunkIterator = .{
+        .source = &[_]u8{ 'd', 'a', 't', 'a', 0xff, 0xff, 0xff, 0xff, 'x', 0x00 },
+    };
     try std.testing.expectError(error.InvalidRiff, resolved.nextResolved(3));
     try std.testing.expectEqual(0, resolved.offset);
     try std.testing.expectEqualStrings("x", (try resolved.nextResolved(1)).?.data);
@@ -844,8 +849,19 @@ test "RIFF writer literal bytes and lazy nested lists" {
     var writer: std.Io.Writer = .fixed(&bytes);
     try riff.writeHeader("DEMO".*, try riff.chunkSize(1), &writer, .{});
     try riff.writeChunk("note".*, "x", &writer, .{});
-    try std.testing.expectEqualStrings("RIFF\x0e\x00\x00\x00DEMOnote\x01\x00\x00\x00x\x00", &bytes);
-    var outer: riff.ChunkIterator = .{ .source = "LIST\x05\x00\x00\x00INFOx\x00" };
+    try std.testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            'R',  'I',  'F',  'F',  0x0e, 0x00, 0x00, 0x00, 'D', 'E', 'M', 'O', 'n', 'o', 't', 'e',
+            0x01, 0x00, 0x00, 0x00, 'x',  0x00,
+        },
+        &bytes,
+    );
+    var outer: riff.ChunkIterator = .{
+        .source = &[_]u8{
+            'L', 'I', 'S', 'T', 0x05, 0x00, 0x00, 0x00, 'I', 'N', 'F', 'O', 'x', 0x00,
+        },
+    };
     const list = try (try outer.next()).?.list();
     try std.testing.expectEqualStrings("INFO", &list.list_type);
     var children = list.iterator();
