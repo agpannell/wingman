@@ -16,7 +16,7 @@ Use [Zig 0.17.0 and the package setup](../README.md#use-it-in-a-project). From a
 
 ## Describe the blocks
 
-`Format` is a value passed to each operation. It retains no resource:
+`Format` is a value passed to each operation. It owns no storage:
 
 | Field | Meaning |
 | --- | --- |
@@ -41,14 +41,17 @@ Use the empty default for ordinary IMA input.
 
 | API | Result |
 | --- | --- |
-| `frameCount(byte_count, format)` | Whole decoded frame count after geometry/extent checks |
+| `format.validate()` | Block geometry and coefficient-table extent, without data |
+| `format.frameCount(byte_count)` | Whole decoded frame count after geometry/extent checks |
 | `decodeInto(source, destination, format)` | All frames, returned as the used `[]f32` prefix |
 | `decodePrefixInto(source, destination, frames, format)` | Requested whole-frame prefix, after validating all input |
 | `DecodeError` | `InvalidFormat`, `InvalidData`, `SizeOverflow`, `DestinationTooSmall` or `Aliasing` |
 
-`frameCount` does not read source or predictor headers. A successful count is useful for sizing
-output, but does not prove that the blocks decode. Its errors are `InvalidFormat`, `InvalidData`
-and `SizeOverflow`. An empty source still requires a valid `Format` and produces no samples.
+Use `format.validate()` to admit block geometry before data is available. It returns `Format.Error`:
+`InvalidFormat` or `SizeOverflow`. `format.frameCount(byte_count)` also checks complete-block extent
+and returns `Format.CountError`, adding `InvalidData`. Neither operation reads source or predictor
+headers. A successful count is useful for sizing output, but does not prove that the blocks decode.
+An empty source still requires a valid `Format` and produces no samples.
 
 ```zig
 const std = @import("std");
@@ -61,8 +64,8 @@ test "count complete IMA blocks" {
         .block_bytes = 8,
         .frames_per_block = 9,
     };
-    try std.testing.expectEqual(18, try adpcm.frameCount(16, format));
-    try std.testing.expectError(error.InvalidData, adpcm.frameCount(15, format));
+    try std.testing.expectEqual(18, try format.frameCount(16));
+    try std.testing.expectError(error.InvalidData, format.frameCount(15));
 }
 ```
 
@@ -185,6 +188,11 @@ The WAVE library reads ADPCM and its `fact` frame count, but its writer currentl
 encoding raw blocks here does not create an ADPCM WAVE file. Some external readers ignore a
 container's frame count and expose the padded frames.
 
+`Format.Encoding` selects the block layout. `EncodeOptions.Strategy` and `EncodeOptions.Tail`
+select encoder work and final-block treatment. Float encoding returns `EncodeError`; PCM16
+encoding returns `EncodeI16Error`, which omits `InvalidSamples` because every `i16` value is valid.
+Both include the format/count errors, capacity refusal and overlap refusal.
+
 ## Decoding ownership and failure
 
 Operations allocate nothing and retain no input, coefficient table, output or scheduler. Keep
@@ -225,5 +233,4 @@ Inline tests cover literal mono/stereo results, signed prediction, unsigned delt
 all tested prefix boundaries, omitted failures, storage admission and empty-input count limits.
 
 Three-bit DVI, other ADPCM block layouts, more than two channels, containers, resampling,
-playback and packet handling are outside this library's current surface. No throughput claim is
-made by the examples or contract tests.
+playback and packet handling are outside this library's current surface.

@@ -21,34 +21,29 @@ const builtin = @import("builtin");
 const riff = @import("riff.zig");
 const lpcm = @import("lpcm.zig");
 const allocation = @import("common/allocation.zig");
-const container = @import("wav/container.zig");
-const format = @import("wav/format.zig");
-const parallel = @import("wav/parallel.zig");
+const sample_decode = @import("wav/sample_decode.zig");
 const testing = std.testing;
 const fixtures = @import("wav/fixtures.zig");
 
-pub const Container = container.Container;
-pub const ChunkIterator = container.ChunkIterator;
-pub const ChunkIndexEntry = container.ChunkIndexEntry;
-pub const Rf64Sizes = container.Rf64Sizes;
-pub const parse = container.parse;
-pub const ParseError = container.ParseError;
-pub const Channels = format.Channels;
-pub const Format = format.Format;
-pub const Encoding = format.Encoding;
-pub const parseFormat = format.parseFormat;
-pub const frameCount = format.frameCount;
-pub const FormatError = format.FormatError;
-pub const Worker = parallel.Worker;
-pub const ParallelOptions = parallel.ParallelOptions;
+pub const Container = @import("wav/Container.zig");
+pub const Format = @import("wav/Format.zig");
+pub const Audio = @import("wav/Audio.zig");
+pub const Channels = Format.Channels;
+pub const DecodeWorker = sample_decode.DecodeWorker;
+pub const ParallelOptions = sample_decode.ParallelOptions;
 
-/// Malformed or unsupported WAVE, sample/size failure, or insufficient/aliased caller storage.
-pub const DecodeError = ParseError || FormatError || parallel.ConversionError || error{
-    DestinationTooSmall,
+/// Malformed/unsupported WAVE or geometry overflow, plus directory storage refusal.
+pub const DecodeRequirementsError = Container.Iterator.InitError || Format.Error || Format
+    .CountError;
+
+/// Complete-file decoding also rejects invalid sample values and insufficient sample capacity.
+pub const DecodeError = DecodeRequirementsError || error{ InvalidSamples, DestinationTooSmall };
+
+/// Allocating decode reports content/size failures, allocation exhaustion or source overlap with
+/// allocated directory storage. Partial ownership is released on error.
+pub const DecodeAllocError = Format.Error || DecodeWorker.Error || std.mem.Allocator.Error || error{
+    Aliasing,
 };
-
-/// Allocating decode also reports allocation exhaustion. Partial ownership is released on error.
-pub const DecodeAllocError = DecodeError || std.mem.Allocator.Error;
 
 /// Cancellation ends every work borrow before return; caller output remains unpublished on error.
 pub const ParallelDecodeError = DecodeError || std.Io.Cancelable;
@@ -56,72 +51,41 @@ pub const ParallelDecodeError = DecodeError || std.Io.Cancelable;
 /// Allocating parallel decode combines source/storage failures, exhaustion and cancellation.
 pub const ParallelDecodeAllocError = DecodeAllocError || std.Io.Cancelable;
 
-/// Invalid rate/layout/samples, unrepresentable PCM16 RIFF output or caller storage refusal.
-pub const EncodeError = error{
+/// Invalid rate/layout/samples or unrepresentable PCM16 RIFF output.
+pub const EncodeRequirementsError = error{
     InvalidSamples,
     SizeOverflow,
-    DestinationTooSmall,
-    Aliasing,
     InvalidRate,
     UnsupportedWave,
 };
 
-/// Borrowed interleaved audio. Samples remain owned by their source reservation; metadata is
-/// copied. Null speaker mask means ordinary WAVE metadata; a zero mask means unspecified
-/// assignments.
-pub const AudioView = struct {
-    sample_rate: u32,
-    channels: Channels,
-    samples: []const f32,
-    channel_mask: ?u32 = null,
-};
-
-/// Owns naturally aligned interleaved samples independently of encoded source and scratch. The
-/// complete byte owner includes alignment padding. Copies share ownership; release it exactly once
-/// with the original allocator after all sample borrows retire. No allocator is retained.
-pub const Audio = struct {
-    sample_rate: u32,
-    channels: Channels,
-    samples: []f32,
-    allocation: []u8,
-    channel_mask: ?u32 = null,
-
-    /// Borrows immutable samples and copied metadata until this owner is modified or released.
-    pub fn view(self: Audio) AudioView {
-        return .{
-            .sample_rate = self.sample_rate,
-            .channels = self.channels,
-            .samples = self.samples,
-            .channel_mask = self.channel_mask,
-        };
-    }
-
-    /// Releases the complete reservation, including padding, and invalidates every sample borrow.
-    pub fn deinit(self: *Audio, allocator: std.mem.Allocator) void {
-        allocator.free(self.allocation);
-        self.* = undefined;
-    }
-};
+/// Caller-buffer encoding also rejects insufficient or aliased output.
+pub const EncodeError = EncodeRequirementsError || error{ DestinationTooSmall, Aliasing };
 
 /// Complete-file geometry, not proof that encoded sample/block contents are valid. Format metadata
 /// is copied except Microsoft coefficient bytes, which borrow the source until conversion retires.
 pub const DecodeRequirements = struct {
+    /// Admitted codec and source metadata; Microsoft coefficients still borrow the source.
     format: Format,
+    /// Decoded frames after applying any ADPCM fact prefix.
     frames: usize,
+    /// Interleaved sample values, equal to frames times the channel count.
     samples: usize,
+    /// Bytes for exactly samples f32 values, excluding any allocation alignment padding.
     sample_bytes: usize,
+    /// RF64 index entries required for each active container pass.
     directory_entries: usize,
 };
 
 /// Inspects the complete container, format and data geometry, including global ADPCM fact trimming.
-/// Reserve parse(source).scratchCount() directory entries first; scratch is exclusive to each pass.
-/// Unknown chunks are skipped and data may precede fmt. Samples and predictor state remain
-/// unchecked.
+/// Reserve Container.parse(source).scratchCount() directory entries first; scratch is exclusive to
+/// each pass. Unknown chunks are skipped and data may precede fmt. Samples and predictor state
+/// remain unchecked.
 pub fn decodeRequirements(
     source: []const u8,
-    directory_index: []ChunkIndexEntry,
-) DecodeError!DecodeRequirements {
-    const view = try parse(source);
+    directory_index: []Container.Iterator.IndexEntry,
+) DecodeRequirementsError!DecodeRequirements {
+    const view = try Container.parse(source);
     var chunks = try view.iterator(directory_index);
     return inspectDataChunks(&chunks, null);
 }
@@ -136,9 +100,11 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, source: []const u8) DecodeAlloc
 
 test decodeAlloc {
     var bytes: [56]u8 = undefined;
-    const source: AudioView = .{ .sample_rate = 48000, .channels = .stereo, .samples = &.{
-        -1, 1, -0.5, 0.5, 0, 0.25,
-    } };
+    const source: Audio.View = .{
+        .sample_rate = 48000,
+        .channels = .stereo,
+        .samples = &.{ -1, 1, -0.5, 0.5, 0, 0.25 },
+    };
     const encoded = try encodePcm16Into(source, &bytes);
     var audio = try decodeAlloc(testing.allocator, encoded);
     defer audio.deinit(testing.allocator);
@@ -147,32 +113,32 @@ test decodeAlloc {
 }
 
 /// Decodes into a used caller sample prefix without allocating. Directory scratch comes from
-/// parse(source).scratchCount(). Source, destination and used scratch must be disjoint. Capacity
-/// and alias refusals precede output writes; content errors can leave partial unpublished samples.
-/// The returned view survives scratch retirement and borrows only destination storage. Wide integer
-/// PCM conversion may depend on the calling thread's floating-point environment.
+/// Container.parse(source).scratchCount(). Source, destination and used scratch must be disjoint.
+/// Capacity and alias refusals precede output writes; content errors can leave partial unpublished
+/// samples. The returned view survives scratch retirement and borrows only destination storage.
+/// Wide integer PCM conversion may depend on the calling thread's floating-point environment.
 pub fn decodeInto(
     source: []const u8,
     destination: []f32,
-    directory_index: []ChunkIndexEntry,
-) DecodeError!AudioView {
-    const view = try parse(source);
+    directory_index: []Container.Iterator.IndexEntry,
+) DecodeError!Audio.View {
+    const view = try Container.parse(source);
     try admitStorage(view, destination, directory_index, &.{});
     var chunks = try view.iterator(directory_index);
     var single_data: SingleData = .{};
     const requirements = try inspectDataChunks(
         &chunks,
-        if (view.rf64_sizes == null) &single_data else null,
+        if (view.rf64 == null) &single_data else null,
     );
     if (destination.len < requirements.samples) return error.DestinationTooSmall;
     const output = destination[0..requirements.samples];
     if (single_data.admitted) {
         const data = single_data.bytes.?;
         if (data.len != 0) {
-            try @call(.never_inline, parallel.convert, .{ requirements.format, data, output });
+            try @call(.never_inline, sample_decode.convert, .{ requirements.format, data, output });
         }
     } else {
-        container.restart(&chunks);
+        chunks.restart();
         try decodeDataChunks(false, undefined, &chunks, requirements.format, output, &.{}, .{});
     }
     return audioView(requirements.format, output);
@@ -180,9 +146,13 @@ pub fn decodeInto(
 
 test decodeInto {
     var encoded: [48]u8 = undefined;
-    const source: AudioView = .{ .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 0.5 } };
+    const source: Audio.View = .{
+        .sample_rate = 8000,
+        .channels = .mono,
+        .samples = &.{ -1, 0.5 },
+    };
     const bytes = try encodePcm16Into(source, &encoded);
-    const container_view = try parse(bytes);
+    const container_view = try Container.parse(bytes);
     // Ordinary RIFF has no RF64 directory, so this example needs no index entries.
     try testing.expectEqual(0, container_view.scratchCount());
     const required = try decodeRequirements(bytes, &.{});
@@ -200,7 +170,7 @@ pub fn decodeParallelAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
     source: []const u8,
-    workers: []Worker,
+    workers: []DecodeWorker,
     options: ParallelOptions,
 ) ParallelDecodeAllocError!Audio {
     if (spans.overlaps(source, std.mem.sliceAsBytes(workers))) return error.Aliasing;
@@ -213,11 +183,13 @@ test decodeParallelAlloc {
     var provider = std.Io.Threaded.init(allocator, .{ .async_limit = .limited(3) });
     defer provider.deinit();
     var bytes: [56]u8 = undefined;
-    const source: AudioView = .{ .sample_rate = 48000, .channels = .stereo, .samples = &.{
-        -1, 1, -0.5, 0.5, 0, 0.25,
-    } };
+    const source: Audio.View = .{
+        .sample_rate = 48000,
+        .channels = .stereo,
+        .samples = &.{ -1, 1, -0.5, 0.5, 0, 0.25 },
+    };
     const encoded = try encodePcm16Into(source, &bytes);
-    var workers: [4]Worker = undefined;
+    var workers: [4]DecodeWorker = undefined;
     var audio = try decodeParallelAlloc(allocator, provider.io(), encoded, &workers, .{});
     defer audio.deinit(allocator);
     try testing.expectEqual(6, audio.samples.len);
@@ -231,25 +203,25 @@ pub fn decodeParallelInto(
     io: std.Io,
     source: []const u8,
     destination: []f32,
-    directory_index: []ChunkIndexEntry,
-    workers: []Worker,
+    directory_index: []Container.Iterator.IndexEntry,
+    workers: []DecodeWorker,
     options: ParallelOptions,
-) ParallelDecodeError!AudioView {
-    const view = try parse(source);
+) ParallelDecodeError!Audio.View {
+    const view = try Container.parse(source);
     try admitStorage(view, destination, directory_index, workers);
     var chunks = try view.iterator(directory_index);
     const requirements = try inspectDataChunks(&chunks, null);
     if (destination.len < requirements.samples) return error.DestinationTooSmall;
     const output = destination[0..requirements.samples];
-    container.restart(&chunks);
+    chunks.restart();
     try decodeDataChunks(true, io, &chunks, requirements.format, output, workers, options);
     return audioView(requirements.format, output);
 }
 
-fn audioView(info: Format, samples: []const f32) AudioView {
+fn audioView(info: Format, samples: []const f32) Audio.View {
     return .{
         .sample_rate = info.sample_rate,
-        .channels = info.channels,
+        .channels = info.channels(),
         .samples = samples,
         .channel_mask = info.channel_mask,
     };
@@ -258,9 +230,9 @@ fn audioView(info: Format, samples: []const f32) AudioView {
 fn admitStorage(
     view: Container,
     destination: []f32,
-    directory_index: []ChunkIndexEntry,
-    workers: []Worker,
-) DecodeError!void {
+    directory_index: []Container.Iterator.IndexEntry,
+    workers: []DecodeWorker,
+) Container.Iterator.InitError!void {
     const entries = view.scratchCount();
     if (directory_index.len < entries) return error.InsufficientScratch;
     const index_bytes = std.mem.sliceAsBytes(directory_index[0..entries]);
@@ -286,14 +258,17 @@ fn decodeOwned(
     allocator: std.mem.Allocator,
     io: std.Io,
     source: []const u8,
-    workers: []Worker,
+    workers: []DecodeWorker,
     options: ParallelOptions,
 ) (if (scheduled) ParallelDecodeAllocError else DecodeAllocError)!Audio {
-    const view = try parse(source);
+    const view = try Container.parse(source);
     const requirements = blk: {
-        const index = try allocator.alloc(ChunkIndexEntry, view.scratchCount());
+        const index = try allocator.alloc(Container.Iterator.IndexEntry, view.scratchCount());
         defer allocator.free(index);
-        var chunks = try view.iterator(index);
+        var chunks = view.iterator(index) catch |err| switch (err) {
+            error.InsufficientScratch => unreachable, // The allocator supplied the exact count.
+            error.Aliasing => return error.Aliasing,
+        };
         break :blk try inspectDataChunks(&chunks, null);
     };
     const owner = try allocation.AlignedAllocation(
@@ -302,9 +277,12 @@ fn decodeOwned(
     errdefer allocator.free(owner.storage);
     // Retire inspection scratch before samples exist, then reacquire conversion scratch above them.
     // This order lets a tail-reclaiming allocator free both the index and all sample padding.
-    const index = try allocator.alloc(ChunkIndexEntry, view.scratchCount());
+    const index = try allocator.alloc(Container.Iterator.IndexEntry, view.scratchCount());
     defer allocator.free(index);
-    var chunks = try view.iterator(index);
+    var chunks = view.iterator(index) catch |err| switch (err) {
+        error.InsufficientScratch => unreachable, // The allocator supplied the exact count.
+        error.Aliasing => return error.Aliasing,
+    };
     try decodeDataChunks(
         scheduled,
         io,
@@ -316,7 +294,7 @@ fn decodeOwned(
     );
     return .{
         .sample_rate = requirements.format.sample_rate,
-        .channels = requirements.format.channels,
+        .channels = requirements.format.channels(),
         .samples = owner.samples,
         .allocation = owner.storage,
         .channel_mask = requirements.format.channel_mask,
@@ -331,10 +309,10 @@ const SingleData = struct {
 };
 
 fn inspectDataChunks(
-    chunks: *ChunkIterator,
+    chunks: *Container.Iterator,
     single_data: ?*SingleData,
-) DecodeError!DecodeRequirements {
-    const view = chunks.view;
+) (Format.Error || Format.CountError)!DecodeRequirements {
+    const view = chunks.container;
     var format_bytes: ?[]const u8 = null;
     var fact_frames: ?u32 = null;
     var saw_data = false;
@@ -356,56 +334,50 @@ fn inspectDataChunks(
             fact_frames = std.mem.readInt(u32, chunk.data[0..4], .little);
         }
     }
-    const info = try parseFormat(format_bytes orelse return error.InvalidWave);
+    const info = try Format.parse(format_bytes orelse return error.InvalidWave);
     if (!saw_data) return error.InvalidWave;
     const complete = complete: {
         if (single_data) |single| {
-            if (!single.multiple and (info.encoding == .g711_alaw or info.encoding ==
-                .g711_mulaw))
-            {
+            if (!single.multiple and info.encoding == .g711) {
                 const data = single.bytes.?;
-                const frames = try frameCount(info, data.len);
-                const samples = std.math.mul(
-                    usize,
-                    frames,
-                    @backingInt(info.channels),
-                ) catch return error.SizeOverflow;
+                // G.711 stores one byte per sample; first admit complete channel frames.
+                _ = try info.frameCount(data.len);
                 single.admitted = true;
-                break :complete samples;
+                break :complete data.len;
             }
         }
-        container.restart(chunks);
+        chunks.restart();
         break :complete try countDataSamples(chunks, info);
     };
     const count: usize = blk: {
-        if (info.encoding != .ima_adpcm and info.encoding != .ms_adpcm) break :blk complete;
+        if (info.encoding != .adpcm) break :blk complete;
         const fact = fact_frames orelse break :blk complete;
         const frames: u64 = if (fact == std.math.maxInt(
             u32,
-        ) and view.rf64_sizes != null) view.rf64_sizes.?.sample_count else fact;
-        const channels: usize = @backingInt(info.channels);
+        ) and view.rf64 != null) view.rf64.?.frame_count else fact;
+        const channels: usize = @backingInt(info.channels());
         if (frames > complete / channels) return error.InvalidWave;
         break :blk @as(usize, @intCast(frames)) * channels;
     };
     const bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.SizeOverflow;
     return .{
         .format = info,
-        .frames = count / @as(usize, @backingInt(info.channels)),
+        .frames = count / @as(usize, @backingInt(info.channels())),
         .samples = count,
         .sample_bytes = bytes,
         .directory_entries = view.scratchCount(),
     };
 }
 
-fn countDataSamples(chunks: *ChunkIterator, info: Format) DecodeError!usize {
+fn countDataSamples(chunks: *Container.Iterator, info: Format) Format.CountError!usize {
     var count: usize = 0;
     while (try chunks.next()) |chunk| {
         if (std.mem.eql(u8, chunk.id, "data")) {
-            const frames = try frameCount(info, chunk.data.len);
+            const frames = try info.frameCount(chunk.data.len);
             const samples = std.math.mul(
                 usize,
                 frames,
-                @backingInt(info.channels),
+                @backingInt(info.channels()),
             ) catch return error.SizeOverflow;
             count = std.math.add(usize, count, samples) catch return error.SizeOverflow;
         }
@@ -416,21 +388,21 @@ fn countDataSamples(chunks: *ChunkIterator, info: Format) DecodeError!usize {
 fn decodeDataChunks(
     comptime scheduled: bool,
     io: std.Io,
-    chunks: *ChunkIterator,
+    chunks: *Container.Iterator,
     info: Format,
     samples: []f32,
-    workers: []Worker,
+    workers: []DecodeWorker,
     options: ParallelOptions,
-) (if (scheduled) ParallelDecodeError else DecodeError)!void {
+) (if (scheduled) sample_decode.ParallelError else DecodeWorker.Error)!void {
     var offset: usize = 0;
     while (try chunks.next()) |chunk| {
         if (std.mem.eql(u8, chunk.id, "data")) {
             if (chunk.data.len == 0) continue;
-            const frames = try frameCount(info, chunk.data.len);
+            const frames = try info.frameCount(chunk.data.len);
             const count = std.math.mul(
                 usize,
                 frames,
-                @backingInt(info.channels),
+                @backingInt(info.channels()),
             ) catch return error.SizeOverflow;
             const complete_end = std.math.add(usize, offset, count) catch return error.SizeOverflow;
             const end = @min(complete_end, samples.len);
@@ -439,13 +411,13 @@ fn decodeDataChunks(
             if (scheduled) {
                 try @call(
                     .never_inline,
-                    parallel.convertParallel,
+                    sample_decode.convertParallel,
                     .{ io, info, chunk.data, samples[offset..end], workers, options },
                 );
             } else {
                 try @call(
                     .never_inline,
-                    parallel.convert,
+                    sample_decode.convert,
                     .{ info, chunk.data, samples[offset..end] },
                 );
             }
@@ -457,7 +429,7 @@ fn decodeDataChunks(
 
 /// Returns complete PCM16 RIFF output bytes after validating rate, mono/stereo frame geometry and
 /// every finite sample in [-1, 1]. Size arithmetic is checked before any writer mutation.
-pub fn encodePcm16Requirements(source: AudioView) EncodeError!usize {
+pub fn encodePcm16Requirements(source: Audio.View) EncodeRequirementsError!usize {
     const channels: u32 = @backingInt(source.channels);
     if (source.sample_rate == 0) return error.InvalidRate;
     if (channels == 0) return error.InvalidSamples;
@@ -474,18 +446,22 @@ pub fn encodePcm16Requirements(source: AudioView) EncodeError!usize {
 
 /// Writes complete normalized mono/stereo PCM16 RIFF. Invalid input leaves the writer untouched;
 /// writer failure may leave a prefix. Samples must be disjoint from writer storage. Rounding uses
-/// nearest integer without dithering; endpoints map to -32768/32767. Extensible speaker-mask
-/// metadata is not encoded. The caller owns flushing.
+/// nearest integer, with halfway ties away from zero and no dithering; endpoints map to
+/// -32768/32767. Extensible speaker-mask metadata is not encoded. The caller owns flushing.
 pub fn writePcm16(
-    source: AudioView,
+    source: Audio.View,
     writer: *std.Io.Writer,
-) (EncodeError || std.Io.Writer.Error)!void {
+) (EncodeRequirementsError || std.Io.Writer.Error)!void {
     const bytes = try encodePcm16Requirements(source);
     try writePcm16Admitted(source, bytes, writer);
 }
 
 test writePcm16 {
-    const source: AudioView = .{ .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 0.5 } };
+    const source: Audio.View = .{
+        .sample_rate = 8000,
+        .channels = .mono,
+        .samples = &.{ -1, 0.5 },
+    };
     var bytes: [48]u8 = undefined;
     var writer = std.Io.Writer.fixed(&bytes);
     try writePcm16(source, &writer);
@@ -495,7 +471,7 @@ test writePcm16 {
 
 /// Writes a complete file into a used caller byte prefix. Admission failures preserve the entire
 /// destination, including unused capacity. Input samples and output must be disjoint.
-pub fn encodePcm16Into(source: AudioView, destination: []u8) EncodeError![]u8 {
+pub fn encodePcm16Into(source: Audio.View, destination: []u8) EncodeError![]u8 {
     const bytes = try encodePcm16Requirements(source);
     if (destination.len < bytes) return error.DestinationTooSmall;
     const output = destination[0..bytes];
@@ -507,7 +483,7 @@ pub fn encodePcm16Into(source: AudioView, destination: []u8) EncodeError![]u8 {
 
 test encodePcm16Into {
     var bytes: [48]u8 = undefined;
-    const audio: AudioView = .{ .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 1 } };
+    const audio: Audio.View = .{ .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 1 } };
     const encoded = try encodePcm16Into(audio, &bytes);
     var decoded = try decodeAlloc(testing.allocator, encoded);
     defer decoded.deinit(testing.allocator);
@@ -515,7 +491,7 @@ test encodePcm16Into {
 }
 
 fn writePcm16Admitted(
-    source: AudioView,
+    source: Audio.View,
     bytes: usize,
     writer: *std.Io.Writer,
 ) riff.WriteError!void {
@@ -536,14 +512,15 @@ fn writePcm16Admitted(
 }
 
 test {
-    _ = container;
-    _ = format;
-    _ = parallel;
+    _ = Container;
+    _ = Format;
+    _ = Audio;
+    _ = sample_decode;
 }
 
 fn testParallelDecode(allocator: std.mem.Allocator, source: []const u8) !Audio {
     var provider: TestIo = .{};
-    var workers: [4]Worker = undefined;
+    var workers: [4]DecodeWorker = undefined;
     defer std.debug.assert(provider.count == 0);
     return decodeParallelAlloc(
         allocator,
@@ -556,7 +533,7 @@ fn testParallelDecode(allocator: std.mem.Allocator, source: []const u8) !Audio {
 
 const TestIo = struct {
     const Pending = struct {
-        context: [@sizeOf(*Worker)]u8 align(@alignOf(*Worker)),
+        context: [@sizeOf(*DecodeWorker)]u8 align(@alignOf(*DecodeWorker)),
         start: *const fn (*const anyopaque) void,
     };
     pending: [7]Pending = undefined,
@@ -581,8 +558,8 @@ const TestIo = struct {
         start: *const fn (*const anyopaque) void,
     ) void {
         const self: *TestIo = @ptrCast(@alignCast(pointer.?));
-        std.debug.assert(context.len == @sizeOf(*Worker));
-        std.debug.assert(alignment == std.mem.Alignment.of(*Worker));
+        std.debug.assert(context.len == @sizeOf(*DecodeWorker));
+        std.debug.assert(alignment == std.mem.Alignment.of(*DecodeWorker));
         std.debug.assert(self.count < self.pending.len);
         const task = &self.pending[self.count];
         @memcpy(&task.context, context);
@@ -665,9 +642,10 @@ test "invalid PCM preserves output and writer exhaustion is returned" {
 test "stereo RIFF bytes carry exact sizes rates order and signed PCM endpoints" {
     var bytes: [56]u8 = undefined;
     var writer = std.Io.Writer.fixed(&bytes);
-    try writePcm16(.{ .sample_rate = 48000, .channels = .stereo, .samples = &.{
-        -1, 1, -0.5, 0.5, 0, 0.25,
-    } }, &writer);
+    try writePcm16(
+        .{ .sample_rate = 48000, .channels = .stereo, .samples = &.{ -1, 1, -0.5, 0.5, 0, 0.25 } },
+        &writer,
+    );
     try std.testing.expectEqualSlices(u8, fixtures.stereo, writer.buffered());
 }
 
@@ -683,17 +661,21 @@ test "decoder reads interleaved PCM16 into owned normalized samples" {
     defer audio.deinit(std.testing.allocator);
     try std.testing.expectEqual(48000, audio.sample_rate);
     try std.testing.expectEqual(Channels.stereo, audio.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        -1, 0.999969482421875, -0.5, 0.5, 0, 0.25,
-    }, audio.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -1, 0.999969482421875, -0.5, 0.5, 0, 0.25 },
+        audio.samples,
+    );
 }
 
 test "decoder concatenates multiple frame-aligned data chunks" {
     var audio = try decodeAlloc(std.testing.allocator, fixtures.stereo_split_data);
     defer audio.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(f32, &.{
-        -1, 0.999969482421875, -0.5, 0.5, 0, 0.25,
-    }, audio.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -1, 0.999969482421875, -0.5, 0.5, 0, 0.25 },
+        audio.samples,
+    );
 }
 
 test "decoder accepts RF64 64-bit chunk sizes" {
@@ -701,9 +683,11 @@ test "decoder accepts RF64 64-bit chunk sizes" {
     defer audio.deinit(std.testing.allocator);
     try std.testing.expectEqual(48000, audio.sample_rate);
     try std.testing.expectEqual(Channels.stereo, audio.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        -1, 0.999969482421875, -0.5, 0.5, 0, 0.25,
-    }, audio.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -1, 0.999969482421875, -0.5, 0.5, 0, 0.25 },
+        audio.samples,
+    );
 }
 
 test "decoder consumes the RF64 data size once across multiple data chunks" {
@@ -764,7 +748,7 @@ test "RF64 decoding reuses bounded storage after temporary table usage" {
                 // one decode, so leaked scratch prevents reuse.
                 fixed.buffer = backing[0 .. retained_end + @sizeOf(
                     f32,
-                ) + 3 * @sizeOf(ChunkIndexEntry)];
+                ) + 3 * @sizeOf(Container.Iterator.IndexEntry)];
             }
         }
     }
@@ -802,15 +786,19 @@ test "decoder accepts G.711 mu-law and A-law WAV tags" {
     defer mulaw.deinit(std.testing.allocator);
     try std.testing.expectEqual(8000, mulaw.sample_rate);
     try std.testing.expectEqual(Channels.mono, mulaw.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        0, 0, -0.9803466796875, 0.9803466796875,
-    }, mulaw.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 0, 0, -0.9803466796875, 0.9803466796875 },
+        mulaw.samples,
+    );
 
     var alaw = try decodeAlloc(std.testing.allocator, fixtures.alaw_mono);
     defer alaw.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(f32, &.{
-        0.000244140625, -0.000244140625, -0.16796875, 0.16796875,
-    }, alaw.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 0.000244140625, -0.000244140625, -0.16796875, 0.16796875 },
+        alaw.samples,
+    );
 
     var invalid_bits = fixtures.mulaw_mono.*;
     std.mem.writeInt(u16, invalid_bits[34..36], 16, .little);
@@ -821,11 +809,10 @@ test "decoder accepts G.711 mu-law and A-law WAV tags" {
 }
 
 test "caller G.711 decode preserves admission and data ordering" {
-    const cases = .{ .{ fixtures.mulaw_mono, [_]f32{
-        0, 0, -0.9803466796875, 0.9803466796875,
-    } }, .{ fixtures.alaw_mono, [_]f32{
-        0.000244140625, -0.000244140625, -0.16796875, 0.16796875,
-    } } };
+    const cases = .{
+        .{ fixtures.mulaw_mono, [_]f32{ 0, 0, -0.9803466796875, 0.9803466796875 } },
+        .{ fixtures.alaw_mono, [_]f32{ 0.000244140625, -0.000244140625, -0.16796875, 0.16796875 } },
+    };
     inline for (cases) |case| {
         const source = case[0];
         const expected = case[1];
@@ -835,7 +822,7 @@ test "caller G.711 decode preserves admission and data ordering" {
         @memcpy(reordered[24..48], source[12..36]);
         var empty_second: [56]u8 = undefined;
         @memcpy(empty_second[0..48], source);
-        @memcpy(empty_second[48..56], "data\x00\x00\x00\x00");
+        @memcpy(empty_second[48..56], &[_]u8{ 'd', 'a', 't', 'a', 0x00, 0x00, 0x00, 0x00 });
         std.mem.writeInt(u32, empty_second[4..8], 48, .little);
         for ([_][]const u8{ source, &reordered, &empty_second }) |input| {
             var output: [6]f32 = @splat(123);
@@ -870,9 +857,11 @@ test "caller G.711 decode validates stereo geometry and extensible subformats" {
     var output: [6]f32 = @splat(123);
     const audio = try decodeInto(&stereo, output[1..5], &.{});
     try testing.expectEqual(Channels.stereo, audio.channels);
-    try testing.expectEqualSlices(f32, &.{
-        0, 0, -0.9803466796875, 0.9803466796875,
-    }, audio.samples);
+    try testing.expectEqualSlices(
+        f32,
+        &.{ 0, 0, -0.9803466796875, 0.9803466796875 },
+        audio.samples,
+    );
     try testing.expectEqual(123, output[0]);
     try testing.expectEqual(123, output[5]);
     std.mem.writeInt(u32, stereo[40..44], 3, .little);
@@ -880,11 +869,10 @@ test "caller G.711 decode validates stereo geometry and extensible subformats" {
     try testing.expectError(error.InvalidWave, decodeInto(&stereo, output[0..0], &.{}));
     try testing.expect(std.mem.allEqual(f32, &output, 123));
     const inputs = [_][]const u8{ fixtures.extensible_mulaw_mono, fixtures.extensible_alaw_mono };
-    const expected = [_][4]f32{ .{
-        0, 0, -0.9803466796875, 0.9803466796875,
-    }, .{
-        0.000244140625, -0.000244140625, -0.16796875, 0.16796875,
-    } };
+    const expected = [_][4]f32{
+        .{ 0, 0, -0.9803466796875, 0.9803466796875 },
+        .{ 0.000244140625, -0.000244140625, -0.16796875, 0.16796875 },
+    };
     for (inputs, expected) |input, samples| {
         @memset(&output, 123);
         const decoded = try decodeInto(input, output[1..5], &.{});
@@ -896,11 +884,10 @@ test "caller G.711 decode validates stereo geometry and extensible subformats" {
 
 test "caller extensible G.711 retains multichannel layout and frame alignment" {
     const inputs = [_][]const u8{ fixtures.extensible_mulaw_mono, fixtures.extensible_alaw_mono };
-    const expected = [_][3]f32{ .{
-        0, 0, -0.9803466796875,
-    }, .{
-        0.000244140625, -0.000244140625, -0.16796875,
-    } };
+    const expected = [_][3]f32{
+        .{ 0, 0, -0.9803466796875 },
+        .{ 0.000244140625, -0.000244140625, -0.16796875 },
+    };
     for (inputs, expected) |input, samples| {
         var source: [72]u8 = undefined;
         @memcpy(&source, input);
@@ -940,7 +927,7 @@ test "caller G.711 decode scans malformed tails before capacity or output" {
     std.mem.writeInt(u32, duplicate[4..8], 64, .little);
     var truncated: [55]u8 = undefined;
     @memcpy(truncated[0..48], source);
-    @memcpy(truncated[48..55], "JUNK\x04\x00\x00");
+    @memcpy(truncated[48..55], &[_]u8{ 'J', 'U', 'N', 'K', 0x04, 0x00, 0x00 });
     std.mem.writeInt(u32, truncated[4..8], 47, .little);
     var output: [4]f32 = @splat(123);
     try testing.expectError(error.UnsupportedWave, decodeInto(&duplicate, output[0..0], &.{}));
@@ -957,15 +944,19 @@ test "decoder accepts extensible G.711 subformat GUIDs" {
     var mulaw = try decodeAlloc(std.testing.allocator, fixtures.extensible_mulaw_mono);
     defer mulaw.deinit(std.testing.allocator);
     try std.testing.expectEqual(Channels.mono, mulaw.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        0, 0, -0.9803466796875, 0.9803466796875,
-    }, mulaw.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 0, 0, -0.9803466796875, 0.9803466796875 },
+        mulaw.samples,
+    );
 
     var alaw = try decodeAlloc(std.testing.allocator, fixtures.extensible_alaw_mono);
     defer alaw.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(f32, &.{
-        0.000244140625, -0.000244140625, -0.16796875, 0.16796875,
-    }, alaw.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 0.000244140625, -0.000244140625, -0.16796875, 0.16796875 },
+        alaw.samples,
+    );
 
     var invalid_bits = fixtures.extensible_mulaw_mono.*;
     std.mem.writeInt(u16, invalid_bits[34..36], 16, .little);
@@ -978,12 +969,16 @@ test "decoder accepts extensible G.711 subformat GUIDs" {
 test "decoder follows G.711 A-law segment boundaries" {
     var audio = try decodeAlloc(std.testing.allocator, fixtures.alaw_segment_boundaries);
     defer audio.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(f32, &.{
-        -0.000244140625, 0.000244140625, -0.008056640625, 0.008056640625, -0.01611328125,
-        0.01611328125,   -0.0322265625,  0.0322265625,    -0.064453125,   0.064453125,
-        -0.12890625,     0.12890625,     -0.2578125,      0.2578125,      -0.515625,
-        0.515625,
-    }, audio.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{
+            -0.000244140625, 0.000244140625, -0.008056640625, 0.008056640625, -0.01611328125,
+            0.01611328125,   -0.0322265625,  0.0322265625,    -0.064453125,   0.064453125,
+            -0.12890625,     0.12890625,     -0.2578125,      0.2578125,      -0.515625,
+            0.515625,
+        },
+        audio.samples,
+    );
 }
 
 test "decoder accepts extensible 24-bit PCM and float sources" {
@@ -1007,9 +1002,11 @@ test "decoder accepts extensible multichannel and reduced-precision PCM" {
     var multichannel = try decodeAlloc(std.testing.allocator, fixtures.extensible_pcm6);
     defer multichannel.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(Channels, @fromBackingInt(@intCast(6))), multichannel.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        -1, -0.5, 0, 0.5, 0.999969482421875, -0.000030517578125,
-    }, multichannel.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ -1, -0.5, 0, 0.5, 0.999969482421875, -0.000030517578125 },
+        multichannel.samples,
+    );
 
     var reduced = try decodeAlloc(std.testing.allocator, fixtures.extensible_pcm20);
     defer reduced.deinit(std.testing.allocator);
@@ -1032,10 +1029,15 @@ test "decoder reads mono IMA ADPCM blocks" {
     defer audio.deinit(std.testing.allocator);
     try std.testing.expectEqual(8000, audio.sample_rate);
     try std.testing.expectEqual(Channels.mono, audio.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        0,                 0.000030517578125, 0.00006103515625, 0.00018310546875, 0.000274658203125,
-        0.000274658203125, 0.00048828125,     0,                0.00103759765625,
-    }, audio.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{
+            0,                 0.000030517578125, 0.00006103515625, 0.00018310546875,
+            0.000274658203125, 0.000274658203125, 0.00048828125,    0,
+            0.00103759765625,
+        },
+        audio.samples,
+    );
 
     var invalid = fixtures.ima_adpcm_mono.*;
     invalid[50] = 89;
@@ -1043,15 +1045,18 @@ test "decoder reads mono IMA ADPCM blocks" {
 }
 
 test "decoder reads IMA seed-only blocks in both channel layouts" {
-    const cases = .{ .{ fixtures.ima_header_mono, Channels.mono, &[_]f32{
-        -1, 0.999969482421875,
-    } }, .{ fixtures.ima_header_stereo, Channels.stereo, &[_]f32{
-        -1, 0.999969482421875, 0.5, -0.5,
-    } } };
+    const cases = .{
+        .{ fixtures.ima_header_mono, Channels.mono, &[_]f32{ -1, 0.999969482421875 } },
+        .{
+            fixtures.ima_header_stereo,
+            Channels.stereo,
+            &[_]f32{ -1, 0.999969482421875, 0.5, -0.5 },
+        },
+    };
     inline for (cases) |case| {
-        const info = try parseFormat(case[0][20..40]);
-        try std.testing.expectEqual(1, info.samples_per_block);
-        try std.testing.expectEqual(2, try frameCount(info, case[0].len - 48));
+        const info = try Format.parse(case[0][20..40]);
+        try std.testing.expectEqual(1, info.blockLayout().frames_per_block);
+        try std.testing.expectEqual(2, try info.frameCount(case[0].len - 48));
         var serial = try decodeAlloc(std.testing.allocator, case[0]);
         defer serial.deinit(std.testing.allocator);
         try std.testing.expectEqual(case[1], serial.channels);
@@ -1064,7 +1069,7 @@ test "decoder reads IMA seed-only blocks in both channel layouts" {
         var invalid = case[0][20..40].*;
         for ([_]u16{ 0, 2 }) |frames| {
             std.mem.writeInt(u16, invalid[18..20], frames, .little);
-            try std.testing.expectError(error.InvalidWave, parseFormat(&invalid));
+            try std.testing.expectError(error.InvalidWave, Format.parse(&invalid));
         }
     }
 }
@@ -1126,39 +1131,50 @@ test "decoder reads interleaved stereo IMA ADPCM channel groups" {
     var audio = try decodeAlloc(std.testing.allocator, fixtures.ima_adpcm_stereo);
     defer audio.deinit(std.testing.allocator);
     try std.testing.expectEqual(Channels.stereo, audio.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        0,                 0.030517578125,    0.000030517578125, 0.030548095703125,
-        0.00006103515625,  0.03057861328125,  0.00018310546875,  0.03070068359375,
-        0.000274658203125, 0.030792236328125, 0.000274658203125, 0.030792236328125,
-        0.00048828125,     0.031005859375,    0,                 0.030517578125,
-        0.00103759765625,  0.03155517578125,
-    }, audio.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{
+            0,                 0.030517578125,    0.000030517578125, 0.030548095703125,
+            0.00006103515625,  0.03057861328125,  0.00018310546875,  0.03070068359375,
+            0.000274658203125, 0.030792236328125, 0.000274658203125, 0.030792236328125,
+            0.00048828125,     0.031005859375,    0,                 0.030517578125,
+            0.00103759765625,  0.03155517578125,
+        },
+        audio.samples,
+    );
 }
 
 test "decoder reads Microsoft ADPCM seed samples in time order" {
     var mono = try decodeAlloc(std.testing.allocator, fixtures.ms_adpcm_mono);
     defer mono.deinit(std.testing.allocator);
     try std.testing.expectEqual(Channels.mono, mono.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        0.06103515625,    0.030517578125, 0.030517578125, 0.05792236328125, 0.0333251953125,
-        -0.1434326171875,
-    }, mono.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{
+            0.06103515625,    0.030517578125, 0.030517578125, 0.05792236328125, 0.0333251953125,
+            -0.1434326171875,
+        },
+        mono.samples,
+    );
 
     var stereo = try decodeAlloc(std.testing.allocator, fixtures.ms_adpcm_stereo);
     defer stereo.deinit(std.testing.allocator);
     try std.testing.expectEqual(Channels.stereo, stereo.channels);
-    try std.testing.expectEqualSlices(f32, &.{
-        0.06103515625,   -0.06103515625,   0.030517578125,   -0.030517578125, 0.030517578125,
-        -0.030517578125, 0.03753662109375, -0.0445556640625,
-    }, stereo.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{
+            0.06103515625,   -0.06103515625,   0.030517578125,   -0.030517578125, 0.030517578125,
+            -0.030517578125, 0.03753662109375, -0.0445556640625,
+        },
+        stereo.samples,
+    );
 }
 
 test "Microsoft ADPCM signed prediction matches independent PCM through both decode paths" {
-    const cases = .{ .{
-        fixtures.ms_prediction_mono, fixtures.ms_prediction_mono_samples, Channels.mono,
-    }, .{
-        fixtures.ms_prediction_stereo, fixtures.ms_prediction_stereo_samples, Channels.stereo,
-    } };
+    const cases = .{
+        .{ fixtures.ms_prediction_mono, fixtures.ms_prediction_mono_samples, Channels.mono },
+        .{ fixtures.ms_prediction_stereo, fixtures.ms_prediction_stereo_samples, Channels.stereo },
+    };
     inline for (cases) |case| {
         for ([_]bool{ false, true }) |scheduled| {
             var audio = if (scheduled) try testParallelDecode(
@@ -1174,11 +1190,10 @@ test "Microsoft ADPCM signed prediction matches independent PCM through both dec
 }
 
 test "Microsoft ADPCM signed prediction preserves fact prefixes under reversed execution" {
-    const cases = .{ .{
-        fixtures.ms_prediction_mono, fixtures.ms_prediction_mono_samples,
-    }, .{
-        fixtures.ms_prediction_stereo, fixtures.ms_prediction_stereo_samples,
-    } };
+    const cases = .{
+        .{ fixtures.ms_prediction_mono, fixtures.ms_prediction_mono_samples },
+        .{ fixtures.ms_prediction_stereo, fixtures.ms_prediction_stereo_samples },
+    };
     inline for (cases) |case| {
         const channels = std.mem.readInt(u16, case[0][22..24], .little);
         const frames = case[1].len / 2 / channels;
@@ -1201,19 +1216,38 @@ test "Microsoft ADPCM signed prediction preserves fact prefixes under reversed e
 }
 
 test "decoder honors ADPCM fact frames without publishing block padding" {
-    const cases = .{ .{ fixtures.ima_mono, Channels.mono, &[_]f32{
-        0, 0.000030517578125, 0.00006103515625,
-    } }, .{ fixtures.extended_fact, Channels.mono, &[_]f32{
-        0, 0.000030517578125, 0.00006103515625,
-    } }, .{ fixtures.ima_stereo, Channels.stereo, &[_]f32{
-        0,                0.030517578125,   0.000030517578125, 0.030548095703125, 0.00006103515625,
-        0.03057861328125, 0.00018310546875, 0.03070068359375,  0.000274658203125, 0.030792236328125,
-    } }, .{ fixtures.ms_mono, Channels.mono, &[_]f32{
-        0.06103515625, 0.030517578125, 0.030517578125, 0.05792236328125, 0.0333251953125,
-    } }, .{ fixtures.ms_stereo, Channels.stereo, &[_]f32{
-        0.06103515625,   -0.06103515625, 0.030517578125, -0.030517578125, 0.030517578125,
-        -0.030517578125,
-    } } };
+    const cases = .{
+        .{ fixtures.ima_mono, Channels.mono, &[_]f32{ 0, 0.000030517578125, 0.00006103515625 } },
+        .{
+            fixtures.extended_fact,
+            Channels.mono,
+            &[_]f32{ 0, 0.000030517578125, 0.00006103515625 },
+        },
+        .{
+            fixtures.ima_stereo,
+            Channels.stereo,
+            &[_]f32{
+                0,                 0.030517578125,    0.000030517578125, 0.030548095703125,
+                0.00006103515625,  0.03057861328125,  0.00018310546875,  0.03070068359375,
+                0.000274658203125, 0.030792236328125,
+            },
+        },
+        .{
+            fixtures.ms_mono,
+            Channels.mono,
+            &[_]f32{
+                0.06103515625, 0.030517578125, 0.030517578125, 0.05792236328125, 0.0333251953125,
+            },
+        },
+        .{
+            fixtures.ms_stereo,
+            Channels.stereo,
+            &[_]f32{
+                0.06103515625,   -0.06103515625, 0.030517578125, -0.030517578125, 0.030517578125,
+                -0.030517578125,
+            },
+        },
+    };
     inline for (cases) |case| {
         var audio = try decodeAlloc(std.testing.allocator, case[0]);
         defer audio.deinit(std.testing.allocator);
@@ -1228,9 +1262,11 @@ test "decoder honors ADPCM fact frames without publishing block padding" {
 test "decoder resolves RF64 ADPCM fact sentinels and retains explicit counts" {
     var audio = try decodeAlloc(std.testing.allocator, fixtures.rf64_ima_mono);
     defer audio.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(f32, &.{
-        0, 0.000030517578125, 0.00006103515625,
-    }, audio.samples);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 0, 0.000030517578125, 0.00006103515625 },
+        audio.samples,
+    );
 
     var explicit = fixtures.rf64_ima_mono.*;
     std.mem.writeInt(u32, explicit[84..88], 2, .little);
@@ -1253,7 +1289,7 @@ test "RF64 explicit outer sizes reach requirements and all complete decode opera
     var owned = try decodeAlloc(testing.allocator, source);
     defer owned.deinit(testing.allocator);
     try testing.expectEqualSlices(f32, &expected, owned.samples);
-    var workers: [2]Worker = undefined;
+    var workers: [2]DecodeWorker = undefined;
     const scheduled = try decodeParallelInto(std.Io.failing, source, &samples, &.{}, &workers, .{});
     try testing.expectEqualSlices(f32, &expected, scheduled.samples);
     var scheduled_owner = try decodeParallelAlloc(
@@ -1288,11 +1324,18 @@ test "ADPCM fact counts can end inside seed samples or publish no frames" {
         source: []const u8,
         count_offset: usize,
         expected: []const f32,
-    }{ .{ .source = fixtures.ima_mono, .count_offset = 48, .expected = &.{
-        0, 0.000030517578125,
-    } }, .{ .source = fixtures.ms_stereo, .count_offset = 78, .expected = &.{
-        0.06103515625, -0.06103515625, 0.030517578125, -0.030517578125,
-    } } };
+    }{
+        .{
+            .source = fixtures.ima_mono,
+            .count_offset = 48,
+            .expected = &.{ 0, 0.000030517578125 },
+        },
+        .{
+            .source = fixtures.ms_stereo,
+            .count_offset = 78,
+            .expected = &.{ 0.06103515625, -0.06103515625, 0.030517578125, -0.030517578125 },
+        },
+    };
     for (cases) |case| {
         const bytes = try std.testing.allocator.dupe(u8, case.source);
         defer std.testing.allocator.free(bytes);
@@ -1499,9 +1542,12 @@ test "WAV owners reclaim padded samples and RF64 scratch across every allocation
     table[40] = .{ .id = "KEEP".*, .size = 0 };
     const indexed = try fixtures.makeRf64Metadata(allocator, table, chunks);
     defer allocator.free(indexed);
-    for ([_][]const u8{
-        fixtures.stereo, fixtures.rf64_repeated_unknown_chunks, indexed, fixtures.ima_two_blocks,
-    }) |source| {
+    for (
+        [_][]const u8{
+            fixtures.stereo,         fixtures.rf64_repeated_unknown_chunks, indexed,
+            fixtures.ima_two_blocks,
+        },
+    ) |source| {
         for (0..8) |residue| {
             const prefix = 16 + residue;
             for ([_]bool{ false, true }) |decline_resize| {
@@ -1565,7 +1611,7 @@ test "content failure and std.Io cancellation release complete owners after all 
             var fixed = std.heap.FixedBufferAllocator.init(backing[8 .. backing.len - 8]);
             @memset(try fixed.allocator().alloc(u8, prefix), 0x3c);
             var provider: TestIo = .{ .canceled = canceled };
-            var workers: [3]Worker = undefined;
+            var workers: [3]DecodeWorker = undefined;
             const source: []const u8 = if (canceled) fixtures.rf64_stereo_with_table else &invalid;
             const result = decodeParallelAlloc(
                 fixed.allocator(),
@@ -1585,7 +1631,10 @@ test "content failure and std.Io cancellation release complete owners after all 
             for (workers) |worker| {
                 try testing.expectEqual(0, worker.source.len);
                 try testing.expectEqual(0, worker.destination.len);
-                try testing.expectEqual(0, worker.format.adpcm_coefficients.len);
+                if (worker.format.encoding == .adpcm) try testing.expectEqual(
+                    0,
+                    worker.format.encoding.adpcm.coefficients.len,
+                );
             }
             try testing.expect(std.mem.allEqual(u8, fixed.buffer[0..prefix], 0x3c));
             try testing.expect(std.mem.allEqual(u8, backing[0..8], 0xa5));
@@ -1617,18 +1666,20 @@ test "caller output admission preserves guards and sizing does not validate samp
     const alias: []f32 = @alignCast(std.mem.bytesAsSlice(f32, source[44..56]));
     try testing.expectError(error.Aliasing, decodeInto(&source, alias, &.{}));
     try testing.expectEqualSlices(u8, fixtures.stereo, &source);
-    var short_index: [2]ChunkIndexEntry = @splat(.{ .table_index = 77, .next_match = 88 });
-    const view = try parse(fixtures.rf64_repeated_unknown_chunks);
+    var short_index: [2]Container.Iterator.IndexEntry = @splat(
+        .{ .table_index = 77, .next_match = 88 },
+    );
+    const view = try Container.parse(fixtures.rf64_repeated_unknown_chunks);
     try testing.expectError(error.InsufficientScratch, view.iterator(&short_index));
     try testing.expectEqual(77, short_index[0].table_index);
-    var index: [4]ChunkIndexEntry = @splat(.{ .table_index = 77, .next_match = 88 });
+    var index: [4]Container.Iterator.IndexEntry = @splat(.{ .table_index = 77, .next_match = 88 });
     _ = try view.iterator(&index);
     try testing.expectEqual(77, index[3].table_index);
 }
 
 test "parallel decoding permits inline providers empty chunks and serial thresholds" {
     var output: [6]f32 = undefined;
-    var workers: [3]Worker = undefined;
+    var workers: [3]DecodeWorker = undefined;
     const audio = try decodeParallelInto(
         std.Io.failing,
         fixtures.stereo_empty_data,
@@ -1662,7 +1713,7 @@ test "std.Io threaded ADPCM conversion preserves independent samples and release
     const allocator = testing.allocator;
     var provider = std.Io.Threaded.init(allocator, .{ .async_limit = .limited(3) });
     defer provider.deinit();
-    var workers: [4]Worker = undefined;
+    var workers: [4]DecodeWorker = undefined;
     var audio = try decodeParallelAlloc(
         allocator,
         provider.io(),
@@ -1675,15 +1726,180 @@ test "std.Io threaded ADPCM conversion preserves independent samples and release
     for (workers) |worker| {
         try testing.expectEqual(0, worker.source.len);
         try testing.expectEqual(0, worker.destination.len);
-        try testing.expectEqual(0, worker.format.adpcm_coefficients.len);
+        if (worker.format.encoding == .adpcm) try testing.expectEqual(
+            0,
+            worker.format.encoding.adpcm.coefficients.len,
+        );
     }
 }
+
+test "cancellation joins pending native jobs before releasing sample and coefficient borrows" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var provider = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .limited(8) });
+    defer provider.deinit();
+    const io = provider.io();
+
+    // Four complete Microsoft blocks share the literal format; fact retains just the first frame.
+    // Every native participant therefore receives encoded work and an empty output prefix.
+    var source: [126]u8 = undefined;
+    @memcpy(source[0..70], fixtures.ms_adpcm_mono[0..70]);
+    std.mem.writeInt(u32, source[4..8], source.len - 8, .little);
+    @memcpy(
+        source[70..90],
+        &[_]u8{ 'f', 'a', 'c', 't', 4, 0, 0, 0, 1, 0, 0, 0, 'd', 'a', 't', 'a', 36, 0, 0, 0 },
+    );
+    for (0..4) |block| @memcpy(source[90 + block * 9 ..][0..9], fixtures.ms_adpcm_mono[78..87]);
+    var sample: [1]f32 = undefined;
+    _ = try decodeInto(&source, &sample, &.{});
+
+    var backing: [256]u8 align(16) = @splat(0xa5);
+    var fixed = std.heap.FixedBufferAllocator.init(backing[8..248]);
+    const prefix = try fixed.allocator().alloc(u8, 37);
+    @memset(prefix, 0x3c);
+    var workers: [4]DecodeWorker = undefined;
+    var probe: PendingDecodeProbe = .{
+        .native_io = io,
+        .vtable = io.vtable.*,
+        .allocator = fixed.allocator(),
+        .source = &source,
+        .workers = &workers,
+    };
+    probe.vtable.groupAsync = PendingDecodeProbe.groupAsync;
+    var future = std.Io.concurrent(
+        io,
+        PendingDecodeProbe.decode,
+        .{&probe},
+    ) catch return error.SkipZigTest;
+    defer {
+        // A timeout or all-inline fallback can still finish successfully and transfer an owner.
+        if (future.cancel(io)) |value| {
+            var audio = value;
+            audio.deinit(fixed.allocator());
+        } else |_| {}
+    }
+
+    const timeout: std.Io.Timeout = .{
+        .duration = .{ .raw = .fromMilliseconds(5_000), .clock = .awake },
+    };
+    const deadline = timeout.toDeadline(io);
+    while (!probe.ready.isSet()) {
+        probe.ready.waitTimeout(io, deadline) catch |err| switch (err) {
+            error.Canceled => return err,
+            error.Timeout => if (!probe.ready.isSet() and deadline.toDurationFromNow(
+                io,
+            ).?.raw.nanoseconds <= 0) return err,
+        };
+    }
+    const native_started = probe.native_started.load(.acquire);
+    if (native_started == 0) return error.SkipZigTest;
+    try testing.expect(probe.finished.load(.acquire) < workers.len - 1);
+    try testing.expectError(error.Canceled, future.cancel(io));
+    try testing.expectEqual(workers.len - 1, probe.finished.load(.acquire));
+    try testing.expectEqual(native_started, probe.canceled.load(.acquire));
+    try testing.expect(!probe.borrow_violation.load(.acquire));
+    for (workers) |worker| {
+        try testing.expectEqual(0, worker.source.len);
+        try testing.expectEqual(0, worker.destination.len);
+        try testing.expectEqual(0, worker.format.encoding.adpcm.coefficients.len);
+    }
+    try testing.expectEqual(37, fixed.end_index);
+    try testing.expect(std.mem.allEqual(u8, prefix, 0x3c));
+    try testing.expect(std.mem.allEqual(u8, backing[0..8], 0xa5));
+    try testing.expect(std.mem.allEqual(u8, backing[248..], 0xa5));
+}
+
+// Gate real Threaded jobs at a cancelable wait. Keep its native await/cancel contract intact;
+// cancellation of the outer Future must finish every gate before decode can retire its borrows.
+const PendingDecodeProbe = struct {
+    native_io: std.Io,
+    vtable: std.Io.VTable,
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    workers: []DecodeWorker,
+    decoder_thread: std.Thread.Id = undefined,
+    ready: std.Io.Event = .unset,
+    gate: std.Io.Event = .unset,
+    arrived: std.atomic.Value(usize) = .init(0),
+    native_started: std.atomic.Value(usize) = .init(0),
+    finished: std.atomic.Value(usize) = .init(0),
+    canceled: std.atomic.Value(usize) = .init(0),
+    borrow_violation: std.atomic.Value(bool) = .init(false),
+
+    // The copied Io retains Threaded userdata. Only its decode caller needs this probe binding;
+    // copied native job contexts carry their own pointer and never read another thread's binding.
+    threadlocal var current: *PendingDecodeProbe = undefined;
+
+    fn decode(self: *PendingDecodeProbe) ParallelDecodeAllocError!Audio {
+        current = self;
+        defer current = undefined;
+        self.decoder_thread = std.Thread.getCurrentId();
+        return decodeParallelAlloc(
+            self.allocator,
+            .{ .userdata = self.native_io.userdata, .vtable = &self.vtable },
+            self.source,
+            self.workers,
+            .{ .minimum_bytes = 0, .minimum_job_bytes = 1 },
+        );
+    }
+
+    const Job = struct {
+        probe: *PendingDecodeProbe,
+        arguments: [@sizeOf(*DecodeWorker)]u8 align(@alignOf(*DecodeWorker)),
+        start: *const fn (*const anyopaque) void,
+
+        fn run(raw: *const anyopaque) void {
+            const job: *const Job = @ptrCast(@alignCast(raw));
+            const probe = job.probe;
+            defer _ = probe.finished.fetchAdd(1, .release);
+            const native = std.Thread.getCurrentId() != probe.decoder_thread;
+            if (native) _ = probe.native_started.fetchAdd(1, .monotonic);
+            if (probe.arrived.fetchAdd(
+                1,
+                .acq_rel,
+            ) + 1 == probe.workers.len - 1) probe.ready.set(probe.native_io);
+            // An inline fallback must run immediately, allowing the controller to skip an
+            // all-inline provider without trapping its decode caller behind the gate.
+            if (native) probe.gate.wait(probe.native_io) catch {
+                const worker = std.mem.bytesToValue(*DecodeWorker, &job.arguments);
+                if (worker.source.len == 0 or worker.destination.len != 0 or worker.format.encoding
+                    .adpcm.coefficients.len == 0) probe.borrow_violation.store(
+                    true,
+                    .release,
+                );
+                _ = probe.canceled.fetchAdd(1, .release);
+                return;
+            };
+            job.start(&job.arguments);
+        }
+    };
+
+    fn groupAsync(
+        _: ?*anyopaque,
+        group: *std.Io.Group,
+        context: []const u8,
+        alignment: std.mem.Alignment,
+        start: *const fn (*const anyopaque) void,
+    ) void {
+        std.debug.assert(context.len == @sizeOf(*DecodeWorker));
+        std.debug.assert(alignment == std.mem.Alignment.of(*DecodeWorker));
+        const self = current;
+        var job: Job = .{ .probe = self, .arguments = undefined, .start = start };
+        @memcpy(&job.arguments, context);
+        self.native_io.vtable.groupAsync(
+            self.native_io.userdata,
+            group,
+            std.mem.asBytes(&job),
+            .of(Job),
+            Job.run,
+        );
+    }
+};
 
 test "extensible speaker masks are copied without changing source sample order" {
     var source = fixtures.extensible_pcm6[0..fixtures.extensible_pcm6.len].*;
     const mask: u32 = 0x8000003f;
     std.mem.writeInt(u32, source[40..44], mask, .little);
-    const info = try parseFormat(source[20..60]);
+    const info = try Format.parse(source[20..60]);
     try testing.expectEqual(mask, info.channel_mask.?);
     var audio = try decodeAlloc(testing.allocator, &source);
     defer audio.deinit(testing.allocator);
@@ -1691,6 +1907,6 @@ test "extensible speaker masks are copied without changing source sample order" 
     try testing.expectEqual(mask, audio.view().channel_mask.?);
     std.mem.writeInt(u32, source[40..44], 0, .little);
     try testing.expectEqual(mask, audio.channel_mask.?);
-    try testing.expectEqual(0, (try parseFormat(source[20..60])).channel_mask.?);
-    try testing.expectEqual(null, (try parseFormat(fixtures.stereo[20..36])).channel_mask);
+    try testing.expectEqual(0, (try Format.parse(source[20..60])).channel_mask.?);
+    try testing.expectEqual(null, (try Format.parse(fixtures.stereo[20..36])).channel_mask);
 }

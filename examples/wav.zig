@@ -3,13 +3,15 @@ const std = @import("std");
 const wav = @import("wingman").wav;
 
 pub fn main(init: std.process.Init) !void {
-    const input: wav.AudioView = .{ .sample_rate = 48000, .channels = .stereo, .samples = &.{
-        -1, 1, -0.5, 0.5, 0, 0.25,
-    } };
+    const input: wav.Audio.View = .{
+        .sample_rate = 48000,
+        .channels = .stereo,
+        .samples = &.{ -1, 1, -0.5, 0.5, 0, 0.25 },
+    };
     var file: [56]u8 = undefined;
     if (try wav.encodePcm16Requirements(input) != file.len) return error.SizeMismatch;
     const encoded = try wav.encodePcm16Into(input, &file);
-    const container = try wav.parse(encoded);
+    const container = try wav.Container.parse(encoded);
     if (container.scratchCount() != 0) return error.UnexpectedDirectory;
     const required = try wav.decodeRequirements(encoded, &.{});
     var samples: [8]f32 = @splat(42);
@@ -22,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     defer owned.deinit(init.gpa);
     if (!std.mem.eql(f32, &expected, owned.view().samples)) return error.OwnedMismatch;
 
-    var workers: [2]wav.Worker = undefined;
+    var workers: [2]wav.DecodeWorker = undefined;
     var parallel_samples: [6]f32 = undefined;
     const parallel = try wav.decodeParallelInto(
         init.io,
@@ -33,10 +35,17 @@ pub fn main(init: std.process.Init) !void {
         .{ .minimum_bytes = 0, .minimum_job_bytes = 1 },
     );
     if (!std.mem.eql(f32, &expected, parallel.samples)) return error.ParallelMismatch;
-    for (workers) |worker| {
-        if (worker.source.len != 0 or worker.destination.len != 0 or worker.format
-            .adpcm_coefficients.len != 0) return error.WorkerBorrowEscaped;
-    }
+    // Every job has joined before return. Reuse the output and workers without a reset.
+    @memset(&parallel_samples, 42);
+    const repeated = try wav.decodeParallelInto(
+        init.io,
+        encoded,
+        &parallel_samples,
+        &.{},
+        &workers,
+        .{ .minimum_bytes = 0, .minimum_job_bytes = 1 },
+    );
+    if (!std.mem.eql(f32, &expected, repeated.samples)) return error.WorkerReuseMismatch;
 
     var buffer: [512]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);

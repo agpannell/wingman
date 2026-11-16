@@ -6,61 +6,58 @@ const std = @import("std");
 const lpcm = @import("../lpcm.zig");
 const g711 = @import("../g711.zig");
 const adpcm = @import("../adpcm.zig");
-const Format = @import("format.zig").Format;
-
-pub const ConversionError = error{ InvalidWave, InvalidSamples, SizeOverflow };
+const Format = @import("Format.zig");
 
 /// Parallel conversion also propagates cancellation after every borrowed participant has finished.
-pub const ParallelError = ConversionError || std.Io.Cancelable;
+pub const ParallelError = DecodeWorker.Error || std.Io.Cancelable;
 
 /// Admission thresholds in encoded bytes. Small chunks or insufficient workers use serial decode.
 /// Zero thresholds permit the smallest whole-frame/block partitions.
 pub const ParallelOptions = struct {
+    /// Minimum encoded bytes in one data chunk before attempting parallel conversion.
     minimum_bytes: usize = 256 * 1024,
+    /// Minimum encoded bytes per participant, rounded up to whole frames or blocks.
     minimum_job_bytes: usize = 64 * 1024,
 };
 
 /// Address-stable reservation for one conversion participant, including the calling thread.
-/// Contents are managed by parallel decoding; no initialization is required. Source, destination
-/// and coefficient borrows end before return, including cancellation. No allocator is retained.
-pub const Worker = struct {
+/// Contents are managed by parallel decoding; no initialization is required. Only the selected
+/// worker prefix is initialized; unused slots may remain undefined. Source, destination and
+/// coefficient borrows end before return, including cancellation. No allocator is retained.
+pub const DecodeWorker = struct {
+    /// Copied admitted format for a selected job; coefficient borrows are cleared on retirement.
     format: Format,
+    /// Borrowed whole frames or blocks for the job; cleared before the decode call returns.
     source: []const u8,
+    /// Disjoint output prefix for this job; may be empty when validating omitted ADPCM blocks.
     destination: []f32,
-    failure: ?ConversionError,
+    /// Job-local content failure, read by the coordinator after joining all selected jobs.
+    failure: ?Error,
 
-    fn run(self: *Worker) void {
+    /// Invalid encoded content, nonfinite LPCM samples or an unrepresentable decoded extent.
+    pub const Error = error{ InvalidWave, InvalidSamples, SizeOverflow };
+
+    fn run(self: *DecodeWorker) void {
         self.failure = null;
         convert(self.format, self.source, self.destination) catch |err| {
             self.failure = err;
         };
     }
 
-    fn retire(self: *Worker) void {
+    fn retire(self: *DecodeWorker) void {
         self.source = &.{};
         self.destination = &.{};
-        self.format.adpcm_coefficients = &.{};
+        if (self.format.encoding == .adpcm) self.format.encoding.adpcm.coefficients = &.{};
     }
 };
 
 // The owning complete-file layer has admitted format, frame geometry, exact output and aliasing.
-pub fn convert(format: Format, source: []const u8, destination: []f32) ConversionError!void {
+pub fn convert(format: Format, source: []const u8, destination: []f32) DecodeWorker.Error!void {
     switch (format.encoding) {
-        .g711_alaw, .g711_mulaw => {
-            _ = g711.decodeInto(
-                source,
-                destination,
-                if (format.encoding == .g711_alaw) .alaw else .mulaw,
-            ) catch unreachable;
+        .g711 => |companded| {
+            _ = g711.decodeInto(source, destination, companded.law) catch unreachable;
         },
-        .ima_adpcm, .ms_adpcm => {
-            const block_format: adpcm.Format = .{
-                .encoding = if (format.encoding == .ima_adpcm) .ima_wave else .microsoft_wave,
-                .channels = @backingInt(format.channels),
-                .block_bytes = format.block_align,
-                .frames_per_block = format.samples_per_block,
-                .coefficients = format.adpcm_coefficients,
-            };
+        .adpcm => |block_format| {
             _ = adpcm.decodePrefixInto(
                 source,
                 destination,
@@ -72,16 +69,8 @@ pub fn convert(format: Format, source: []const u8, destination: []f32) Conversio
                 error.DestinationTooSmall, error.Aliasing => unreachable,
             };
         },
-        else => {
-            const sample_format: lpcm.Format = .{ .encoding = switch (format.encoding) {
-                .pcm_u8 => .unsigned8,
-                .pcm_s16 => .signed16,
-                .pcm_s24 => .signed24,
-                .pcm_s32 => .signed32,
-                .ieee_f32 => .float32,
-                else => unreachable,
-            }, .valid_bits = @intCast(format.valid_bits_per_sample) };
-            _ = lpcm.decodeInto(source, destination, sample_format) catch |err| switch (err) {
+        .lpcm => |pcm| {
+            _ = lpcm.decodeInto(source, destination, pcm.sample_format) catch |err| switch (err) {
                 error.InvalidSamples => return error.InvalidSamples,
                 error.InvalidFormat, error.InvalidData => return error.InvalidWave,
                 error.DestinationTooSmall, error.Aliasing => unreachable,
@@ -95,7 +84,7 @@ pub fn convertParallel(
     format: Format,
     source: []const u8,
     destination: []f32,
-    workers: []Worker,
+    workers: []DecodeWorker,
     options: ParallelOptions,
 ) ParallelError!void {
     if (workers.len < 2 or source.len < options.minimum_bytes) return convert(
@@ -103,19 +92,20 @@ pub fn convertParallel(
         source,
         destination,
     );
-    const units = source.len / format.block_align;
+    const layout = format.blockLayout();
+    const units = source.len / layout.block_bytes;
     const minimum_units = @max(
         1,
-        options.minimum_job_bytes / format.block_align + @intFromBool(
-            options.minimum_job_bytes % format.block_align != 0,
+        options.minimum_job_bytes / layout.block_bytes + @intFromBool(
+            options.minimum_job_bytes % layout.block_bytes != 0,
         ),
     );
     const participants = @min(workers.len, units / minimum_units);
     if (participants < 2) return convert(format, source, destination);
     const samples_per_unit = std.math.mul(
         usize,
-        format.samples_per_block,
-        @backingInt(format.channels),
+        layout.frames_per_block,
+        @backingInt(format.channels()),
     ) catch return error.SizeOverflow;
     const units_per_job = units / participants;
     const remainder = units % participants;
@@ -131,11 +121,11 @@ pub fn convertParallel(
         const sample_end = @min(end * samples_per_unit, destination.len);
         worker.* = .{
             .format = format,
-            .source = source[begin * format.block_align .. end * format.block_align],
+            .source = source[begin * layout.block_bytes .. end * layout.block_bytes],
             .destination = destination[sample_begin..sample_end],
             .failure = null,
         };
-        if (index != 0) group.async(io, Worker.run, .{worker});
+        if (index != 0) group.async(io, DecodeWorker.run, .{worker});
     }
     workers[0].run();
     try group.await(io);

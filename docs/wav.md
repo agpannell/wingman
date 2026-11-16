@@ -18,13 +18,18 @@ allocating, caller-buffer and `std.Io` decoding.
 
 | Operation | Storage and result |
 | --- | --- |
-| `parse`, `Container.iterator` | Borrow source; the caller supplies RF64 directory scratch |
-| `parseFormat`, `frameCount` | Describe format and frame geometry; Microsoft coefficients borrow `fmt\x20` bytes |
+| `Container.parse`, `Container.iterator` | Borrow source; the caller supplies RF64 directory scratch |
+| `Format.parse`, `Format.frameCount` | Describe format and frame geometry; Microsoft coefficients borrow `fmt\x20` bytes |
 | `decodeRequirements` | Inspect complete file geometry and the decoded sample count; sample contents remain unchecked |
-| `decodeInto` | Use caller sample and directory storage; return an `AudioView` borrowing the used sample prefix |
+| `decodeInto` | Use caller sample and directory storage; return an `Audio.View` borrowing the used sample prefix |
 | `decodeAlloc` | Allocate an independent `Audio`; release it with the original allocator |
 | `decodeParallelInto`, `decodeParallelAlloc` | Decode with explicit `std.Io`, bounded workers and `ParallelOptions` |
 | `encodePcm16Requirements`, `encodePcm16Into`, `writePcm16` | Size, fill caller bytes or write a complete PCM16 RIFF file |
+
+Geometry inspection returns `DecodeRequirementsError`; sample decoding adds `InvalidSamples`
+and caller sample-capacity refusal through `DecodeError`. PCM16 sizing returns
+`EncodeRequirementsError`; caller-buffer encoding adds capacity and overlap through `EncodeError`.
+Writer output combines the sizing failures with `std.Io.Writer.Error`.
 
 Serial calls need no scheduler. Allocating calls take a per-call allocator and retain none. An
 `Audio` owns its complete byte allocation, including alignment padding; its `samples` borrow that
@@ -36,7 +41,7 @@ const std = @import("std");
 const wav = @import("wingman").wav;
 
 test "write a complete file and decode with caller storage" {
-    const source: wav.AudioView = .{
+    const source: wav.Audio.View = .{
         .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 0.5 },
     };
     var bytes: [48]u8 = undefined;
@@ -51,9 +56,9 @@ test "write a complete file and decode with caller storage" {
 ```
 
 Ordinary RIFF needs no directory entries, so `&.{}` is sufficient in this example. For arbitrary
-input, first obtain `parse(source).scratchCount()`, reserve that many `ChunkIndexEntry` values,
-then call `decodeRequirements` or `decodeInto`. Each active pass needs exclusive scratch; extra
-entries are untouched. Requirements can size output but do not certify floating-point values or
+input, first obtain `Container.parse(source).scratchCount()` and reserve that many
+`Container.Iterator.IndexEntry` values, then call `decodeRequirements` or `decodeInto`.
+Each active pass needs exclusive scratch; extra entries are untouched. Requirements can size output but do not certify floating-point values or
 ADPCM predictor state.
 
 ```zig
@@ -94,8 +99,18 @@ one. See [LPCM](lpcm.md), [G.711](g711.md) and [ADPCM](adpcm.md) for their numer
 
 `Channels` is a non-exhaustive enum: use `@backingInt(channels)` for its count. `channel_mask` is
 copied metadata: null for ordinary formats, zero for unspecified assignments. Masks do not cause
-reordering or validate a speaker arrangement. `Format` values come from `parseFormat`; copying
-one copies the Microsoft coefficient slice, not its bytes. Keep those bytes alive through use.
+reordering or validate a speaker arrangement.
+
+`Format.parse` admits a complete `fmt\x20` payload. Its `encoding` holds an LPCM sample format,
+a G.711 law or a raw ADPCM block format. `format.channels()` gives the samples per decoded frame;
+`format.blockLayout()` gives `block_bytes` and `frames_per_block`. An LPCM/G.711 unit is one frame;
+an ADPCM unit is a complete block containing several frames. `format.frameCount(byte_count)`
+checks whole encoded units and counts frames, including any ADPCM padding. It does not read samples
+or apply the file's `fact` prefix.
+
+Copying a `Format` copies its Microsoft coefficient slice, not the bytes. Keep those bytes immutable
+and alive through use. `Format.Error` names header/profile refusals; `Format.CountError` names
+incomplete encoded extents and frame-count overflow.
 
 The loader accepts reordered `fmt\x20` and `data`, unknown padded chunks and multiple top-level data
 chunks. Each data chunk must independently contain whole frames or ADPCM blocks. Duplicate format
@@ -108,28 +123,36 @@ both paths retain the same validation and storage rules.
 
 ## Inspect chunks and RF64 sizes
 
-`parse` admits the outer WAVE/RF64 header and required RF64 `ds64` directory. Later chunk extents
+`Container.parse` admits the outer WAVE/RF64 header and required RF64 `ds64` directory. Later chunk extents
 remain fallible during iteration. Returned chunks borrow source even after the iterator advances.
 A failed `next` ends that pass; start a fresh iterator to retry. Copying an active iterator shares
-its scratch and does not create an independent traversal.
+its scratch and does not create an independent traversal. Parsing and traversal return
+`Container.Error`; iterator construction returns `Container.Iterator.InitError` for insufficient
+or aliased directory scratch.
 
 RF64 uses a dedicated 64-bit size for its single sentinel-sized `data` chunk and a directory for
 other sentinel-sized chunks. Explicit 32-bit sizes take precedence over unused replacements.
-Repeated IDs consume directory entries in authored order. Up to32 records use direct scans;
+Repeated IDs consume directory entries in authored order. Up to 32 records use direct scans;
 larger directories sort caller scratch lazily by ID and ordinal, then use indexed lookup.
-`tableEntryUsed(ordinal)` observes consumption without advancing the iterator.
+`Container.rf64` exposes copied size/frame counts and the borrowed directory as `Container.Rf64Metadata`.
+The `frame_count` counts decoded frames, one sample per channel. `Container.Iterator.tableEntryUsed(ordinal)`
+observes consumption without advancing traversal.
 
 Complete-file operations reuse that ordering between internal passes while resetting each pass's
 consumption. A requirements or caller-buffer decode prepares an index at most once. Allocating
 decode has two scratch reservations: inspection retires before sample allocation, then conversion
-uses fresh scratch. Each reservation prepares at most once. Independent public iterators and
-separate API calls always start fresh; scratch contents are not a persistent cache.
+uses fresh scratch. Each reservation prepares at most once.
+
+After a public iterator reaches the end successfully, `restart()` resets consumption while retaining
+its prepared ordering. Keep its immutable source and exclusive scratch alive throughout both passes.
+A failed pass requires a fresh iterator. Constructing another iterator or starting a separate API
+call always starts fresh; scratch contents are not a persistent cache.
 
 Index preparation remains O(N log N) for N directory records, with eight bytes of scratch per
 record and a physically present twelve-byte record in `ds64`. Tables without a non-data sentinel
 avoid preparation. For untrusted files, bound input bytes before parsing, then inspect
-`parse(source).scratchCount()` before reserving scratch or choosing allocating decode. Use decoded
-requirements/caller storage or a suitable allocator budget for output. An allocator limit alone
+`Container.parse(source).scratchCount()` before reserving scratch or choosing allocating decode.
+Use decoded requirements/caller storage or a suitable allocator budget for output. An allocator limit alone
 does not bound CPU time; the host controls request concurrency and execution policy.
 
 ```zig
@@ -141,15 +164,15 @@ test "borrow ordinary WAVE chunks" {
     const encoded = try wav.encodePcm16Into(.{
         .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 0.5 },
     }, &bytes);
-    const container = try wav.parse(encoded);
+    const container = try wav.Container.parse(encoded);
     try std.testing.expectEqual(0, container.scratchCount());
     var chunks = try container.iterator(&.{});
     const format_chunk = (try chunks.next()).?;
     try std.testing.expectEqualStrings("fmt ", format_chunk.id);
-    const format = try wav.parseFormat(format_chunk.data);
+    const format = try wav.Format.parse(format_chunk.data);
     const data = (try chunks.next()).?;
     try std.testing.expectEqualStrings("data", data.id);
-    try std.testing.expectEqual(2, try wav.frameCount(format, data.data.len));
+    try std.testing.expectEqual(2, try format.frameCount(data.data.len));
     try std.testing.expectEqual(null, try chunks.next());
 }
 ```
@@ -160,9 +183,10 @@ used scratch; extra capacity stays unchanged.
 
 ## Parallel conversion through std.Io
 
-Pass a `std.Io` provider, address-stable caller `Worker` storage and `ParallelOptions`. The provider
-may execute inline and controls its own scheduling allocations; Wingman creates no thread pool.
-Defaults use serial conversion below256KiB and target at least64KiB of encoded data per job.
+Pass a `std.Io` provider, address-stable caller `DecodeWorker` storage and `ParallelOptions`.
+The provider may execute inline and controls its own scheduling allocations; Wingman creates no
+thread pool.
+Defaults use serial conversion below 256 KiB and target at least 64 KiB of encoded data per job.
 Whole frames or ADPCM blocks form disjoint partitions. Thresholds or too few workers can select
 serial conversion. Worker capacity bounds participants, including the calling thread.
 
@@ -182,15 +206,17 @@ test "parallel API permits an inline std.Io provider" {
         .samples = &.{ -1, 1, -0.5, 0.5, 0, 0.25 },
     }, &bytes);
     var samples: [6]f32 = undefined;
-    var workers: [2]wav.Worker = undefined;
-    const audio = try wav.decodeParallelInto(
-        std.Io.failing, encoded, &samples, &.{}, &workers,
-        .{ .minimum_bytes = 0, .minimum_job_bytes = 1 },
-    );
-    try std.testing.expectEqualSlices(
-        f32, &.{ -1, 32767.0 / 32768.0, -0.5, 0.5, 0, 0.25 }, audio.samples,
-    );
-    for (workers) |worker| try std.testing.expectEqual(0, worker.source.len);
+    var workers: [2]wav.DecodeWorker = undefined;
+    // Each call joins its jobs, so both the output and worker reservations can be reused.
+    for (0..2) |_| {
+        const audio = try wav.decodeParallelInto(
+            std.Io.failing, encoded, &samples, &.{}, &workers,
+            .{ .minimum_bytes = 0, .minimum_job_bytes = 1 },
+        );
+        try std.testing.expectEqualSlices(
+            f32, &.{ -1, 32767.0 / 32768.0, -0.5, 0.5, 0, 0.25 }, audio.samples,
+        );
+    }
 }
 ```
 

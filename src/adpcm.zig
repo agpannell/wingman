@@ -13,9 +13,6 @@ const overlaps = @import("common/byte_ranges.zig").overlaps;
 const sample_rounding = @import("common/round.zig");
 const testing = std.testing;
 
-/// Specific block layouts, rather than a claim to support every ADPCM dialect.
-pub const Encoding = enum { microsoft_wave, ima_wave };
-
 /// Block layout supplied by a container parser or protocol. A frame has one sample per channel.
 /// Channels must be one or two; every encoded block has exactly block_bytes bytes and represents
 /// frames_per_block frames. No rate, container or allocation policy is retained.
@@ -33,7 +30,18 @@ pub const Format = struct {
     /// through the call. For either encoding this span must be disjoint from used output bytes.
     coefficients: []const u8 = &.{},
 
-    fn validate(self: Format) error{ InvalidFormat, SizeOverflow }!void {
+    /// Specific block layouts, rather than a claim to support every ADPCM dialect.
+    pub const Encoding = enum { microsoft_wave, ima_wave };
+
+    /// Invalid channel/block/coefficient geometry, or overflow while sizing its represented frames.
+    pub const Error = error{ InvalidFormat, SizeOverflow };
+
+    /// Counting also rejects incomplete source frames or encoded blocks.
+    pub const CountError = Error || error{InvalidData};
+
+    /// Checks complete block geometry and coefficient-table extent without reading encoded samples
+    /// or coefficient values. No source or output storage is retained.
+    pub fn validate(self: Format) Error!void {
         if (self.channels == 0 or self.channels > 2) return error.InvalidFormat;
         const channels: usize = self.channels;
         const header = channels * @as(usize, if (self.encoding == .ima_wave) 4 else 7);
@@ -62,43 +70,48 @@ pub const Format = struct {
         };
         if (self.frames_per_block != frames) return error.InvalidFormat;
     }
-};
 
-/// Invalid geometry, incomplete frames or blocks, or an unrepresentable count.
-pub const CountError = error{ InvalidFormat, InvalidData, SizeOverflow };
+    test validate {
+        const complete: Format = .{
+            .encoding = .ima_wave,
+            .channels = 1,
+            .block_bytes = 8,
+            .frames_per_block = 9,
+        };
+        try complete.validate();
+        var partial_word = complete;
+        partial_word.block_bytes = 7;
+        try testing.expectError(error.InvalidFormat, partial_word.validate());
+    }
+
+    /// Count decoded frames from validated geometry and whole source blocks without inspecting
+    /// predictor headers, coefficient values or adaptive updates. Empty input still validates
+    /// Format. Reject malformed geometry, partial blocks and unrepresentable counts.
+    pub fn frameCount(self: Format, byte_count: usize) CountError!usize {
+        try self.validate();
+        if (byte_count % self.block_bytes != 0) return error.InvalidData;
+        return std.math.mul(
+            usize,
+            byte_count / self.block_bytes,
+            self.frames_per_block,
+        ) catch error.SizeOverflow;
+    }
+
+    test frameCount {
+        const format: Format = .{
+            .encoding = .ima_wave,
+            .channels = 1,
+            .block_bytes = 8,
+            .frames_per_block = 9,
+        };
+        try testing.expectEqual(18, try format.frameCount(16));
+        try testing.expectError(error.InvalidData, format.frameCount(15));
+    }
+};
 
 /// Malformed geometry/blocks, Microsoft delta beyond its supported range, size overflow, or
 /// insufficient/aliased output. The delta range restriction returns InvalidData.
-pub const DecodeError = error{
-    InvalidFormat,
-    InvalidData,
-    SizeOverflow,
-    DestinationTooSmall,
-    Aliasing,
-};
-
-/// Deterministic block initialization and greedy nibble selection. Each channel is independent;
-/// equal-error choices use the lowest nibble, and a preview/fast tie uses fast.
-pub const Strategy = enum {
-    /// Start IMA at step index zero; start Microsoft at predictor zero with the initial difference
-    /// clamped to 16...32767.
-    fast,
-    /// Try up to 89 IMA indices or 256 Microsoft predictors with seven initial deltas, each on up
-    /// to 16 supplied coded samples. Keep the candidate only when its decoded PCM16 squared error
-    /// over the caller's supplied frames in that channel and block is lower than fast. Zero padding
-    /// is excluded from this score. This does not guarantee lower error on a shorter prefix or
-    /// better perceptual quality. Additional candidate passes trade speed for potentially lower
-    /// error.
-    preview,
-};
-
-/// Treatment of an input that ends before a complete block.
-pub const Tail = enum {
-    /// Encode a final block with zero PCM samples after the supplied frames.
-    pad,
-    /// Reject input that does not contain a whole number of blocks.
-    strict,
-};
+pub const DecodeError = Format.CountError || error{ DestinationTooSmall, Aliasing };
 
 /// Per-call encoder choices. The strategy is selected explicitly by the caller.
 pub const EncodeOptions = struct {
@@ -106,6 +119,29 @@ pub const EncodeOptions = struct {
     strategy: Strategy,
     /// How to handle a final partial block.
     tail: Tail = .pad,
+
+    /// Deterministic block initialization and greedy nibble selection. Each channel is independent;
+    /// equal-error choices use the lowest nibble, and a preview/fast tie uses fast.
+    pub const Strategy = enum {
+        /// Start IMA at step index zero; start Microsoft at predictor zero with the initial
+        /// difference clamped to 16...32767.
+        fast,
+        /// Try up to 89 IMA indices or 256 Microsoft predictors with seven initial deltas, each on
+        /// up to 16 supplied coded samples. Keep the candidate only when its decoded PCM16 squared
+        /// error over the caller's supplied frames in that channel and block is lower than fast.
+        /// Zero padding is excluded from this score. This does not guarantee lower error on a
+        /// shorter prefix or better perceptual quality. Additional candidate passes trade speed for
+        /// potentially lower error.
+        preview,
+    };
+
+    /// Treatment of an input that ends before a complete block.
+    pub const Tail = enum {
+        /// Encode a final block with zero PCM samples after the supplied frames.
+        pad,
+        /// Reject input that does not contain a whole number of blocks.
+        strict,
+    };
 };
 
 /// Required byte storage and the actual and encoded frame counts.
@@ -128,8 +164,11 @@ pub const EncodeResult = struct {
     encoded_frame_count: usize,
 };
 
-/// Invalid geometry or samples, unrepresentable size, insufficient output capacity or overlap.
-pub const EncodeError = CountError || error{ InvalidSamples, DestinationTooSmall, Aliasing };
+/// PCM16 encoding accepts every sample value; only geometry, size, capacity or overlap can fail.
+pub const EncodeI16Error = Format.CountError || error{ DestinationTooSmall, Aliasing };
+
+/// Float encoding also rejects nonfinite samples and values outside [-1, 1].
+pub const EncodeError = EncodeI16Error || error{InvalidSamples};
 
 /// Computes complete-block output size without inspecting sample values. `sample_count` counts
 /// interleaved samples, not frames. A padded block represents `encoded_frame_count` frames; retain
@@ -138,8 +177,8 @@ pub const EncodeError = CountError || error{ InvalidSamples, DestinationTooSmall
 pub fn encodeRequirements(
     sample_count: usize,
     format: Format,
-    tail: Tail,
-) CountError!EncodeRequirements {
+    tail: EncodeOptions.Tail,
+) Format.CountError!EncodeRequirements {
     try format.validate();
     const channels: usize = format.channels;
     if (sample_count % channels != 0) return error.InvalidData;
@@ -219,7 +258,7 @@ pub fn encodeI16Into(
     destination: []u8,
     format: Format,
     options: EncodeOptions,
-) EncodeError!EncodeResult {
+) EncodeI16Error!EncodeResult {
     const requirements = try encodeRequirements(source.len, format, options.tail);
     return encodeSamples(i16, source, destination, format, options, requirements);
 }
@@ -248,7 +287,7 @@ fn encodeSamples(
     format: Format,
     options: EncodeOptions,
     requirements: EncodeRequirements,
-) EncodeError!EncodeResult {
+) error{ DestinationTooSmall, Aliasing }!EncodeResult {
     // Admission finishes before the first block write. Only the used output prefix must be disjoint
     // from the source and coefficients; spare destination capacity is not written.
     if (destination.len < requirements.byte_count) return error.DestinationTooSmall;
@@ -280,30 +319,6 @@ fn encodeSamples(
     };
 }
 
-/// Count decoded frames from validated geometry and whole source blocks without inspecting
-/// predictor headers, coefficient values or adaptive updates. Empty input still validates Format.
-/// Reject malformed geometry, partial blocks and unrepresentable counts.
-pub fn frameCount(byte_count: usize, format: Format) CountError!usize {
-    try format.validate();
-    if (byte_count % format.block_bytes != 0) return error.InvalidData;
-    return std.math.mul(
-        usize,
-        byte_count / format.block_bytes,
-        format.frames_per_block,
-    ) catch error.SizeOverflow;
-}
-
-test frameCount {
-    const format: Format = .{
-        .encoding = .ima_wave,
-        .channels = 1,
-        .block_bytes = 8,
-        .frames_per_block = 9,
-    };
-    try testing.expectEqual(18, try frameCount(16, format));
-    try testing.expectError(error.InvalidData, frameCount(15, format));
-}
-
 /// Decode all complete blocks to interleaved f32 samples and return the used destination prefix.
 /// Each sample is a signed PCM16 integer divided by 32768, exactly representable as f32. Spare
 /// destination remains unchanged. Source and coefficients are borrowed through the call; the
@@ -313,7 +328,7 @@ test frameCount {
 /// output. Malformed blocks can leave partial output; disregard the used region on error. See
 /// decodePrefixInto for the same admission and full-source validation with shorter output.
 pub fn decodeInto(source: []const u8, destination: []f32, format: Format) DecodeError![]f32 {
-    return decodePrefixInto(source, destination, try frameCount(source.len, format), format);
+    return decodePrefixInto(source, destination, try format.frameCount(source.len), format);
 }
 
 test decodeInto {
@@ -346,7 +361,7 @@ pub fn decodePrefixInto(
     frames: usize,
     format: Format,
 ) DecodeError![]f32 {
-    const complete = try frameCount(source.len, format);
+    const complete = try format.frameCount(source.len);
     if (frames > complete) return error.InvalidData;
     const count = std.math.mul(usize, frames, format.channels) catch return error.SizeOverflow;
     if (destination.len < count) return error.DestinationTooSmall;
@@ -378,19 +393,26 @@ test decodePrefixInto {
     var output: [1]f32 = undefined;
     _ = try decodePrefixInto(&.{ 0, 128, 0, 0, 255, 127, 0, 0 }, &output, 1, format);
     try testing.expectEqual(-1, output[0]);
-    try testing.expectError(error.InvalidData, decodePrefixInto(&.{
-        0, 0, 89, 0,
-    }, &.{}, 0, format));
+    try testing.expectError(
+        error.InvalidData,
+        decodePrefixInto(&.{ 0, 0, 89, 0 }, &.{}, 0, format),
+    );
 }
 
-// The block encoder reads absent final samples as zero after public admission has checked frames.
-
+// Reconstructed PCM16 history and adaptive quantization for one channel. Trial encoding copies this
+// state, then uses the same feedback transitions as the emitted block.
 const BlockState = struct {
+    /// Most recent reconstructed sample; also the sole IMA predictor.
     sample_1: i32,
+    /// Previous reconstructed sample, used only by Microsoft prediction.
     sample_2: i32 = 0,
+    /// Microsoft correction scale, adapted after each coded sample.
     delta: i32 = 16,
+    /// IMA step-table index.
     index: u8 = 0,
+    /// Microsoft coefficient-pair ordinal, stored in the block header.
     predictor: u8 = 0,
+    /// Microsoft 8.8 prediction coefficients selected by predictor.
     coefficients: [2]i32 = .{ 0, 0 },
 };
 
@@ -403,6 +425,7 @@ fn blockCoefficients(format: Format, predictor: u8) [2]i32 {
 }
 
 fn blockSample(comptime Sample: type, source: []const Sample, index: usize) i16 {
+    // Public admission checked whole frames; missing final-block samples are zero padding.
     if (index >= source.len) return 0;
     if (Sample == i16) return source[index];
     return @intCast(@min(32767, sample_rounding.halfAwayScaled(source[index], 32768)));
@@ -443,7 +466,11 @@ fn blockStep(format: Format, state: BlockState, nibble: u4) ?BlockState {
     return next;
 }
 
-fn blockChoice(format: Format, state: BlockState, sample: i16) struct { u4, BlockState } {
+fn blockChoice(
+    format: Format,
+    state: BlockState,
+    sample: i16,
+) struct { nibble: u4, state: BlockState } {
     var best_error: u64 = std.math.maxInt(u64);
     var best_nibble: u4 = 0;
     var best_state = state;
@@ -478,7 +505,7 @@ fn blockChoice(format: Format, state: BlockState, sample: i16) struct { u4, Bloc
     }
     // Nibble zero always reduces a valid Microsoft delta and is valid for IMA.
     std.debug.assert(best_error != std.math.maxInt(u64));
-    return .{ best_nibble, best_state };
+    return .{ .nibble = best_nibble, .state = best_state };
 }
 
 test "greedy block choice preserves tie order and bounded state" {
@@ -498,30 +525,30 @@ test "greedy block choice preserves tie order and bounded state" {
 
     // With IMA step 7, codes 0 and 8 both reconstruct zero; the lower code wins.
     const zero = blockChoice(ima, .{ .sample_1 = 0 }, 0);
-    try testing.expectEqual(@as(u4, 0), zero[0]);
-    try testing.expectEqual(@as(i32, 0), zero[1].sample_1);
+    try testing.expectEqual(@as(u4, 0), zero.nibble);
+    try testing.expectEqual(@as(i32, 0), zero.state.sample_1);
     const minus_one = blockChoice(ima, .{ .sample_1 = 0 }, -1);
-    try testing.expectEqual(@as(u4, 9), minus_one[0]);
-    try testing.expectEqual(@as(i32, -1), minus_one[1].sample_1);
+    try testing.expectEqual(@as(u4, 9), minus_one.nibble);
+    try testing.expectEqual(@as(i32, -1), minus_one.state.sample_1);
 
     // Saturated equal samples can update the index differently; code zero leaves index 87.
     const saturated = blockChoice(ima, .{ .sample_1 = 32767, .index = 88 }, 32767);
-    try testing.expectEqual(@as(u4, 0), saturated[0]);
-    try testing.expectEqual(@as(u8, 87), saturated[1].index);
+    try testing.expectEqual(@as(u4, 0), saturated.nibble);
+    try testing.expectEqual(@as(u8, 87), saturated.state.index);
     const lower = blockChoice(ima, .{ .sample_1 = -32768, .index = 88 }, -32768);
-    try testing.expectEqual(@as(u4, 8), lower[0]);
-    try testing.expectEqual(@as(i32, -32768), lower[1].sample_1);
+    try testing.expectEqual(@as(u4, 8), lower.nibble);
+    try testing.expectEqual(@as(i32, -32768), lower.state.sample_1);
 
     // High adaptive deltas make several otherwise attractive Microsoft codes inadmissible.
     const state: BlockState = .{ .sample_1 = 0, .delta = 2147483647, .coefficients = .{ 256, 0 } };
     const high = blockChoice(ms, state, 32767);
-    try testing.expectEqual(@as(u4, 1), high[0]);
-    try testing.expectEqual(@as(i32, 32767), high[1].sample_1);
-    try testing.expectEqual(@as(i32, 1929379839), high[1].delta);
+    try testing.expectEqual(@as(u4, 1), high.nibble);
+    try testing.expectEqual(@as(i32, 32767), high.state.sample_1);
+    try testing.expectEqual(@as(i32, 1929379839), high.state.delta);
     const low = blockChoice(ms, state, -32768);
-    try testing.expectEqual(@as(u4, 13), low[0]);
-    try testing.expectEqual(@as(i32, -32768), low[1].sample_1);
-    try testing.expectEqual(@as(i32, 1929379839), low[1].delta);
+    try testing.expectEqual(@as(u4, 13), low.nibble);
+    try testing.expectEqual(@as(i32, -32768), low.state.sample_1);
+    try testing.expectEqual(@as(i32, 1929379839), low.state.delta);
 }
 
 fn expectImaChoiceMatchesAllCodes(format: Format, state: BlockState, sample: i16) !void {
@@ -540,8 +567,8 @@ fn expectImaChoiceMatchesAllCodes(format: Format, state: BlockState, sample: i16
         }
     }
     const actual = blockChoice(format, state, sample);
-    try testing.expectEqual(best_nibble, actual[0]);
-    try testing.expectEqualDeep(best_state, actual[1]);
+    try testing.expectEqual(best_nibble, actual.nibble);
+    try testing.expectEqualDeep(best_state, actual.state);
 }
 
 test "IMA sign pruning matches every transition at midpoint boundaries" {
@@ -575,7 +602,7 @@ test "IMA sign pruning matches every transition at midpoint boundaries" {
         for (0..128) |_| {
             const sample = random.random().int(i16);
             try expectImaChoiceMatchesAllCodes(format, state, sample);
-            state = blockChoice(format, state, sample)[1];
+            state = blockChoice(format, state, sample).state;
         }
     }
 }
@@ -596,8 +623,8 @@ fn blockRun(
     for (0..count) |index| {
         const sample = blockSample(Sample, source, (seeds + index) * channels + channel);
         const choice = blockChoice(format, state, sample);
-        const nibble = choice[0];
-        state = choice[1];
+        const nibble = choice.nibble;
+        state = choice.state;
         const difference = @as(i64, sample) - state.sample_1;
         total += @as(u64, @intCast(difference * difference));
         // The same transitions score a trial and emit the final block. Microsoft mono uses the high
@@ -667,7 +694,7 @@ fn encodeFullBlock(
     source: []const Sample,
     output: []u8,
     format: Format,
-    strategy: Strategy,
+    strategy: EncodeOptions.Strategy,
 ) void {
     const channels: usize = format.channels;
     const seeds: usize = if (format.encoding == .ima_wave) 1 else 2;
@@ -737,7 +764,7 @@ test "complete block strategies preserve seeds and preview fallback" {
     var source: [242]i16 = undefined;
     var random = std.Random.DefaultPrng.init(0xada5_01);
     for (&source) |*sample| sample.* = random.random().int(i16);
-    for ([_]Encoding{ .ima_wave, .microsoft_wave }) |encoding| {
+    for ([_]Format.Encoding{ .ima_wave, .microsoft_wave }) |encoding| {
         for ([_]u16{ 1, 2 }) |channels| {
             const payload = 64 - @as(
                 usize,
@@ -787,7 +814,7 @@ test "complete block strategies preserve seeds and preview fallback" {
 
 test "ADPCM encoding pads whole frames and reports both frame counts" {
     const coefficients = [_]u8{ 0, 1, 0, 0, 0, 2, 0, 255 };
-    for ([_]Encoding{ .ima_wave, .microsoft_wave }) |encoding| {
+    for ([_]Format.Encoding{ .ima_wave, .microsoft_wave }) |encoding| {
         for ([_]u16{ 1, 2 }) |channels| {
             const block_bytes: usize = if (encoding == .ima_wave) channels * 8 else channels * 8;
             const frames: usize = if (encoding == .ima_wave) 9 else 4;
@@ -798,7 +825,7 @@ test "ADPCM encoding pads whole frames and reports both frame counts" {
                 .frames_per_block = frames,
                 .coefficients = &coefficients,
             };
-            for ([_]Strategy{ .fast, .preview }) |strategy| {
+            for ([_]EncodeOptions.Strategy{ .fast, .preview }) |strategy| {
                 for (
                     [_]usize{ 0, 1, frames - 1, frames, frames + 1, frames * 2 - 1, frames * 2 },
                 ) |count| {
@@ -898,7 +925,7 @@ test "preview scores supplied frames rather than padding" {
         },
     };
     for (cases) |case| {
-        for ([_]Strategy{ .fast, .preview }) |strategy| {
+        for ([_]EncodeOptions.Strategy{ .fast, .preview }) |strategy| {
             var bytes: [15]u8 = undefined;
             const encoded = try encodeI16Into(
                 case.samples,
@@ -979,9 +1006,10 @@ test "ADPCM encoding rejects incomplete frames, overflow and coefficient overlap
     const original = storage;
     var aliased = stereo;
     aliased.coefficients = storage[0..4];
-    try testing.expectError(error.Aliasing, encodeI16Into(&.{
-        1, 2,
-    }, &storage, aliased, .{ .strategy = .fast }));
+    try testing.expectError(
+        error.Aliasing,
+        encodeI16Into(&.{ 1, 2 }, &storage, aliased, .{ .strategy = .fast }),
+    );
     try testing.expectEqualSlices(u8, &original, &storage);
 }
 
@@ -1275,7 +1303,7 @@ test "ADPCM geometry refuses overflow before touching sample storage" {
         .frames_per_block = 9,
     };
     const bytes = std.math.maxInt(usize) / 8 * 8;
-    try testing.expectError(error.SizeOverflow, frameCount(bytes, format));
+    try testing.expectError(error.SizeOverflow, format.frameCount(bytes));
     var destination: [9]f32 = @splat(123);
     try testing.expectError(
         error.InvalidFormat,
@@ -1310,7 +1338,7 @@ test "ADPCM empty input does not size absent blocks" {
             },
         },
     ) |format| {
-        try testing.expectEqual(0, try frameCount(0, format));
+        try testing.expectEqual(0, try format.frameCount(0));
         var storage: [2]f32 = @splat(123);
         const destination: []f32 = &storage;
         const complete = try decodeInto(&.{}, destination, format);
@@ -1338,21 +1366,25 @@ test "IMA mono and stereo words have independent state and reserved bytes" {
     // their independent predictors advance in opposite directions.
     const mono = [_]u8{ 0, 0, 0, 0xff, 0x11, 0x11, 0x11, 0x11 };
     var output: [20]f32 = @splat(42);
-    try expectSamples(&.{ 0, 1, 2, 3, 4, 5, 6, 7, 8 }, try decodeInto(
-        &mono,
-        &output,
-        .{ .encoding = .ima_wave, .channels = 1, .block_bytes = 8, .frames_per_block = 9 },
-    ));
+    try expectSamples(
+        &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8 },
+        try decodeInto(
+            &mono,
+            &output,
+            .{ .encoding = .ima_wave, .channels = 1, .block_bytes = 8, .frames_per_block = 9 },
+        ),
+    );
     const stereo = [_]u8{
         0, 0, 0, 0xaa, 100, 0, 0, 0xbb, 0x11, 0x11, 0x11, 0x11, 0x99, 0x99, 0x99, 0x99,
     };
-    try expectSamples(&.{
-        0, 100, 1, 99, 2, 98, 3, 97, 4, 96, 5, 95, 6, 94, 7, 93, 8, 92,
-    }, try decodeInto(
-        &stereo,
-        &output,
-        .{ .encoding = .ima_wave, .channels = 2, .block_bytes = 16, .frames_per_block = 9 },
-    ));
+    try expectSamples(
+        &.{ 0, 100, 1, 99, 2, 98, 3, 97, 4, 96, 5, 95, 6, 94, 7, 93, 8, 92 },
+        try decodeInto(
+            &stereo,
+            &output,
+            .{ .encoding = .ima_wave, .channels = 2, .block_bytes = 16, .frames_per_block = 9 },
+        ),
+    );
     try testing.expectEqualSlices(f32, &.{ 42, 42 }, output[18..]);
 }
 
@@ -1362,42 +1394,51 @@ test "Microsoft stereo seed order signed feedback and unsigned initial delta" {
     const coefficients = [_]u8{ 0, 1, 0, 0 };
     const stereo = [_]u8{ 0, 0, 16, 0, 32, 0, 100, 0, 0x9c, 0xff, 90, 0, 0xa6, 0xff, 0x1f };
     var output: [6]f32 = undefined;
-    try expectSamples(&.{ 90, -90, 100, -100, 116, -132 }, try decodeInto(
-        &stereo,
-        &output,
-        .{
-            .encoding = .microsoft_wave,
-            .channels = 2,
-            .block_bytes = 15,
-            .frames_per_block = 3,
-            .coefficients = &coefficients,
-        },
-    ));
+    try expectSamples(
+        &.{ 90, -90, 100, -100, 116, -132 },
+        try decodeInto(
+            &stereo,
+            &output,
+            .{
+                .encoding = .microsoft_wave,
+                .channels = 2,
+                .block_bytes = 15,
+                .frames_per_block = 3,
+                .coefficients = &coefficients,
+            },
+        ),
+    );
     const high_delta = [_]u8{ 0, 0xff, 0xff, 0, 0, 0, 0, 0x10 };
-    try expectSamples(&.{ 0, 0, 32767, 32767 }, try decodeInto(
-        &high_delta,
-        &output,
-        .{
-            .encoding = .microsoft_wave,
-            .channels = 1,
-            .block_bytes = 8,
-            .frames_per_block = 4,
-            .coefficients = &coefficients,
-        },
-    ));
+    try expectSamples(
+        &.{ 0, 0, 32767, 32767 },
+        try decodeInto(
+            &high_delta,
+            &output,
+            .{
+                .encoding = .microsoft_wave,
+                .channels = 1,
+                .block_bytes = 8,
+                .frames_per_block = 4,
+                .coefficients = &coefficients,
+            },
+        ),
+    );
     const fractional_coefficients = [_]u8{ 240, 0, 0, 0 };
     const fractional = [_]u8{ 0, 37, 0, 0xff, 0xff, 0xff, 0xff, 0 };
-    try expectSamples(&.{ -1, -1, 0, 0 }, try decodeInto(
-        &fractional,
-        &output,
-        .{
-            .encoding = .microsoft_wave,
-            .channels = 1,
-            .block_bytes = 8,
-            .frames_per_block = 4,
-            .coefficients = &fractional_coefficients,
-        },
-    ));
+    try expectSamples(
+        &.{ -1, -1, 0, 0 },
+        try decodeInto(
+            &fractional,
+            &output,
+            .{
+                .encoding = .microsoft_wave,
+                .channels = 1,
+                .block_bytes = 8,
+                .frames_per_block = 4,
+                .coefficients = &fractional_coefficients,
+            },
+        ),
+    );
 }
 
 test "every mono prefix and source residue preserves guards and block resets" {
@@ -1543,30 +1584,36 @@ test "source and coefficients may touch output or occupy unused capacity" {
     @memcpy(bytes[16..20], &coefficients);
     @memcpy(bytes[20..28], &block);
     const spare = shared[4..16].*;
-    try expectSamples(&.{ -100, 100, 116, 148 }, try decodeInto(
-        bytes[20..28],
-        &shared,
-        .{
-            .encoding = .microsoft_wave,
-            .channels = 1,
-            .block_bytes = 8,
-            .frames_per_block = 4,
-            .coefficients = bytes[16..20],
-        },
-    ));
+    try expectSamples(
+        &.{ -100, 100, 116, 148 },
+        try decodeInto(
+            bytes[20..28],
+            &shared,
+            .{
+                .encoding = .microsoft_wave,
+                .channels = 1,
+                .block_bytes = 8,
+                .frames_per_block = 4,
+                .coefficients = bytes[16..20],
+            },
+        ),
+    );
     try testing.expectEqualSlices(u8, std.mem.asBytes(&spare), bytes[16..]);
     @memcpy(bytes[0..8], &block);
-    try expectSamples(&.{ -100, 100, 116, 148 }, try decodeInto(
-        bytes[0..8],
-        shared[2..6],
-        .{
-            .encoding = .microsoft_wave,
-            .channels = 1,
-            .block_bytes = 8,
-            .frames_per_block = 4,
-            .coefficients = &coefficients,
-        },
-    ));
+    try expectSamples(
+        &.{ -100, 100, 116, 148 },
+        try decodeInto(
+            bytes[0..8],
+            shared[2..6],
+            .{
+                .encoding = .microsoft_wave,
+                .channels = 1,
+                .block_bytes = 8,
+                .frames_per_block = 4,
+                .coefficients = &coefficients,
+            },
+        ),
+    );
     try testing.expectEqualSlices(u8, &block, bytes[0..8]);
 }
 

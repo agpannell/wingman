@@ -23,26 +23,29 @@ pub fn main(init: std.process.Init) !void {
         bytes: []const u8,
         format: adpcm.Format,
         expected: []const i16,
-    }{ .{
-        .bytes = &microsoft,
-        .format = .{
-            .encoding = .microsoft_wave,
-            .channels = 1,
-            .block_bytes = 8,
-            .frames_per_block = 4,
-            .coefficients = &coefficients,
+    }{
+        .{
+            .bytes = &microsoft,
+            .format = .{
+                .encoding = .microsoft_wave,
+                .channels = 1,
+                .block_bytes = 8,
+                .frames_per_block = 4,
+                .coefficients = &coefficients,
+            },
+            .expected = &.{ -100, 100, 116, 148 },
         },
-        .expected = &.{ -100, 100, 116, 148 },
-    }, .{
-        .bytes = &ima,
-        .format = .{
-            .encoding = .ima_wave,
-            .channels = 1,
-            .block_bytes = 8,
-            .frames_per_block = 9,
+        .{
+            .bytes = &ima,
+            .format = .{
+                .encoding = .ima_wave,
+                .channels = 1,
+                .block_bytes = 8,
+                .frames_per_block = 9,
+            },
+            .expected = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8 },
         },
-        .expected = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8 },
-    } };
+    };
 
     var output_buffer: [512]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &output_buffer);
@@ -55,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
 
         // frameCount validates the format and complete-block size without reading the headers. Each
         // frame needs one output slot per channel. Nine slots suffice for these mono blocks.
-        const frame_count = try adpcm.frameCount(block.len, format);
+        const frame_count = try format.frameCount(block.len);
         const sample_count = frame_count * format.channels;
         var sample_storage: [9]f32 = undefined;
         if (sample_storage.len < sample_count) return error.DestinationTooSmall;

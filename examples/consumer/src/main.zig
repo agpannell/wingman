@@ -789,16 +789,23 @@ test "WAVE chunk inspection and inline std.Io conversion use the public namespac
         .{ .sample_rate = 48000, .channels = .stereo, .samples = &.{ -1, 1, -0.5, 0.5, 0, 0.25 } },
         &bytes,
     );
-    const container = try wav.parse(encoded);
+    const container = try wav.Container.parse(encoded);
     var chunks = try container.iterator(&.{});
     const format_chunk = (try chunks.next()).?;
     try std.testing.expectEqualStrings("fmt ", format_chunk.id);
-    const format = try wav.parseFormat(format_chunk.data);
+    const parsed: wav.Format.Error!wav.Format = wav.Format.parse(format_chunk.data);
+    const format = try parsed;
+    const geometry: wav.Format.BlockLayout = format.blockLayout();
+    try std.testing.expectEqual(wav.Channels.stereo, format.channels());
+    try std.testing.expectEqual(4, geometry.block_bytes);
+    try std.testing.expectEqual(1, geometry.frames_per_block);
     const data = (try chunks.next()).?;
-    try std.testing.expectEqual(3, try wav.frameCount(format, data.data.len));
+    try std.testing.expectEqual(3, try format.frameCount(data.data.len));
     try std.testing.expectEqual(null, try chunks.next());
+    chunks.restart();
+    try std.testing.expectEqualStrings("fmt ", (try chunks.next()).?.id);
     var samples: [6]f32 = undefined;
-    var workers: [2]wav.Worker = undefined;
+    var workers: [2]wav.DecodeWorker = undefined;
     const view = try wav.decodeParallelInto(
         std.Io.failing,
         encoded,
@@ -969,7 +976,9 @@ test "ADPCM Microsoft literal samples from caller-owned coefficients" {
         .frames_per_block = 4,
         .coefficients = &coefficients,
     };
-    try std.testing.expectEqual(4, try adpcm.frameCount(source.len, format));
+    const admitted: adpcm.Format.Error!void = format.validate();
+    try admitted;
+    try std.testing.expectEqual(4, try format.frameCount(source.len));
     var output: [6]f32 = @splat(42);
     const decoded = try adpcm.decodeInto(&source, &output, format);
     try std.testing.expectEqualSlices(
@@ -1004,7 +1013,7 @@ test "ADPCM encoder reports padded capacity and trims supplied frames" {
     );
     var bytes: [8]u8 = undefined;
     const encoded = try adpcm.encodeI16Into(&input, &bytes, format, .{ .strategy = .preview });
-    const counted: adpcm.CountError!usize = adpcm.frameCount(encoded.bytes.len, format);
+    const counted: adpcm.Format.CountError!usize = format.frameCount(encoded.bytes.len);
     const frames = counted catch |err| switch (err) {
         error.InvalidFormat, error.InvalidData, error.SizeOverflow => return err,
     };
