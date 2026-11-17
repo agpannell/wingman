@@ -147,8 +147,9 @@ The [public entry](../src/acclaim.zig) groups the paired format API. Under `src/
 owns retained data/views, `text.zig` lexical admission, `skeleton.zig` ASF materialization,
 `motion.zig` AMC completion and `pose.zig` prepared interpretation. Authored controls live in
 `fixtures.zig`, with tests beside their implementations. BVH and Acclaim share strict numeric
-admission in [`common/ascii_number.zig`](../src/common/ascii_number.zig) and geometric arithmetic in
-[`common/rigid_transform.zig`](../src/common/rigid_transform.zig); the common namespace stays internal.
+admission in [`common/ascii_number.zig`](../src/common/ascii_number.zig) and the
+[`RigidTransform` value](../src/common/RigidTransform.zig). Callers use `wingman.RigidTransform`;
+its shared [3×3 matrix arithmetic](../src/common/matrix3.zig) stays internal.
 
 The skeleton reservation pass scans boundaries and names before materialization without imposing
 a fixed bone count or repeatedly splitting whole lines. Motion loading counts frames and reserves

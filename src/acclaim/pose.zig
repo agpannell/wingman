@@ -6,9 +6,8 @@
 const std = @import("std");
 const overlaps = @import("../common/byte_ranges.zig").overlaps;
 const model = @import("model.zig");
-const rigid = @import("../common/rigid_transform.zig");
-const RigidTransform = rigid.RigidTransform;
-const multiply = rigid.multiply;
+const RigidTransform = @import("../common/RigidTransform.zig");
+const matrix3 = @import("../common/matrix3.zig");
 const finite = RigidTransform.isFinite;
 
 /// Interpretation of nonzero ASF root orientation. Both choices agree when that orientation is
@@ -240,9 +239,9 @@ pub const PoseEvaluator = struct {
             .l => unreachable,
         };
         if (index == 0 and self.root_orientation == .rest) {
-            result.rotation = multiply(prepared.basis, result.rotation);
+            result.rotation = matrix3.multiply(prepared.basis, result.rotation);
         } else if (bone.dof_count != 0) {
-            const basis_times_motion = multiply(prepared.basis, result.rotation);
+            const basis_times_motion = matrix3.multiply(prepared.basis, result.rotation);
             result.rotation = multiplyTranspose(basis_times_motion, prepared.basis);
         }
         // The root's channels are positions in file axes, not sequential affine translations.
@@ -273,7 +272,8 @@ fn axisRotation(angles: [3]f64, order: model.RotationOrder, unit: model.AngleUni
         .zyx => .{ 2, 1, 0 },
     };
     var result = identity_matrix;
-    for (axes) |axis| rotate(&result, axis, radians(angles[axis], unit));
+    for (axes) |axis|
+        rotate(&result, axis, radians(angles[axis], unit));
     return result;
 }
 
@@ -315,11 +315,13 @@ const fixtures = @import("fixtures.zig");
 const parseSkeletonAlloc = @import("skeleton.zig").parseSkeletonAlloc;
 
 fn expectVector(expected: [3]f64, actual: [3]f64) !void {
-    for (expected, actual) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+    for (expected, actual) |a, b|
+        try std.testing.expectApproxEqAbs(a, b, 1e-12);
 }
 
 fn expectMatrix(expected: Matrix, actual: Matrix) !void {
-    for (expected, actual) |a, b| try expectVector(a, b);
+    for (expected, actual) |a, b|
+        try expectVector(a, b);
 }
 
 test "pose origins, endpoint, channel order, scale and both root interpretations" {
@@ -327,9 +329,12 @@ test "pose origins, endpoint, channel order, scale and both root interpretations
     var skeleton = try parseSkeletonAlloc(allocator, fixtures.skeleton, null, .{});
     defer skeleton.deinit(allocator);
     // TZ TX TY RZ RX RY, tip RY RX, base RZ. Static fixed lies between base and tip.
-    const sample: model.Sample = .{ .number = 7, .skeleton = skeleton.view(), .values = &.{
-        1, 2, 3, 90, 90, 0, 0, 0, 90,
-    }, .angle_unit = .degrees };
+    const sample: model.Sample = .{
+        .number = 7,
+        .skeleton = skeleton.view(),
+        .values = &.{ 1, 2, 3, 90, 90, 0, 0, 0, 90 },
+        .angle_unit = .degrees,
+    };
     var evaluator = try PoseEvaluator.initAlloc(allocator, skeleton.view(), .{ .length_scale = 2 });
     defer evaluator.deinit(allocator);
     var output: [5]RigidTransform = @splat(RigidTransform.identity);
@@ -367,43 +372,56 @@ test "all six axis orders use independent basis-vector literals" {
     const cases = [_]struct {
         order: []const u8,
         expected: Matrix,
-    }{ .{ .order = "XYZ", .expected = .{ .{
-        0.35355339059327384, -0.57322330470336313, 0.73919891974011653,
-    }, .{
-        0.61237243569579458, 0.73919891974011664, 0.2803300858899106,
-    }, .{
-        -0.70710678118654746, 0.35355339059327373, 0.61237243569579458,
-    } } }, .{ .order = "XZY", .expected = .{ .{
-        0.35355339059327384, -0.17677669529663703, 0.91855865354369171,
-    }, .{
-        0.8660254037844386, 0.43301270189221946, -0.25,
-    }, .{
-        -0.35355339059327379, 0.88388347648318433, 0.3061862178478974,
-    } } }, .{ .order = "YXZ", .expected = .{ .{
-        0.047367172745376662, -0.75, 0.65973960844117108,
-    }, .{
-        0.78914913099243145, 0.43301270189221946, 0.4355957403991576,
-    }, .{
-        -0.61237243569579447, 0.49999999999999994, 0.61237243569579458,
-    } } }, .{ .order = "YZX", .expected = .{ .{
-        0.35355339059327384, -0.8660254037844386, 0.35355339059327379,
-    }, .{
-        0.88388347648318444, 0.43301270189221946, 0.17677669529663687,
-    }, .{
-        -0.30618621784789724, 0.25, 0.91855865354369182,
-    } } }, .{ .order = "ZXY", .expected = .{ .{
-        0.65973960844117108, -0.43559574039915772, 0.61237243569579447,
-    }, .{
-        0.75, 0.43301270189221946, -0.49999999999999994,
-    }, .{
-        -0.047367172745376551, 0.78914913099243134, 0.61237243569579458,
-    } } }, .{ .order = "ZYX", .expected = .{ .{
-        0.35355339059327384, -0.61237243569579458, 0.70710678118654746,
-    }, .{
-        0.92677669529663687, 0.12682648404432229, -0.35355339059327373,
-    }, .{
-        0.12682648404432195, 0.7803300858899106, 0.61237243569579458,
-    } } } };
+    }{
+        .{
+            .order = "XYZ",
+            .expected = .{
+                .{ 0.35355339059327384, -0.57322330470336313, 0.73919891974011653 },
+                .{ 0.61237243569579458, 0.73919891974011664, 0.2803300858899106 },
+                .{ -0.70710678118654746, 0.35355339059327373, 0.61237243569579458 },
+            },
+        },
+        .{
+            .order = "XZY",
+            .expected = .{
+                .{ 0.35355339059327384, -0.17677669529663703, 0.91855865354369171 },
+                .{ 0.8660254037844386, 0.43301270189221946, -0.25 },
+                .{ -0.35355339059327379, 0.88388347648318433, 0.3061862178478974 },
+            },
+        },
+        .{
+            .order = "YXZ",
+            .expected = .{
+                .{ 0.047367172745376662, -0.75, 0.65973960844117108 },
+                .{ 0.78914913099243145, 0.43301270189221946, 0.4355957403991576 },
+                .{ -0.61237243569579447, 0.49999999999999994, 0.61237243569579458 },
+            },
+        },
+        .{
+            .order = "YZX",
+            .expected = .{
+                .{ 0.35355339059327384, -0.8660254037844386, 0.35355339059327379 },
+                .{ 0.88388347648318444, 0.43301270189221946, 0.17677669529663687 },
+                .{ -0.30618621784789724, 0.25, 0.91855865354369182 },
+            },
+        },
+        .{
+            .order = "ZXY",
+            .expected = .{
+                .{ 0.65973960844117108, -0.43559574039915772, 0.61237243569579447 },
+                .{ 0.75, 0.43301270189221946, -0.49999999999999994 },
+                .{ -0.047367172745376551, 0.78914913099243134, 0.61237243569579458 },
+            },
+        },
+        .{
+            .order = "ZYX",
+            .expected = .{
+                .{ 0.35355339059327384, -0.61237243569579458, 0.70710678118654746 },
+                .{ 0.92677669529663687, 0.12682648404432229, -0.35355339059327373 },
+                .{ 0.12682648404432195, 0.7803300858899106, 0.61237243569579458 },
+            },
+        },
+    };
     const allocator = std.testing.allocator;
     for (cases) |case| {
         const root_axis = try std.fmt.allocPrint(allocator, "axis {s}", .{case.order});
@@ -444,15 +462,12 @@ test "all six axis orders use independent basis-vector literals" {
 
 test "ASF radian axes and AMC degree override are independent" {
     const allocator = std.testing.allocator;
-    const substitutions = [_][2][]const u8{ .{
-        "angle deg", "angle rad",
-    }, .{
-        "orientation 0 0 90", "orientation 0 0 1.5707963267948966",
-    }, .{
-        "axis 0 90 0", "axis 0 1.5707963267948966 0",
-    }, .{
-        "axis 0 0 45", "axis 0 0 0.7853981633974483",
-    } };
+    const substitutions = [_][2][]const u8{
+        .{ "angle deg", "angle rad" },
+        .{ "orientation 0 0 90", "orientation 0 0 1.5707963267948966" },
+        .{ "axis 0 90 0", "axis 0 1.5707963267948966 0" },
+        .{ "axis 0 0 45", "axis 0 0 0.7853981633974483" },
+    };
     var source = try allocator.dupe(u8, fixtures.skeleton);
     defer allocator.free(source);
     for (substitutions) |pair| {
@@ -561,12 +576,11 @@ test "pose preparation releases storage on exhaustion and geometry overflow" {
             .{ .length_scale = std.math.floatMax(f64) },
         ),
     );
-    for ([_]f64{ 0, -1, std.math.inf(f64), std.math.nan(f64) }) |scale| {
+    for ([_]f64{ 0, -1, std.math.inf(f64), std.math.nan(f64) }) |scale|
         try std.testing.expectError(
             error.InvalidScale,
             PoseEvaluator.initAlloc(allocator, skeleton.view(), .{ .length_scale = scale }),
         );
-    }
 }
 
 test "unsupported pose channels preserve their raw skeleton identity" {
@@ -612,7 +626,8 @@ test "pose preflight rejects foreign samples, bad values, short and overlapping 
         sample.values = &.{ 0, 0, 0, 0, 0, 0, 0, 0, value };
         try std.testing.expectError(error.InvalidSample, evaluator.localPoseInto(sample, &output));
     }
-    for (output) |value| try std.testing.expectEqual(RigidTransform.identity, value);
+    for (output) |value|
+        try std.testing.expectEqual(RigidTransform.identity, value);
     const overlapping: [*]const f64 = @ptrCast(&output);
     sample.values = overlapping[0..9];
     try std.testing.expectError(error.AliasedStorage, evaluator.globalPoseInto(sample, &output));
@@ -634,13 +649,17 @@ test "global pose rejects finite local inputs whose accumulated positions overfl
         .{ .length_scale = std.math.floatMax(f64) / 4 },
     );
     defer evaluator.deinit(allocator);
-    const sample: model.Sample = .{ .number = 1, .skeleton = skeleton.view(), .values = &.{
-        0, 2, 0, -90, 0, 0, 0, 0, 0,
-    }, .angle_unit = .degrees };
+    const sample: model.Sample = .{
+        .number = 1,
+        .skeleton = skeleton.view(),
+        .values = &.{ 0, 2, 0, -90, 0, 0, 0, 0, 0 },
+        .angle_unit = .degrees,
+    };
     var output: [5]RigidTransform = @splat(RigidTransform.identity);
     _ = try evaluator.localPoseInto(sample, &output);
     @memset(&output, RigidTransform.identity);
     try std.testing.expectError(error.NonFiniteResult, evaluator.globalPoseInto(sample, &output));
     try std.testing.expectEqual(RigidTransform.identity, output[4]);
-    for (output) |value| try std.testing.expect(finite(value));
+    for (output) |value|
+        try std.testing.expect(finite(value));
 }

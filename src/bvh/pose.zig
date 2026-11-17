@@ -4,8 +4,8 @@
 const std = @import("std");
 const overlaps = @import("../common/byte_ranges.zig").overlaps;
 const model = @import("model.zig");
-const transforms = @import("../common/rigid_transform.zig");
-const RigidTransform = transforms.RigidTransform;
+const RigidTransform = @import("../common/RigidTransform.zig");
+const matrix3 = @import("../common/matrix3.zig");
 const fixtures = @import("fixtures.zig");
 const parseAlloc = @import("parse.zig").parseAlloc;
 
@@ -106,7 +106,11 @@ pub fn globalPoseInto(
                     const components: @Vector(3, f64) = row;
                     rotation.* = components + @as(@Vector(3, f64), @splat(0));
                 }
-            } else transforms.composeInto(&result, &output[parent], &value);
+            } else {
+                // Borrow the parent matrix to preserve code generation in the global-pose loop.
+                matrix3.multiplyInto(&result.rotation, &output[parent].rotation, &value.rotation);
+                result.translation = output[parent].transformPoint(value.translation);
+            }
         } else result = value;
         if (!result.isFinite()) return error.NonFiniteResult;
         out.* = result;
@@ -121,7 +125,8 @@ test globalPoseInto {
     const pose = try globalPoseInto(motion.frame(0).?, &storage, .{});
     // The root's quarter turn carries the knee and its end site to the left.
     for ([_][3]f64{ .{ 2, 4, 6 }, .{ -2, 4, 6 }, .{ -4, 4, 6 } }, pose) |expected, actual| {
-        for (expected, actual.translation) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-14);
+        for (expected, actual.translation) |a, b|
+            try std.testing.expectApproxEqAbs(a, b, 1e-14);
     }
 }
 
@@ -212,28 +217,30 @@ inline fn localInto(
         // Parsed channels have distinct axes. Specializing the six orders removes products by the
         // axis matrices' known zeros and ones without changing the declared intrinsic order.
         switch (axes[0]) {
-            0 => if (axes[1] == 1) euler(&result.rotation, .{
-                0, 1, 2,
-            }, sine, cosine) else euler(&result.rotation, .{
-                0, 2, 1,
-            }, sine, cosine),
-            1 => if (axes[1] == 0) euler(&result.rotation, .{
-                1, 0, 2,
-            }, sine, cosine) else euler(&result.rotation, .{
-                1, 2, 0,
-            }, sine, cosine),
-            2 => if (axes[1] == 0) euler(&result.rotation, .{
-                2, 0, 1,
-            }, sine, cosine) else euler(&result.rotation, .{
-                2, 1, 0,
-            }, sine, cosine),
+            0 => if (axes[1] == 1) euler(
+                &result.rotation,
+                .{ 0, 1, 2 },
+                sine,
+                cosine,
+            ) else euler(&result.rotation, .{ 0, 2, 1 }, sine, cosine),
+            1 => if (axes[1] == 0) euler(
+                &result.rotation,
+                .{ 1, 0, 2 },
+                sine,
+                cosine,
+            ) else euler(&result.rotation, .{ 1, 2, 0 }, sine, cosine),
+            2 => if (axes[1] == 0) euler(
+                &result.rotation,
+                .{ 2, 0, 1 },
+                sine,
+                cosine,
+            ) else euler(&result.rotation, .{ 2, 1, 0 }, sine, cosine),
             else => unreachable,
         }
     } else {
         result.rotation = RigidTransform.identity.rotation;
-        for (axes[0..rotations], angles[0..rotations]) |axis, degrees| {
+        for (axes[0..rotations], angles[0..rotations]) |axis, degrees|
             rotate(&result.rotation, axis, degrees);
-        }
     }
 }
 
@@ -287,11 +294,13 @@ fn rotate(matrix: *[3][3]f64, axis: u2, degrees: f64) void {
 }
 
 fn expectVector(expected: [3]f64, actual: [3]f64) !void {
-    for (expected, actual) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-13);
+    for (expected, actual) |a, b|
+        try std.testing.expectApproxEqAbs(a, b, 1e-13);
 }
 
 fn expectMatrix(expected: [3][3]f64, actual: [3][3]f64) !void {
-    for (expected, actual) |a, b| try expectVector(a, b);
+    for (expected, actual) |a, b|
+        try expectVector(a, b);
 }
 
 test "BVH local/global joint origins, end sites, scale and unchanged output tails" {
@@ -323,49 +332,42 @@ test "BVH local/global joint origins, end sites, scale and unchanged output tail
 test "BVH intrinsic quarter-turn compositions cover every order with literal matrices" {
     const Case = struct { order: []const u8, matrix: [3][3]f64 };
     // Hand-composed right-handed quarter turns; these expectations do not call a rotation helper.
-    const cases = [_]Case{ .{ .order = "Xrotation Yrotation Zrotation", .matrix = .{ .{
-        0, 0, 1,
-    }, .{
-        0, -1, 0,
-    }, .{
-        1, 0, 0,
-    } } }, .{ .order = "Xrotation Zrotation Yrotation", .matrix = .{ .{
-        0, -1, 0,
-    }, .{
-        1, 0, 0,
-    }, .{
-        0, 0, 1,
-    } } }, .{ .order = "Yrotation Xrotation Zrotation", .matrix = .{ .{
-        1, 0, 0,
-    }, .{
-        0, 0, -1,
-    }, .{
-        0, 1, 0,
-    } } }, .{ .order = "Yrotation Zrotation Xrotation", .matrix = .{ .{
-        0, 1, 0,
-    }, .{
-        1, 0, 0,
-    }, .{
-        0, 0, -1,
-    } } }, .{ .order = "Zrotation Xrotation Yrotation", .matrix = .{ .{
-        -1, 0, 0,
-    }, .{
-        0, 0, 1,
-    }, .{
-        0, 1, 0,
-    } } }, .{ .order = "Zrotation Yrotation Xrotation", .matrix = .{ .{
-        0, 0, 1,
-    }, .{
-        0, 1, 0,
-    }, .{
-        -1, 0, 0,
-    } } } };
+    const cases = [_]Case{
+        .{
+            .order = "Xrotation Yrotation Zrotation",
+            .matrix = .{ .{ 0, 0, 1 }, .{ 0, -1, 0 }, .{ 1, 0, 0 } },
+        },
+        .{
+            .order = "Xrotation Zrotation Yrotation",
+            .matrix = .{ .{ 0, -1, 0 }, .{ 1, 0, 0 }, .{ 0, 0, 1 } },
+        },
+        .{
+            .order = "Yrotation Xrotation Zrotation",
+            .matrix = .{ .{ 1, 0, 0 }, .{ 0, 0, -1 }, .{ 0, 1, 0 } },
+        },
+        .{
+            .order = "Yrotation Zrotation Xrotation",
+            .matrix = .{ .{ 0, 1, 0 }, .{ 1, 0, 0 }, .{ 0, 0, -1 } },
+        },
+        .{
+            .order = "Zrotation Xrotation Yrotation",
+            .matrix = .{ .{ -1, 0, 0 }, .{ 0, 0, 1 }, .{ 0, 1, 0 } },
+        },
+        .{
+            .order = "Zrotation Yrotation Xrotation",
+            .matrix = .{ .{ 0, 0, 1 }, .{ 0, 1, 0 }, .{ -1, 0, 0 } },
+        },
+    };
     const allocator = std.testing.allocator;
     for (cases) |case| {
-        const source = try std.mem.concat(allocator, u8, &.{
-            "HIERARCHY ROOT a { OFFSET 0 0 0 CHANNELS 3 ", case.order,
-            " } MOTION Frames: 1 Frame Time: 1\n90 90 90",
-        });
+        const source = try std.mem.concat(
+            allocator,
+            u8,
+            &.{
+                "HIERARCHY ROOT a { OFFSET 0 0 0 CHANNELS 3 ", case.order,
+                " } MOTION Frames: 1 Frame Time: 1\n90 90 90",
+            },
+        );
         defer allocator.free(source);
         var motion = try parseAlloc(allocator, source, null, .{});
         defer motion.deinit(allocator);
@@ -437,12 +439,11 @@ test "BVH admission leaves all output unchanged on bad scale, width, values or c
     defer motion.deinit(std.testing.allocator);
     var output: [4]RigidTransform = @splat(RigidTransform.identity);
     const sample = motion.frame(0).?;
-    for ([_]f64{ 0, -1, std.math.nan(f64), std.math.inf(f64) }) |scale| {
+    for ([_]f64{ 0, -1, std.math.nan(f64), std.math.inf(f64) }) |scale|
         try std.testing.expectError(
             error.InvalidScale,
             globalPoseInto(sample, &output, .{ .length_scale = scale }),
         );
-    }
     try std.testing.expectError(error.OutputTooSmall, globalPoseInto(sample, output[0..2], .{}));
     var bad_sample = sample;
     bad_sample.values = sample.values[0..8];
@@ -451,7 +452,8 @@ test "BVH admission leaves all output unchanged on bad scale, width, values or c
     values[8] = std.math.nan(f64);
     bad_sample.values = &values;
     try std.testing.expectError(error.InvalidSample, globalPoseInto(bad_sample, &output, .{}));
-    for (output) |value| try std.testing.expectEqualDeep(RigidTransform.identity, value);
+    for (output) |value|
+        try std.testing.expectEqualDeep(RigidTransform.identity, value);
 }
 
 test "BVH alias admission includes the entire offered destination and copied joint names" {
@@ -462,7 +464,8 @@ test "BVH alias admission includes the entire offered destination and copied joi
     const values: [*]const f64 = @ptrCast(&output[3]);
     sample.values = values[0..9];
     try std.testing.expectError(error.AliasedStorage, globalPoseInto(sample, &output, .{}));
-    for (output) |value| try std.testing.expectEqualDeep(RigidTransform.identity, value);
+    for (output) |value|
+        try std.testing.expectEqualDeep(RigidTransform.identity, value);
     _ = try globalPoseInto(sample, output[0..3], .{});
     try std.testing.expectEqualDeep(RigidTransform.identity, output[3]);
 

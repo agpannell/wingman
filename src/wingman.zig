@@ -68,7 +68,7 @@ pub const sfnt = @import("sfnt.zig");
 
 pub const bvh = @import("bvh.zig");
 pub const acclaim = @import("acclaim.zig");
-pub const RigidTransform = @import("common/rigid_transform.zig").RigidTransform;
+pub const RigidTransform = @import("common/RigidTransform.zig");
 
 test {
     _ = adler32;
@@ -102,5 +102,5 @@ test {
     _ = bvh;
     _ = acclaim;
     _ = @import("common/byte_ranges.zig");
-    _ = @import("common/rigid_transform.zig");
+    _ = RigidTransform;
 }

@@ -121,8 +121,9 @@ The [public entry](../src/bvh.zig) presents the API. Under `src/bvh/`, `model.zi
 data and views, `text.zig` owns bounded lexical/numeric admission, `parse.zig` materializes complete
 motions, and `pose.zig` interprets channels and composes parents. Authored controls live in
 `fixtures.zig`; tests remain beside their implementations. Shared
-[`RigidTransform` support](../src/common/rigid_transform.zig) owns geometric arithmetic and its inline
-tests. Callers use the exported `wingman.RigidTransform` type. BVH and Acclaim also share the strict
+[`RigidTransform` support](../src/common/RigidTransform.zig) owns spatial value operations and their
+inline tests; its [3×3 matrix arithmetic](../src/common/matrix3.zig) stays internal. Callers use the
+exported `wingman.RigidTransform` type. BVH and Acclaim also share the strict
 numeric reader in [`common/ascii_number.zig`](../src/common/ascii_number.zig); its assertions stay
 with that implementation.
 
