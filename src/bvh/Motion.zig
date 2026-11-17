@@ -1,30 +1,100 @@
-//! Complete owned BVH ingestion, bounded hierarchy materialization and exact sample admission.
+//! A BVH motion clip owns its retained hierarchy and dense frame-major binary64 channel values.
+//! Construct with parseAlloc, borrow frames with frame, and release once with deinit using the
+//! construction allocator. Input bytes may retire after parsing. Copies alias all allocations;
+//! release only one copy. Names, skeleton views and frames borrow backing storage rather than this
+//! descriptor's address. Keep managed fields and backing unchanged while borrowed. Releasing the
+//! motion invalidates every borrow. No allocator, playback state, interpolation or coordinate
+//! conversion is retained.
 const std = @import("std");
 const overlaps = @import("../common/byte_ranges.zig").overlaps;
-const model = @import("model.zig");
-const text = @import("text.zig");
+const Skeleton = @import("Skeleton.zig");
+const Lexer = @import("Lexer.zig");
 const fixtures = @import("fixtures.zig");
+const Motion = @This();
 
-/// How frame boundaries are admitted after the motion header.
-pub const FrameLayout = enum {
-    /// One complete frame per nonblank line; detects missing/extra columns within each row.
-    lines,
-    /// Whitespace separates all values; frame/channel counts alone determine sample boundaries.
-    whitespace,
+/// Hierarchy and source text owned by this Motion; release through Motion.deinit.
+skeleton: Skeleton,
+/// Owned frame-major values; every frame occupies skeleton.channel_count consecutive entries.
+values: []const f64,
+/// Recorded frame count; can be zero, independently of the per-frame channel count.
+frame_count: u32,
+/// Positive finite encoded interval in seconds; no assumed capture rate is substituted.
+frame_time: f64,
+
+/// Resource and frame-row admission. Parsed values retain their original meaning and order.
+pub const ParseOptions = struct {
+    /// Independent input, hierarchy and frame-storage ceilings.
+    limits: Lexer.ParseLimits = .{},
+    /// Whether physical lines or declared frame/channel counts determine frame boundaries.
+    frame_layout: FrameLayout = .lines,
+
+    /// How frame boundaries are admitted after the motion header.
+    pub const FrameLayout = enum {
+        /// One complete frame per nonblank line; detects missing/extra columns within each row.
+        lines,
+        /// Whitespace separates values; frame/channel counts alone determine frame boundaries.
+        whitespace,
+    };
 };
 
-/// Resource and motion-row admission. Parsed values always retain their original meaning/order.
-pub const ParseOptions = struct { limits: text.Limits = .{}, frame_layout: FrameLayout = .lines };
+/// One recorded frame borrowing the motion's immutable values and hierarchy. Rotations remain
+/// degrees; positions retain source coordinates and units. Pose evaluation also accepts a Frame
+/// whose values are supplied by the caller for this parsed skeleton; it ignores index/time.
+pub const Frame = struct {
+    /// Zero-based recorded frame index; ignored by pose evaluation.
+    index: u32,
+    /// Seconds from frame zero when obtained through Motion.frame; ignored by pose evaluation.
+    time: f64,
+    /// Borrowed values in joint/channel order, with exactly skeleton.channel_count entries.
+    values: []const f64,
+    /// Borrowed hierarchy describing the values; its owning Motion must remain live and immutable.
+    skeleton: Skeleton.View,
 
-/// Reads a complete BVH file into an owned skeleton and frame-major binary64 samples. Supports
-/// forests, branching, repeated names, end sites, zero-channel joints and zero-frame clips. Named
-/// joints require OFFSET then CHANNELS before children; channel labels are the six standard
-/// case-sensitive position/rotation names, each appearing at most once per joint. Rotation order is
-/// preserved, including differing orders between joints and nonroot position channels.
+    /// Borrows a joint or end site's ordered values; returns null for an invalid array index. End
+    /// sites and other static joints return an empty slice. Caller-created frames must supply the
+    /// complete channel width described by values.
+    pub fn jointValues(self: Frame, joint_index: u32) ?[]const f64 {
+        if (joint_index >= self.skeleton.joints.len) return null;
+        const joint = self.skeleton.joints[joint_index];
+        return self.values[joint.channel_offset..][0..joint.channel_count];
+    }
+};
+
+/// Borrows a frame by zero-based index, or returns null beyond the recorded frames. Every frame
+/// time is finite. Static skeletons can have frames with empty channel arrays.
+pub fn frame(self: *const Motion, index: usize) ?Frame {
+    if (index >= self.frame_count) return null;
+    const channel_count = self.skeleton.channel_count;
+    const frame_index: u32 = @intCast(index);
+    const elapsed_intervals: f64 = @floatFromInt(index);
+    const time = elapsed_intervals * self.frame_time;
+    const frame_start = index * channel_count;
+    return .{
+        .index = frame_index,
+        .time = time,
+        .values = self.values[frame_start..][0..channel_count],
+        .skeleton = self.skeleton.view(),
+    };
+}
+
+/// Releases all backing through the allocator used by `parseAlloc`. Every borrowed view and owner
+/// copy expires, including views of the nested skeleton.
+pub fn deinit(self: *Motion, allocator: std.mem.Allocator) void {
+    allocator.free(self.values);
+    allocator.free(self.skeleton.joints);
+    allocator.free(self.skeleton.source);
+    self.* = undefined;
+}
+
+/// Reads a complete BVH file into an owned skeleton and frame-major binary64 channel values.
+/// Supports forests, branching, repeated names, end sites, zero-channel joints and zero-frame
+/// clips. Named joints require OFFSET then CHANNELS before children; channel labels are the six
+/// standard case-sensitive position/rotation names, each appearing at most once per joint. Rotation
+/// order is preserved, including differing orders between joints and nonroot position channels.
 ///
 /// Accepts ASCII tokens/whitespace, LF/CRLF, an optional initial UTF-8 BOM and finite decimal or
 /// exponent numbers. Rejects unknown fields/channels, malformed/trailing input, nonpositive frame
-/// intervals and nonfinite final sample times. Ordinary whitespace may separate hierarchy/header
+/// intervals and nonfinite final frame times. Ordinary whitespace may separate hierarchy/header
 /// tokens; frame boundaries follow `frame_layout`. Empty-channel frames require no data rows.
 ///
 /// Copies only the hierarchy text and owns all materialized data; input may retire on success.
@@ -34,45 +104,45 @@ pub const ParseOptions = struct { limits: text.Limits = .{}, frame_layout: Frame
 pub fn parseAlloc(
     allocator: std.mem.Allocator,
     source: []const u8,
-    diagnostic: ?*text.Diagnostic,
+    diagnostic: ?*Lexer.Diagnostic,
     options: ParseOptions,
-) (std.mem.Allocator.Error || text.ParseError)!model.Motion {
+) (std.mem.Allocator.Error || Lexer.ParseError)!Motion {
     if (diagnostic) |out| {
         if (overlaps(source, std.mem.asBytes(out))) return error.AliasedStorage;
     }
     if (source.len > options.limits.input_bytes) {
-        text.report(source, 0, diagnostic, error.LimitExceeded);
+        Lexer.report(source, 0, diagnostic, error.LimitExceeded);
         return error.LimitExceeded;
     }
-    var lexer = text.Lexer.init(source, options.limits);
+    var lexer = Lexer.init(source, options.limits);
     const reservation = reserveHierarchy(&lexer) catch |err| {
-        text.report(source, lexer.offset, diagnostic, err);
+        Lexer.report(source, lexer.offset, diagnostic, err);
         return err;
     };
-    _ = std.math.mul(usize, reservation.joints, @sizeOf(model.Joint)) catch {
-        text.report(source, lexer.offset, diagnostic, error.LimitExceeded);
+    _ = std.math.mul(usize, reservation.joint_count, @sizeOf(Skeleton.Joint)) catch {
+        Lexer.report(source, lexer.offset, diagnostic, error.LimitExceeded);
         return error.LimitExceeded;
     };
-    const copy = try allocator.dupe(u8, source[0..reservation.bytes]);
+    const copy = try allocator.dupe(u8, source[0..reservation.source_length]);
     errdefer allocator.free(copy);
-    const joints = try allocator.alloc(model.Joint, reservation.joints);
+    const joints = try allocator.alloc(Skeleton.Joint, reservation.joint_count);
     errdefer allocator.free(joints);
-    var hierarchy: Hierarchy = .{
-        .lexer = text.Lexer.init(copy, options.limits),
+    var hierarchy: HierarchyParser = .{
+        .lexer = Lexer.init(copy, options.limits),
         .joints = joints,
     };
     const channel_count = hierarchy.read() catch |err| {
-        text.report(source, hierarchy.lexer.offset, diagnostic, err);
+        Lexer.report(source, hierarchy.lexer.offset, diagnostic, err);
         return err;
     };
     const header = readMotionHeader(&lexer, channel_count) catch |err| {
-        text.report(source, lexer.offset, diagnostic, err);
+        Lexer.report(source, lexer.offset, diagnostic, err);
         return err;
     };
     const values = try allocator.alloc(f64, header.values);
     errdefer allocator.free(values);
     readValues(&lexer, values, header, channel_count, options.frame_layout) catch |err| {
-        text.report(source, lexer.offset, diagnostic, err);
+        Lexer.report(source, lexer.offset, diagnostic, err);
         return err;
     };
     return .{
@@ -92,10 +162,10 @@ test parseAlloc {
         "Frame Time: 0.016667\n1 2 3 90 0 0\n4 5 6 0 0 0";
     var motion = try parseAlloc(allocator, source, null, .{});
     defer motion.deinit(allocator);
-    const sample = motion.frame(1).?;
-    try std.testing.expectEqual(0.016667, sample.time);
-    try std.testing.expectEqualSlices(f64, &.{ 4, 5, 6, 0, 0, 0 }, sample.jointValues(0).?);
-    try std.testing.expectEqual(0, sample.jointValues(1).?.len);
+    const recorded_frame = motion.frame(1).?;
+    try std.testing.expectEqual(0.016667, recorded_frame.time);
+    try std.testing.expectEqualSlices(f64, &.{ 4, 5, 6, 0, 0, 0 }, recorded_frame.jointValues(0).?);
+    try std.testing.expectEqual(0, recorded_frame.jointValues(1).?.len);
     try std.testing.expect(motion.frame(2) == null);
 }
 
@@ -103,9 +173,9 @@ fn same(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-const Reservation = struct { joints: u32, bytes: usize };
+const HierarchyReservation = struct { joint_count: u32, source_length: usize };
 
-fn reserveHierarchy(lexer: *text.Lexer) text.ParseError!Reservation {
+fn reserveHierarchy(lexer: *Lexer) Lexer.ParseError!HierarchyReservation {
     var count: u32 = 0;
     var depth: u32 = 0;
     var name = false;
@@ -127,13 +197,13 @@ fn reserveHierarchy(lexer: *text.Lexer) text.ParseError!Reservation {
             depth -= 1;
         } else if (depth == 0 and same(word, "MOTION")) {
             if (count == 0) return error.InvalidHierarchy;
-            return .{ .joints = count, .bytes = token.offset };
+            return .{ .joint_count = count, .source_length = token.offset };
         }
     }
     return error.UnexpectedEnd;
 }
 
-fn channel(bytes: []const u8) text.ParseError!model.Channel {
+fn parseChannel(bytes: []const u8) Lexer.ParseError!Skeleton.Channel {
     const labels = .{
         "Xposition", "Yposition", "Zposition", "Xrotation", "Yrotation", "Zrotation",
     };
@@ -143,14 +213,15 @@ fn channel(bytes: []const u8) text.ParseError!model.Channel {
     return error.UnsupportedChannel;
 }
 
-const Hierarchy = struct {
-    lexer: text.Lexer,
-    joints: []model.Joint,
+// Materialize source preorder without recursion: emitted parent indices are the traversal stack.
+const HierarchyParser = struct {
+    lexer: Lexer,
+    joints: []Skeleton.Joint,
     used: u32 = 0,
     channels: u32 = 0,
     depth: u32 = 0,
 
-    fn append(self: *Hierarchy, joint: model.Joint) text.ParseError!u32 {
+    fn append(self: *HierarchyParser, joint: Skeleton.Joint) Lexer.ParseError!u32 {
         if (self.used >= self.joints.len) return error.InvalidHierarchy;
         if (self.depth >= self.lexer.limits.depth) return error.LimitExceeded;
         const index = self.used;
@@ -159,16 +230,16 @@ const Hierarchy = struct {
         return index;
     }
 
-    fn named(self: *Hierarchy, parent: ?u32) text.ParseError!u32 {
+    fn readNamedJoint(self: *HierarchyParser, parent: ?u32) Lexer.ParseError!u32 {
         const name = (try self.lexer.take()).bytes;
         if (same(name, "{") or same(name, "}")) return error.InvalidText;
         try self.lexer.expect("{");
         try self.lexer.expect("OFFSET");
         const offset = try self.lexer.vector();
         try self.lexer.expect("CHANNELS");
-        const count = try text.integer((try self.lexer.take()).bytes);
+        const count = try Lexer.integer((try self.lexer.take()).bytes);
         if (count > 6) return error.ChannelCount;
-        var joint: model.Joint = .{
+        var joint: Skeleton.Joint = .{
             .name = name,
             .parent = parent,
             .offset = offset,
@@ -177,7 +248,7 @@ const Hierarchy = struct {
         };
         var seen: u8 = 0;
         for (joint.channels[0..count]) |*out| {
-            out.* = try channel((try self.lexer.take()).bytes);
+            out.* = try parseChannel((try self.lexer.take()).bytes);
             const mask = @as(u8, 1) << @intCast(@backingInt(out.*));
             if (seen & mask != 0) return error.DuplicateChannel;
             seen |= mask;
@@ -188,33 +259,36 @@ const Hierarchy = struct {
         return index;
     }
 
-    fn endSite(self: *Hierarchy, parent: u32) text.ParseError!void {
+    fn readEndSite(self: *HierarchyParser, parent: u32) Lexer.ParseError!void {
         try self.lexer.expect("Site");
         try self.lexer.expect("{");
         try self.lexer.expect("OFFSET");
         const offset = try self.lexer.vector();
         try self.lexer.expect("}");
-        _ = try self.append(
-            .{ .name = null, .parent = parent, .offset = offset, .channel_offset = self.channels },
-        );
+        _ = try self.append(.{
+            .name = null,
+            .parent = parent,
+            .offset = offset,
+            .channel_offset = self.channels,
+        });
     }
 
-    fn read(self: *Hierarchy) text.ParseError!u32 {
+    fn read(self: *HierarchyParser) Lexer.ParseError!u32 {
         try self.lexer.expect("HIERARCHY");
         var parent: ?u32 = null;
         while (try self.lexer.next()) |token| {
             if (parent) |current| {
                 if (same(token.bytes, "JOINT")) {
-                    parent = try self.named(current);
+                    parent = try self.readNamedJoint(current);
                 } else if (same(token.bytes, "End")) {
-                    try self.endSite(current);
+                    try self.readEndSite(current);
                 } else if (same(token.bytes, "}")) {
                     parent = self.joints[current].parent;
                     self.depth -= 1;
                 } else return error.UnexpectedToken;
             } else {
                 if (!same(token.bytes, "ROOT")) return error.UnexpectedToken;
-                parent = try self.named(null);
+                parent = try self.readNamedJoint(null);
             }
         }
         if (parent != null) return error.UnexpectedEnd;
@@ -223,23 +297,29 @@ const Hierarchy = struct {
     }
 };
 
-const MotionHeader = struct { frames: u32, interval: f64, values: usize, line: usize };
+const MotionHeader = struct {
+    frames: u32,
+    interval: f64,
+    values: usize,
+    // The first value row must follow the time token's physical line in line-delimited mode.
+    line: usize,
+};
 
-fn label(lexer: *text.Lexer, word: []const u8) text.ParseError!void {
+fn readLabel(lexer: *Lexer, word: []const u8) Lexer.ParseError!void {
     const token = (try lexer.take()).bytes;
     if (std.mem.endsWith(u8, token, ":") and same(token[0 .. token.len - 1], word)) return;
     if (!same(token, word)) return error.UnexpectedToken;
     try lexer.expect(":");
 }
 
-fn readMotionHeader(lexer: *text.Lexer, width: u32) text.ParseError!MotionHeader {
-    try label(lexer, "Frames");
-    const frames = try text.integer((try lexer.take()).bytes);
+fn readMotionHeader(lexer: *Lexer, width: u32) Lexer.ParseError!MotionHeader {
+    try readLabel(lexer, "Frames");
+    const frames = try Lexer.integer((try lexer.take()).bytes);
     if (frames > lexer.limits.frames) return error.LimitExceeded;
     try lexer.expect("Frame");
-    try label(lexer, "Time");
+    try readLabel(lexer, "Time");
     const token = try lexer.take();
-    const interval = try text.decimal(token.bytes);
+    const interval = try Lexer.decimal(token.bytes);
     if (interval <= 0 or !std.math.isFinite(
         interval * @as(f64, @floatFromInt(frames -| 1)),
     )) return error.InvalidTiming;
@@ -250,23 +330,23 @@ fn readMotionHeader(lexer: *text.Lexer, width: u32) text.ParseError!MotionHeader
 }
 
 fn readValues(
-    lexer: *text.Lexer,
+    lexer: *Lexer,
     values: []f64,
     header: MotionHeader,
     width: u32,
-    layout: FrameLayout,
-) text.ParseError!void {
+    layout: ParseOptions.FrameLayout,
+) Lexer.ParseError!void {
     if (width != 0) {
         var previous_line = header.line;
-        for (0..header.frames) |frame| {
+        for (0..header.frames) |frame_index| {
             const first = try lexer.take();
             if (layout == .lines and first.line <= previous_line) return error.ChannelCount;
-            const output = values[frame * width ..][0..width];
-            output[0] = try text.decimal(first.bytes);
+            const output = values[frame_index * width ..][0..width];
+            output[0] = try Lexer.decimal(first.bytes);
             for (output[1..]) |*out| {
                 const token = try lexer.take();
                 if (layout == .lines and token.line != first.line) return error.ChannelCount;
-                out.* = try text.decimal(token.bytes);
+                out.* = try Lexer.decimal(token.bytes);
             }
             if (layout == .lines) {
                 if (try lexer.peek()) |next| {
@@ -298,15 +378,21 @@ test "BVH owns original names, hierarchy and every channel after source retireme
     try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, &skeleton.joints[0].offset);
     try std.testing.expectEqualSlices(f64, &.{ 0, 4, 0 }, &skeleton.joints[1].offset);
     try std.testing.expectEqualSlices(f64, &.{ 0, 2, 0 }, &skeleton.joints[2].offset);
-    try std.testing.expectEqualSlices(model.Channel, &.{
-        .tx, .ty, .tz, .rz, .rx, .ry,
-    }, skeleton.joints[0].channelOrder());
-    try std.testing.expectEqualSlices(model.Channel, &.{
-        .rx, .ry, .rz,
-    }, skeleton.joints[1].channelOrder());
-    try std.testing.expectEqualSlices(f64, &.{
-        1, 2, 3, 90, 0, 0, 0, 90, 0, -1, -2, -3, 0, 90, 0, 45, 0, -45,
-    }, motion.values);
+    try std.testing.expectEqualSlices(
+        Skeleton.Channel,
+        &.{ .tx, .ty, .tz, .rz, .rx, .ry },
+        skeleton.joints[0].channelOrder(),
+    );
+    try std.testing.expectEqualSlices(
+        Skeleton.Channel,
+        &.{ .rx, .ry, .rz },
+        skeleton.joints[1].channelOrder(),
+    );
+    try std.testing.expectEqualSlices(
+        f64,
+        &.{ 1, 2, 3, 90, 0, 0, 0, 90, 0, -1, -2, -3, 0, 90, 0, 45, 0, -45 },
+        motion.values,
+    );
     try std.testing.expectEqual(0.125, motion.frame_time);
     try std.testing.expectEqual(2, motion.frame_count);
     try std.testing.expectEqual(0.125, motion.frame(1).?.time);
@@ -328,12 +414,16 @@ test "BVH forests preserve repeated and keyword names, zero channels and nonroot
     try std.testing.expectEqual(@as(?u32, null), joints[4].parent);
     try std.testing.expectEqual(@as(?u32, 4), joints[5].parent);
     try std.testing.expectEqual(7, motion.skeleton.channel_count);
-    try std.testing.expectEqualSlices(model.Channel, &.{
-        .rz, .tx, .ry, .tz, .rx, .ty,
-    }, joints[1].channelOrder());
-    try std.testing.expectEqualSlices(f64, &.{
-        30, 1, 20, 2, 10, 3,
-    }, motion.frame(0).?.jointValues(1).?);
+    try std.testing.expectEqualSlices(
+        Skeleton.Channel,
+        &.{ .rz, .tx, .ry, .tz, .rx, .ty },
+        joints[1].channelOrder(),
+    );
+    try std.testing.expectEqualSlices(
+        f64,
+        &.{ 30, 1, 20, 2, 10, 3 },
+        motion.frame(0).?.jointValues(1).?,
+    );
     try std.testing.expectEqualSlices(f64, &.{4}, motion.frame(0).?.jointValues(5).?);
     try std.testing.expectEqual(0, motion.frame(0).?.jointValues(3).?.len);
 }
@@ -404,7 +494,7 @@ test "BVH ASCII admission preserves BOM, CRLF, decimal exponents and negative ze
 
 test "BVH rejects malformed hierarchy, channel sets, numeric and motion framing" {
     const allocator = std.testing.allocator;
-    const Case = struct { source: []const u8, reason: text.ParseError };
+    const Case = struct { source: []const u8, reason: Lexer.ParseError };
     const prefix =
         "HIERARCHY ROOT a { OFFSET 0 0 0 CHANNELS 1 Xposition } MOTION Frames: 1 Frame Time: .25\n";
     const cases = [_]Case{
@@ -476,7 +566,7 @@ test "BVH rejects malformed hierarchy, channel sets, numeric and motion framing"
             "1\n# tail", .reason = error.UnexpectedToken },
     };
     for (cases) |case| {
-        var diagnostic: text.Diagnostic = undefined;
+        var diagnostic: Lexer.Diagnostic = undefined;
         try std.testing.expectError(
             case.reason,
             parseAlloc(allocator, case.source, &diagnostic, .{}),
@@ -490,7 +580,7 @@ test "BVH rejects malformed hierarchy, channel sets, numeric and motion framing"
     }
 }
 
-test "BVH frame counts and intervals admit only finite representable sample times" {
+test "BVH frame counts and intervals admit only finite representable frame times" {
     const allocator = std.testing.allocator;
     const prefix = "HIERARCHY ROOT a { OFFSET 0 0 0 CHANNELS 0 } MOTION Frames: ";
     for ([_][]const u8{ "-1", "+1", "1.0", "4294967296" }) |count| {
@@ -512,7 +602,7 @@ test "BVH reports exact bad-token location and leaves successful/OOM diagnostics
     const allocator = std.testing.allocator;
     const invalid =
         "HIERARCHY\nROOT x { OFFSET 0 0 0 CHANNELS 0 }\nMOTION\nFrames: 0\nFrame Time: nope\n";
-    var diagnostic: text.Diagnostic = .{ .offset = 999, .line = 999, .reason = error.InvalidText };
+    var diagnostic: Lexer.Diagnostic = .{ .offset = 999, .line = 999, .reason = error.InvalidText };
     try std.testing.expectError(
         error.InvalidNumber,
         parseAlloc(allocator, invalid, &diagnostic, .{}),
@@ -530,10 +620,10 @@ test "BVH reports exact bad-token location and leaves successful/OOM diagnostics
     try std.testing.expectEqualDeep(before, diagnostic);
     var overlapping: [
         @sizeOf(
-            text.Diagnostic,
+            Lexer.Diagnostic,
         ) + 16
-    ]u8 align(@alignOf(text.Diagnostic)) = @splat('x');
-    const aliased: *text.Diagnostic = @ptrCast(&overlapping);
+    ]u8 align(@alignOf(Lexer.Diagnostic)) = @splat('x');
+    const aliased: *Lexer.Diagnostic = @ptrCast(&overlapping);
     const old = overlapping;
     try std.testing.expectError(
         error.AliasedStorage,
@@ -545,7 +635,7 @@ test "BVH reports exact bad-token location and leaves successful/OOM diagnostics
 test "BVH independent source, line, token, joint, depth, frame and value limits" {
     const allocator = std.testing.allocator;
     const source = fixtures.simple;
-    const limits = [_]text.Limits{
+    const limits = [_]Lexer.ParseLimits{
         .{ .input_bytes = source.len - 1 },
         .{ .line_bytes = 10 },
         .{ .token_bytes = 5 },
@@ -554,12 +644,11 @@ test "BVH independent source, line, token, joint, depth, frame and value limits"
         .{ .frames = 1 },
         .{ .values = 17 },
     };
-    for (
-        limits,
-    ) |limit| try std.testing.expectError(
-        error.LimitExceeded,
-        parseAlloc(allocator, source, null, .{ .limits = limit }),
-    );
+    for (limits) |limit|
+        try std.testing.expectError(
+            error.LimitExceeded,
+            parseAlloc(allocator, source, null, .{ .limits = limit }),
+        );
     var exact = try parseAlloc(
         allocator,
         source,
@@ -594,28 +683,29 @@ fn allocationCase(allocator: std.mem.Allocator, source: []const u8, valid: bool)
 }
 
 test "BVH frees every partial owner on allocator and late lexical failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{
-        fixtures.simple, true,
-    });
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        allocationCase,
+        .{ fixtures.simple, true },
+    );
     const invalid = fixtures.simple[0 .. fixtures.simple.len - 3] ++ "nan";
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{
-        invalid, false,
-    });
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        allocationCase,
+        .{ invalid, false },
+    );
 }
 
 test "BVH keeps every intrinsic rotation order independently on each joint" {
-    const Case = struct { labels: []const u8, expected: [3]model.Channel };
-    const cases = [_]Case{ .{ .labels = "Xrotation Yrotation Zrotation", .expected = .{
-        .rx, .ry, .rz,
-    } }, .{ .labels = "Xrotation Zrotation Yrotation", .expected = .{
-        .rx, .rz, .ry,
-    } }, .{ .labels = "Yrotation Xrotation Zrotation", .expected = .{
-        .ry, .rx, .rz,
-    } }, .{ .labels = "Yrotation Zrotation Xrotation", .expected = .{
-        .ry, .rz, .rx,
-    } }, .{ .labels = "Zrotation Xrotation Yrotation", .expected = .{
-        .rz, .rx, .ry,
-    } }, .{ .labels = "Zrotation Yrotation Xrotation", .expected = .{ .rz, .ry, .rx } } };
+    const Case = struct { labels: []const u8, expected: [3]Skeleton.Channel };
+    const cases = [_]Case{
+        .{ .labels = "Xrotation Yrotation Zrotation", .expected = .{ .rx, .ry, .rz } },
+        .{ .labels = "Xrotation Zrotation Yrotation", .expected = .{ .rx, .rz, .ry } },
+        .{ .labels = "Yrotation Xrotation Zrotation", .expected = .{ .ry, .rx, .rz } },
+        .{ .labels = "Yrotation Zrotation Xrotation", .expected = .{ .ry, .rz, .rx } },
+        .{ .labels = "Zrotation Xrotation Yrotation", .expected = .{ .rz, .rx, .ry } },
+        .{ .labels = "Zrotation Yrotation Xrotation", .expected = .{ .rz, .ry, .rx } },
+    };
     const allocator = std.testing.allocator;
     for (cases) |case| {
         const source = try std.mem.concat(
@@ -632,13 +722,15 @@ test "BVH keeps every intrinsic rotation order independently on each joint" {
         var motion = try parseAlloc(allocator, source, null, .{});
         defer motion.deinit(allocator);
         try std.testing.expectEqualSlices(
-            model.Channel,
+            Skeleton.Channel,
             &case.expected,
             motion.skeleton.joints[0].channelOrder(),
         );
-        try std.testing.expectEqualSlices(model.Channel, &.{
-            .rz, .ry, .rx,
-        }, motion.skeleton.joints[1].channelOrder());
+        try std.testing.expectEqualSlices(
+            Skeleton.Channel,
+            &.{ .rz, .ry, .rx },
+            motion.skeleton.joints[1].channelOrder(),
+        );
         try std.testing.expectEqualSlices(f64, &.{ 10, 20, 30, 40, 50, 60 }, motion.values);
     }
 }
@@ -648,8 +740,10 @@ test "BVH nesting uses parent links rather than recursive parser stack" {
     var source: std.Io.Writer.Allocating = .init(allocator);
     defer source.deinit();
     try source.writer.writeAll("HIERARCHY ROOT a { OFFSET 0 0 0 CHANNELS 0 ");
-    for (1..1024) |_| try source.writer.writeAll("JOINT a { OFFSET 0 1 0 CHANNELS 0 ");
-    for (0..1024) |_| try source.writer.writeAll("}");
+    for (1..1024) |_|
+        try source.writer.writeAll("JOINT a { OFFSET 0 1 0 CHANNELS 0 ");
+    for (0..1024) |_|
+        try source.writer.writeAll("}");
     try source.writer.writeAll(" MOTION Frames: 1 Frame Time: 1");
     try std.testing.expectError(
         error.LimitExceeded,
@@ -667,7 +761,7 @@ test "BVH nesting uses parent links rather than recursive parser stack" {
     try std.testing.expectEqual(0, motion.frame(0).?.values.len);
 }
 
-test "BVH structural and early sample truncations never publish a partial motion" {
+test "BVH structural and early frame truncations never publish a partial motion" {
     const allocator = std.testing.allocator;
     const last_value = std.mem.lastIndexOf(u8, fixtures.simple, "-45").?;
     for (0..last_value + 1) |end| {
@@ -677,12 +771,12 @@ test "BVH structural and early sample truncations never publish a partial motion
     }
 }
 
-test "BVH storage-byte representability is checked before sample allocation" {
+test "BVH storage-byte representability is checked before channel-value allocation" {
     const source =
         "HIERARCHY ROOT a { OFFSET 0 0 0 CHANNELS 1 Xposition } MOTION Frames: 536870912 Frame " ++
         "Time: 1";
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
-    var diagnostic: text.Diagnostic = undefined;
+    var diagnostic: Lexer.Diagnostic = undefined;
     const reason = if (@sizeOf(usize) == 4) error.LimitExceeded else error.OutOfMemory;
     try std.testing.expectError(
         reason,

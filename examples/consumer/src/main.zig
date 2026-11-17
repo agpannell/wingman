@@ -765,9 +765,11 @@ test "WAVE owned and caller samples retain rate and independent storage" {
     );
     try std.testing.expectEqual(
         48,
-        try wav.encodePcm16Requirements(
-            .{ .sample_rate = 8000, .channels = .mono, .samples = &.{ -1, 0.5 } },
-        ),
+        try wav.encodePcm16Requirements(.{
+            .sample_rate = 8000,
+            .channels = .mono,
+            .samples = &.{ -1, 0.5 },
+        }),
     );
     const required = try wav.decodeRequirements(encoded, &.{});
     try std.testing.expectEqual(2, required.frames);
@@ -819,7 +821,8 @@ test "WAVE chunk inspection and inline std.Io conversion use the public namespac
         &.{ -1, 32767.0 / 32768.0, -0.5, 0.5, 0, 0.25 },
         view.samples,
     );
-    for (workers) |worker| try std.testing.expectEqual(0, worker.source.len);
+    for (workers) |worker|
+        try std.testing.expectEqual(0, worker.source.len);
 }
 
 test "RIFF borrowed chunks and externally resolved geometry" {
@@ -1065,18 +1068,16 @@ test "ADPCM prefix still rejects omitted invalid IMA blocks" {
 }
 
 test "Exif metadata borrows either TIFF byte order" {
-    for (
-        [_][]const u8{
-            &.{
-                0x49, 0x49, 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0,
-                0,    0,
-            },
-            &.{
-                0x4d, 0x4d, 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0,
-                0,    0,
-            },
+    for ([_][]const u8{
+        &.{
+            0x49, 0x49, 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0,
+            0,
         },
-    ) |bytes| {
+        &.{
+            0x4d, 0x4d, 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0,
+            0,
+        },
+    }) |bytes| {
         const view = try exif.View.open(bytes, .{});
         try std.testing.expectEqual(exif.Orientation.right_top, (try view.orientation()).?);
         try std.testing.expectEqual(2, view.record_count);
@@ -1183,7 +1184,8 @@ test "BLAKE3 public parallel API permits inline provider and retires workers" {
     var expected: blake3.Digest = undefined;
     std.crypto.hash.Blake3.hash(input, &expected, .{});
     try std.testing.expectEqual(expected, state.final());
-    for (workers) |worker| try std.testing.expectEqual(0, worker.input.len);
+    for (workers) |worker|
+        try std.testing.expectEqual(0, worker.input.len);
 }
 
 test "LZ4 literal wire fixed counts exact extent and spare capacity" {
@@ -1331,12 +1333,12 @@ test "LZ4 standard frames checksums concatenation and skippable boundaries" {
     try std.testing.expectError(error.ChecksumMismatch, lz4.frame.decode.into(frame, &output, .{}));
 }
 
-test "BVH owned samples and public rigid transforms compose outside the package" {
+test "BVH owned frames and public rigid transforms compose outside the package" {
     var source =
         ("HIERARCHY ROOT hips { OFFSET 1 2 3 CHANNELS 4 Xposition Yposition Zposition " ++
             "Zrotation JOINT tip { OFFSET 0 2 0 CHANNELS 0 End Site { OFFSET 0 1 0 } } }\n" ++
             "MOTION Frames: 1 Frame Time: 0.125\n4 5 6 90\n").*;
-    var motion = try bvh.parseAlloc(std.testing.allocator, &source, null, .{});
+    var motion = try bvh.Motion.parseAlloc(std.testing.allocator, &source, null, .{});
     defer motion.deinit(std.testing.allocator);
     @memset(&source, 0xff);
     try std.testing.expectEqualStrings("hips", motion.skeleton.joints[0].name.?);
@@ -1344,31 +1346,28 @@ test "BVH owned samples and public rigid transforms compose outside the package"
     try std.testing.expectEqual(4, motion.skeleton.channel_count);
     try std.testing.expectEqual(0.125, motion.frame_time);
     try std.testing.expect(motion.frame(1) == null);
-    const sample = motion.frame(0).?;
-    try std.testing.expectEqualSlices(f64, &.{ 4, 5, 6, 90 }, sample.jointValues(0).?);
-    try std.testing.expectEqual(0, sample.jointValues(1).?.len);
+    const frame = motion.frame(0).?;
+    try std.testing.expectEqualSlices(f64, &.{ 4, 5, 6, 90 }, frame.jointValues(0).?);
+    try std.testing.expectEqual(0, frame.jointValues(1).?.len);
 
     var storage: [4]RigidTransform = @splat(.identity);
-    const global = try bvh.globalPoseInto(sample, &storage, .{});
+    const global = try bvh.globalPoseInto(frame, &storage, .{});
     for (global, [_][3]f64{ .{ 5, 7, 9 }, .{ 3, 7, 9 }, .{ 2, 7, 9 } }) |actual, expected| {
-        for (actual.translation, expected) |value, reference| {
+        for (actual.translation, expected) |value, reference|
             try std.testing.expectApproxEqAbs(reference, value, 1e-14);
-        }
         try std.testing.expect(actual.isFinite());
     }
     try std.testing.expectEqualDeep(RigidTransform.identity, storage[3]);
     const point = global[0].transformPoint(.{ 1, 0, 0 });
-    for (point, [_]f64{ 5, 8, 9 }) |actual, expected| {
+    for (point, [_]f64{ 5, 8, 9 }) |actual, expected|
         try std.testing.expectApproxEqAbs(expected, actual, 1e-14);
-    }
     const replaced = try bvh.localPoseInto(
-        sample,
+        frame,
         &storage,
-        .{ .position_channels = .replace_offset, .length_scale = 0.01 },
+        .{ .position_policy = .replace_offset, .length_scale = 0.01 },
     );
-    for (replaced[0].translation, [_]f64{ 0.04, 0.05, 0.06 }) |actual, expected| {
+    for (replaced[0].translation, [_]f64{ 0.04, 0.05, 0.06 }) |actual, expected|
         try std.testing.expectApproxEqAbs(expected, actual, 1e-16);
-    }
     try std.testing.expectEqualDeep(RigidTransform.identity, storage[3]);
 }
 
@@ -1421,9 +1420,8 @@ test "Acclaim paired clips reuse one skeleton and prepared public transforms" {
         const global = try evaluator.globalPoseInto(sample, &storage);
         try std.testing.expectEqual(2, global.len);
         const endpoint = global[1].transformPoint(.{ 2, 0, 0 });
-        for (endpoint, expected) |actual, reference| {
+        for (endpoint, expected) |actual, reference|
             try std.testing.expectApproxEqAbs(reference, actual, 1e-14);
-        }
         try std.testing.expectEqualDeep(RigidTransform.identity, storage[2]);
     }
 }

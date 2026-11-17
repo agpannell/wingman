@@ -5,15 +5,15 @@ const bvh = wingman.bvh;
 
 pub fn main(init: std.process.Init) !void {
     var source = clip.*;
-    var motion = try bvh.parseAlloc(init.gpa, &source, null, .{});
+    var motion = try bvh.Motion.parseAlloc(init.gpa, &source, null, .{});
     defer motion.deinit(init.gpa);
-    @memset(&source, 0xff); // The motion owns its names and every sample.
+    const frame = motion.frame(0) orelse return error.MissingFrame;
+    @memset(&source, 0xff); // The retained frame borrows the motion, not these input bytes.
 
-    const sample = motion.frame(0) orelse return error.MissingFrame;
     var local_storage: [3]wingman.RigidTransform = undefined;
     var global_storage: [4]wingman.RigidTransform = @splat(.identity);
-    const local = try bvh.localPoseInto(sample, &local_storage, .{});
-    const global = try bvh.globalPoseInto(sample, &global_storage, .{});
+    const local = try bvh.localPoseInto(frame, &local_storage, .{});
+    const global = try bvh.globalPoseInto(frame, &global_storage, .{});
     const expected_local = [_][3]f64{ .{ 2, 4, 6 }, .{ 0, 4, 0 }, .{ 0, 2, 0 } };
     const expected_global = [_][3]f64{ .{ 2, 4, 6 }, .{ -2, 4, 6 }, .{ -4, 4, 6 } };
     for (
@@ -37,16 +37,18 @@ pub fn main(init: std.process.Init) !void {
 
     var buffer: [1024]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
-    try output.interface.print("BVH: {d} joints, {d} channels, {d} frames at {d}s\n", .{
-        motion.skeleton.joints.len, motion.skeleton.channel_count, motion.frame_count,
-        motion.frame_time,
-    });
-    for (motion.skeleton.joints, local, global) |joint, relative, absolute| {
+    try output.interface.print(
+        "BVH: {d} joints, {d} channels, {d} frames at {d}s\n",
+        .{
+            motion.skeleton.joints.len, motion.skeleton.channel_count, motion.frame_count,
+            motion.frame_time,
+        },
+    );
+    for (motion.skeleton.joints, local, global) |joint, relative, absolute|
         try output.interface.print(
             "  {s}: local {any}, global {any}\n",
             .{ joint.name orelse "end site", relative.translation, absolute.translation },
         );
-    }
     try output.interface.writeAll(
         "positions retain file units; rotations follow declared channel order\n",
     );

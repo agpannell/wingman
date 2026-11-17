@@ -3,31 +3,34 @@
 //! parent/file axes, independently of their position among rotation channels.
 const std = @import("std");
 const overlaps = @import("../common/byte_ranges.zig").overlaps;
-const model = @import("model.zig");
+const Skeleton = @import("Skeleton.zig");
+const Motion = @import("Motion.zig");
 const RigidTransform = @import("../common/RigidTransform.zig");
 const matrix3 = @import("../common/matrix3.zig");
 const fixtures = @import("fixtures.zig");
-const parseAlloc = @import("parse.zig").parseAlloc;
 
-/// How an encoded position coordinate relates to the corresponding static offset coordinate.
-pub const PositionChannels = enum {
-    /// Add the sample to the offset, following the historical Biovision description.
-    add_offset,
-    /// Replace only the offset axes with position channels, as used by several BVH importers.
-    replace_offset,
-};
-
-/// Explicit interpretation; parsing and stored samples remain unchanged.
+/// Explicit interpretation of stored frame values; parsing does not change them.
 pub const PoseOptions = struct {
     /// Positive finite multiplier for every offset and position channel. One keeps file units.
     length_scale: f64 = 1,
-    position_channels: PositionChannels = .add_offset,
+    /// Relation between encoded position coordinates and static offsets, in parent/file axes.
+    position_policy: PositionPolicy = .add_offset,
+
+    /// How an encoded position coordinate relates to the corresponding static offset coordinate.
+    pub const PositionPolicy = enum {
+        /// Add the recorded position coordinate to the offset, following the historical Biovision
+        /// description.
+        add_offset,
+        /// Replace only the offset axes with position channels, as used by several BVH importers.
+        replace_offset,
+    };
 };
 
 /// Admission failures leave output unchanged. Arithmetic overflow can leave a completed prefix.
+/// InvalidFrame means a frame has the wrong channel width or a nonfinite channel value.
 pub const PoseError = error{
     InvalidScale,
-    InvalidSample,
+    InvalidFrame,
     OutputTooSmall,
     AliasedStorage,
     NonFiniteResult,
@@ -35,8 +38,8 @@ pub const PoseError = error{
 
 /// Writes one parent-relative `wingman.RigidTransform` per joint, including roots and end sites, in
 /// source preorder. The origin is the joint's position; an end site is a real unnamed leaf with its
-/// own offset and an identity local rotation. Keep the sample's parsed skeleton immutable.
-/// Caller-created finite values with the skeleton's exact channel width are also supported; sample
+/// own offset and an identity local rotation. Keep the frame's parsed skeleton immutable.
+/// Caller-created finite values with the skeleton's exact channel width are also supported; frame
 /// index/time are not used for pose interpretation.
 ///
 /// Rotation channels are degrees and compose intrinsically in their listed order: Z, X, Y gives
@@ -45,19 +48,19 @@ pub const PoseError = error{
 /// lengths, not rotations. No bone-alignment rotation or coordinate-system conversion is inferred.
 ///
 /// Allocates/retains nothing. Returns the used prefix and leaves destination's tail unchanged. The
-/// entire offered destination must be disjoint from joint records/names and sample values. Scale,
+/// entire offered destination must be disjoint from joint records/names and frame values. Scale,
 /// channel width, finite values, capacity and alias admission complete before any write.
 /// NonFiniteResult may leave a completed prefix; the failing joint and remaining output stay
 /// untouched. Binary64 arithmetic can overflow even when all source values are finite.
 pub fn localPoseInto(
-    sample: model.Sample,
+    frame: Motion.Frame,
     destination: []RigidTransform,
     options: PoseOptions,
 ) PoseError![]RigidTransform {
-    const output = try admit(sample, destination, options);
-    for (sample.skeleton.joints, output) |joint, *out| {
+    const output = try admit(frame, destination, options);
+    for (frame.skeleton.joints, output) |joint, *out| {
         var value: RigidTransform = undefined;
-        localInto(&value, joint, sample.values, options);
+        localInto(&value, joint, frame.values, options);
         if (!value.isFinite()) return error.NonFiniteResult;
         out.* = value;
     }
@@ -75,7 +78,7 @@ test localPoseInto {
         \\Frame Time: 0.5
         \\1 2 3 90
     ;
-    var motion = try parseAlloc(allocator, source, null, .{});
+    var motion = try Motion.parseAlloc(allocator, source, null, .{});
     defer motion.deinit(allocator);
     var storage: [2]RigidTransform = undefined;
     const pose = try localPoseInto(motion.frame(0).?, &storage, .{});
@@ -88,14 +91,14 @@ test localPoseInto {
 /// parents are available before children. Shares `localPoseInto`'s interpretation, admission,
 /// ownership, tail and numeric-failure contracts; a numeric failure can leave a preorder prefix.
 pub fn globalPoseInto(
-    sample: model.Sample,
+    frame: Motion.Frame,
     destination: []RigidTransform,
     options: PoseOptions,
 ) PoseError![]RigidTransform {
-    const output = try admit(sample, destination, options);
-    for (sample.skeleton.joints, output) |joint, *out| {
+    const output = try admit(frame, destination, options);
+    for (frame.skeleton.joints, output) |joint, *out| {
         var value: RigidTransform = undefined;
-        localInto(&value, joint, sample.values, options);
+        localInto(&value, joint, frame.values, options);
         var result: RigidTransform = undefined;
         if (joint.parent) |parent| {
             if (joint.channel_count == 0) {
@@ -119,7 +122,7 @@ pub fn globalPoseInto(
 }
 
 test globalPoseInto {
-    var motion = try parseAlloc(std.testing.allocator, fixtures.simple, null, .{});
+    var motion = try Motion.parseAlloc(std.testing.allocator, fixtures.simple, null, .{});
     defer motion.deinit(std.testing.allocator);
     var storage: [3]RigidTransform = undefined;
     const pose = try globalPoseInto(motion.frame(0).?, &storage, .{});
@@ -137,17 +140,17 @@ test "BVH static children preserve identity-composition zero signs" {
         \\MOTION Frames: 1 Frame Time: .25
         \\0 0 0
     ;
-    var motion = try parseAlloc(std.testing.allocator, source, null, .{});
+    var motion = try Motion.parseAlloc(std.testing.allocator, source, null, .{});
     defer motion.deinit(std.testing.allocator);
     var storage: [2]RigidTransform = undefined;
-    const sample = motion.frame(0).?;
-    const local_pose = try localPoseInto(sample, &storage, .{});
+    const frame = motion.frame(0).?;
+    const local_pose = try localPoseInto(frame, &storage, .{});
     const negative_zero_bits: u64 = 1 << 63;
     try std.testing.expectEqual(
         negative_zero_bits,
         @as(u64, @bitCast(local_pose[0].rotation[0][1])),
     );
-    const global_pose = try globalPoseInto(sample, &storage, .{});
+    const global_pose = try globalPoseInto(frame, &storage, .{});
     const identity = RigidTransform.identity.rotation;
     try std.testing.expectEqualSlices(
         u8,
@@ -157,30 +160,30 @@ test "BVH static children preserve identity-composition zero signs" {
 }
 
 fn admit(
-    sample: model.Sample,
+    frame: Motion.Frame,
     destination: []RigidTransform,
     options: PoseOptions,
 ) PoseError![]RigidTransform {
     if (!std.math.isFinite(
         options.length_scale,
     ) or options.length_scale <= 0) return error.InvalidScale;
-    if (sample.values.len != sample.skeleton.channel_count) return error.InvalidSample;
-    if (destination.len < sample.skeleton.joints.len) return error.OutputTooSmall;
+    if (frame.values.len != frame.skeleton.channel_count) return error.InvalidFrame;
+    if (destination.len < frame.skeleton.joints.len) return error.OutputTooSmall;
     const bytes = std.mem.sliceAsBytes(destination);
     if (overlaps(
         bytes,
-        std.mem.sliceAsBytes(sample.skeleton.joints),
-    ) or overlaps(bytes, std.mem.sliceAsBytes(sample.values))) return error.AliasedStorage;
-    for (sample.skeleton.joints) |joint| {
+        std.mem.sliceAsBytes(frame.skeleton.joints),
+    ) or overlaps(bytes, std.mem.sliceAsBytes(frame.values))) return error.AliasedStorage;
+    for (frame.skeleton.joints) |joint| {
         if (joint.name) |name| if (overlaps(bytes, name)) return error.AliasedStorage;
     }
-    for (sample.values) |value| if (!std.math.isFinite(value)) return error.InvalidSample;
-    return destination[0..sample.skeleton.joints.len];
+    for (frame.values) |value| if (!std.math.isFinite(value)) return error.InvalidFrame;
+    return destination[0..frame.skeleton.joints.len];
 }
 
 inline fn localInto(
     result: *RigidTransform,
-    joint: model.Joint,
+    joint: Skeleton.Joint,
     values: []const f64,
     options: PoseOptions,
 ) void {
@@ -194,13 +197,13 @@ inline fn localInto(
             .tx, .ty, .tz => {
                 const axis: usize = @backingInt(channel);
                 const position = value * options.length_scale;
-                switch (options.position_channels) {
+                switch (options.position_policy) {
                     .add_offset => result.translation[axis] += position,
                     .replace_offset => result.translation[axis] = position,
                 }
             },
             .rx, .ry, .rz => {
-                axes[rotations] = @intCast(@backingInt(channel) - @backingInt(model.Channel.rx));
+                axes[rotations] = @intCast(@backingInt(channel) - @backingInt(Skeleton.Channel.rx));
                 angles[rotations] = value;
                 rotations += 1;
             },
@@ -304,11 +307,11 @@ fn expectMatrix(expected: [3][3]f64, actual: [3][3]f64) !void {
 }
 
 test "BVH local/global joint origins, end sites, scale and unchanged output tails" {
-    var motion = try parseAlloc(std.testing.allocator, fixtures.simple, null, .{});
+    var motion = try Motion.parseAlloc(std.testing.allocator, fixtures.simple, null, .{});
     defer motion.deinit(std.testing.allocator);
     var output: [4]RigidTransform = @splat(RigidTransform.identity);
-    const sample = motion.frame(0).?;
-    const local_pose = try localPoseInto(sample, &output, .{});
+    const frame = motion.frame(0).?;
+    const local_pose = try localPoseInto(frame, &output, .{});
     try std.testing.expectEqual(3, local_pose.len);
     try expectVector(.{ 2, 4, 6 }, local_pose[0].translation);
     try expectVector(.{ 0, 4, 0 }, local_pose[1].translation);
@@ -316,13 +319,13 @@ test "BVH local/global joint origins, end sites, scale and unchanged output tail
     try expectMatrix(.{ .{ 0, -1, 0 }, .{ 1, 0, 0 }, .{ 0, 0, 1 } }, local_pose[0].rotation);
     try expectMatrix(.{ .{ 0, 0, 1 }, .{ 0, 1, 0 }, .{ -1, 0, 0 } }, local_pose[1].rotation);
     try expectMatrix(RigidTransform.identity.rotation, local_pose[2].rotation);
-    const global_pose = try globalPoseInto(sample, &output, .{});
+    const global_pose = try globalPoseInto(frame, &output, .{});
     try expectVector(.{ -2, 4, 6 }, global_pose[1].translation);
     try expectVector(.{ -4, 4, 6 }, global_pose[2].translation);
     const distal_rotation = .{ .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ -1, 0, 0 } };
     try expectMatrix(distal_rotation, global_pose[1].rotation);
     try expectMatrix(distal_rotation, global_pose[2].rotation);
-    const scaled = try globalPoseInto(sample, &output, .{ .length_scale = 0.5 });
+    const scaled = try globalPoseInto(frame, &output, .{ .length_scale = 0.5 });
     try expectVector(.{ 1, 2, 3 }, scaled[0].translation);
     try expectVector(.{ -1, 2, 3 }, scaled[1].translation);
     try expectVector(.{ -2, 2, 3 }, scaled[2].translation);
@@ -369,7 +372,7 @@ test "BVH intrinsic quarter-turn compositions cover every order with literal mat
             },
         );
         defer allocator.free(source);
-        var motion = try parseAlloc(allocator, source, null, .{});
+        var motion = try Motion.parseAlloc(allocator, source, null, .{});
         defer motion.deinit(allocator);
         var output: [1]RigidTransform = undefined;
         _ = try localPoseInto(motion.frame(0).?, &output, .{});
@@ -384,29 +387,29 @@ test "BVH position interpretations keep interleaved nonroot coordinates in paren
         \\} MOTION Frames: 1 Frame Time: 1
         \\90 90 5 90
     ;
-    var motion = try parseAlloc(std.testing.allocator, source, null, .{});
+    var motion = try Motion.parseAlloc(std.testing.allocator, source, null, .{});
     defer motion.deinit(std.testing.allocator);
-    const sample = motion.frame(0).?;
+    const frame = motion.frame(0).?;
     var output: [2]RigidTransform = undefined;
-    _ = try localPoseInto(sample, &output, .{});
+    _ = try localPoseInto(frame, &output, .{});
     try expectVector(.{ 7, 3, 4 }, output[1].translation);
-    _ = try globalPoseInto(sample, &output, .{});
+    _ = try globalPoseInto(frame, &output, .{});
     try expectVector(.{ 8, -2, 6 }, output[1].translation);
     try expectMatrix(.{ .{ 0, -1, 0 }, .{ 1, 0, 0 }, .{ 0, 0, 1 } }, output[1].rotation);
-    _ = try localPoseInto(sample, &output, .{ .position_channels = .replace_offset });
+    _ = try localPoseInto(frame, &output, .{ .position_policy = .replace_offset });
     try expectVector(.{ 5, 3, 4 }, output[1].translation);
-    _ = try globalPoseInto(sample, &output, .{ .position_channels = .replace_offset });
+    _ = try globalPoseInto(frame, &output, .{ .position_policy = .replace_offset });
     try expectVector(.{ 6, -2, 6 }, output[1].translation);
     _ = try globalPoseInto(
-        sample,
+        frame,
         &output,
-        .{ .position_channels = .replace_offset, .length_scale = 2 },
+        .{ .position_policy = .replace_offset, .length_scale = 2 },
     );
     try expectVector(.{ 12, -4, 12 }, output[1].translation);
 }
 
 test "BVH forests and static end sites evaluate independently with no synthetic bone alignment" {
-    var motion = try parseAlloc(std.testing.allocator, fixtures.forest, null, .{});
+    var motion = try Motion.parseAlloc(std.testing.allocator, fixtures.forest, null, .{});
     defer motion.deinit(std.testing.allocator);
     var output: [6]RigidTransform = undefined;
     _ = try globalPoseInto(motion.frame(0).?, &output, .{});
@@ -418,55 +421,55 @@ test "BVH forests and static end sites evaluate independently with no synthetic 
     try expectMatrix(RigidTransform.identity.rotation, output[4].rotation);
 }
 
-test "BVH caller-created samples need only a parsed skeleton and exact finite channel width" {
+test "BVH caller-created frames need only a parsed skeleton and exact finite channel width" {
     const source =
         "HIERARCHY ROOT a { OFFSET 0 0 0 CHANNELS 1 Xposition } MOTION Frames: 0 Frame Time: 1";
-    var motion = try parseAlloc(std.testing.allocator, source, null, .{});
+    var motion = try Motion.parseAlloc(std.testing.allocator, source, null, .{});
     defer motion.deinit(std.testing.allocator);
-    const sample: model.Sample = .{
+    const frame: Motion.Frame = .{
         .index = 42,
         .time = -5,
         .values = &.{7},
         .skeleton = motion.skeleton.view(),
     };
     var output: [1]RigidTransform = undefined;
-    _ = try globalPoseInto(sample, &output, .{});
+    _ = try globalPoseInto(frame, &output, .{});
     try expectVector(.{ 7, 0, 0 }, output[0].translation);
 }
 
 test "BVH admission leaves all output unchanged on bad scale, width, values or capacity" {
-    var motion = try parseAlloc(std.testing.allocator, fixtures.simple, null, .{});
+    var motion = try Motion.parseAlloc(std.testing.allocator, fixtures.simple, null, .{});
     defer motion.deinit(std.testing.allocator);
     var output: [4]RigidTransform = @splat(RigidTransform.identity);
-    const sample = motion.frame(0).?;
+    const frame = motion.frame(0).?;
     for ([_]f64{ 0, -1, std.math.nan(f64), std.math.inf(f64) }) |scale|
         try std.testing.expectError(
             error.InvalidScale,
-            globalPoseInto(sample, &output, .{ .length_scale = scale }),
+            globalPoseInto(frame, &output, .{ .length_scale = scale }),
         );
-    try std.testing.expectError(error.OutputTooSmall, globalPoseInto(sample, output[0..2], .{}));
-    var bad_sample = sample;
-    bad_sample.values = sample.values[0..8];
-    try std.testing.expectError(error.InvalidSample, localPoseInto(bad_sample, &output, .{}));
+    try std.testing.expectError(error.OutputTooSmall, globalPoseInto(frame, output[0..2], .{}));
+    var invalid_frame = frame;
+    invalid_frame.values = frame.values[0..8];
+    try std.testing.expectError(error.InvalidFrame, localPoseInto(invalid_frame, &output, .{}));
     var values: [9]f64 = @splat(0);
     values[8] = std.math.nan(f64);
-    bad_sample.values = &values;
-    try std.testing.expectError(error.InvalidSample, globalPoseInto(bad_sample, &output, .{}));
+    invalid_frame.values = &values;
+    try std.testing.expectError(error.InvalidFrame, globalPoseInto(invalid_frame, &output, .{}));
     for (output) |value|
         try std.testing.expectEqualDeep(RigidTransform.identity, value);
 }
 
 test "BVH alias admission includes the entire offered destination and copied joint names" {
-    var motion = try parseAlloc(std.testing.allocator, fixtures.simple, null, .{});
+    var motion = try Motion.parseAlloc(std.testing.allocator, fixtures.simple, null, .{});
     defer motion.deinit(std.testing.allocator);
     var output: [4]RigidTransform = @splat(RigidTransform.identity);
-    var sample = motion.frame(0).?;
+    var frame = motion.frame(0).?;
     const values: [*]const f64 = @ptrCast(&output[3]);
-    sample.values = values[0..9];
-    try std.testing.expectError(error.AliasedStorage, globalPoseInto(sample, &output, .{}));
+    frame.values = values[0..9];
+    try std.testing.expectError(error.AliasedStorage, globalPoseInto(frame, &output, .{}));
     for (output) |value|
         try std.testing.expectEqualDeep(RigidTransform.identity, value);
-    _ = try globalPoseInto(sample, output[0..3], .{});
+    _ = try globalPoseInto(frame, output[0..3], .{});
     try std.testing.expectEqualDeep(RigidTransform.identity, output[3]);
 
     var backing: [4096]u8 align(@alignOf(RigidTransform)) = @splat(0xa5);
@@ -475,7 +478,7 @@ test "BVH alias admission includes the entire offered destination and copied joi
     const name_source = "HIERARCHY ROOT alias {" ++
         padding ++
         " OFFSET 0 0 0 CHANNELS 0 } MOTION Frames: 1 Frame Time: 1";
-    var named = try parseAlloc(fixed.allocator(), name_source, null, .{});
+    var named = try Motion.parseAlloc(fixed.allocator(), name_source, null, .{});
     defer named.deinit(fixed.allocator());
     const original = backing;
     const name_output: [*]RigidTransform = @ptrCast(
@@ -505,7 +508,7 @@ test "BVH numeric failure publishes only completed joints and preserves unused t
         \\ROOT b { OFFSET 1e308 0 0 CHANNELS 0 }
         \\MOTION Frames: 1 Frame Time: 1
     ;
-    var motion = try parseAlloc(allocator, source, null, .{});
+    var motion = try Motion.parseAlloc(allocator, source, null, .{});
     defer motion.deinit(allocator);
     var output: [3]RigidTransform = @splat(RigidTransform.identity);
     try std.testing.expectError(
@@ -519,7 +522,7 @@ test "BVH numeric failure publishes only completed joints and preserves unused t
     const hierarchy =
         "HIERARCHY ROOT a { OFFSET 1e308 0 0 CHANNELS 0 JOINT b { OFFSET 1e308 0 0 CHANNELS 0 " ++
         "}} MOTION Frames: 1 Frame Time: 1";
-    var accumulating = try parseAlloc(allocator, hierarchy, null, .{});
+    var accumulating = try Motion.parseAlloc(allocator, hierarchy, null, .{});
     defer accumulating.deinit(allocator);
     _ = try localPoseInto(accumulating.frame(0).?, &output, .{});
     @memset(&output, RigidTransform.identity);
