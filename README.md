@@ -111,15 +111,19 @@ font can render text. Checksums are explicit, and glyphs, layout and rendering s
 
 ### Motion capture
 
-Use `bvh` for self-contained skeleton/motion clips, or `acclaim` to pair one ASF skeleton with
-multiple AMC clips. Both evaluate joint poses using the package's `RigidTransform` type for
-row-major binary64 rotation and translation. Their guides explain intrinsic BVH rotations and
+A skeleton describes static geometry and the meaning of each motion channel. A frame supplies one
+value per channel; evaluating a pose turns those values into joint transforms. Use `bvh` for a clip
+that owns both its skeleton and frames, or `acclaim` to share one ASF skeleton among AMC clips and
+prepared pose evaluators. Frames borrow the parsed storage, so keep their owners alive.
+
+Both formats write local or global poses into caller storage using `RigidTransform`, the package's
+row-major binary64 rotation and translation value. Their guides explain intrinsic BVH rotations and
 Acclaim's fixed-axis calibration; applications choose coordinate conversion, interpolation and playback.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`bvh`](docs/bvh.md) | Owned skeletons and motion channels, caller-output local/global joint poses | `bvh-example` |
-| [`acclaim`](docs/acclaim.md) | Paired ASF/AMC ownership, sparse samples and reusable prepared bone poses | `acclaim-example` |
+| [`acclaim`](docs/acclaim.md) | Paired ASF/AMC ownership, sparse frames and reusable prepared bone poses | `acclaim-example` |
 
 ## Try it
 

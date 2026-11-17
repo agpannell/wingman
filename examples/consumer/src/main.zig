@@ -1377,13 +1377,13 @@ test "Acclaim paired clips reuse one skeleton and prepared public transforms" {
             " position 0 0 0\n orientation 0 0 0\n:bonedata\nbegin\n id 9\n name arm\n" ++
             " direction 1 0 0\n length 2\n axis 0 0 0 XYZ\n dof rz\nend\n:hierarchy\nbegin\n" ++
             " root arm\nend\n").*;
-    var skeleton = try acclaim.parseSkeletonAlloc(std.testing.allocator, &source, null, .{});
+    var skeleton = try acclaim.Skeleton.parseAlloc(std.testing.allocator, &source, null, .{});
     defer skeleton.deinit(std.testing.allocator);
     @memset(&source, 0xff);
     try std.testing.expectEqual(1, skeleton.view().findBone("arm").?);
     try std.testing.expectEqual(9, skeleton.bones[1].id);
     var degrees = ":DEGREES\n3\nroot 1 2 3 0 0 0\narm 90\n".*;
-    var first = try acclaim.parseMotionAlloc(
+    var first = try acclaim.Motion.parseAlloc(
         std.testing.allocator,
         &degrees,
         skeleton.view(),
@@ -1393,7 +1393,7 @@ test "Acclaim paired clips reuse one skeleton and prepared public transforms" {
     defer first.deinit(std.testing.allocator);
     @memset(&degrees, 0xff);
     var radians = ":RADIANS\n9\nroot 4 5 6 0 0 0\narm 1.5707963267948966\n".*;
-    var second = try acclaim.parseMotionAlloc(
+    var second = try acclaim.Motion.parseAlloc(
         std.testing.allocator,
         &radians,
         skeleton.view(),
@@ -1415,9 +1415,9 @@ test "Acclaim paired clips reuse one skeleton and prepared public transforms" {
     try std.testing.expect(first.frame(1) == null and second.frame(1) == null);
 
     var storage: [3]RigidTransform = @splat(.identity);
-    const samples = [_]acclaim.Sample{ first.frame(0).?, second.frame(0).? };
-    for (samples, [_][3]f64{ .{ 1, 4, 3 }, .{ 4, 7, 6 } }) |sample, expected| {
-        const global = try evaluator.globalPoseInto(sample, &storage);
+    const frames = [_]acclaim.Motion.Frame{ first.frame(0).?, second.frame(0).? };
+    for (frames, [_][3]f64{ .{ 1, 4, 3 }, .{ 4, 7, 6 } }) |frame, expected| {
+        const global = try evaluator.globalPoseInto(frame, &storage);
         try std.testing.expectEqual(2, global.len);
         const endpoint = global[1].transformPoint(.{ 2, 0, 0 });
         for (endpoint, expected) |actual, reference|

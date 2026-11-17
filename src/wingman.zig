@@ -27,10 +27,11 @@
 //! ktx2 inspects and writes texture containers with caller-supplied encoded mip levels. etc encodes
 //! and decodes ETC1 color and unsigned EAC component blocks.
 //!
-//! bvh owns self-contained skeletal motion; acclaim pairs reusable ASF skeletons with AMC clips and
-//! cached pose calibration. Both write local/global RigidTransform values into caller storage,
-//! retaining their distinct rotation and unit contracts. Playback, interpolation, retargeting and
-//! producer coordinate conversion stay with callers.
+//! bvh owns a skeleton and its recorded frames; acclaim shares a reusable ASF skeleton among AMC
+//! clips and prepared pose evaluators. A skeleton supplies geometry/channel meanings, a frame holds
+//! raw values, and a pose interprets them as local/global RigidTransform values in caller storage.
+//! The formats retain their distinct rotation and unit contracts. Playback, interpolation,
+//! retargeting and producer coordinate conversion stay with callers.
 //!
 //! Container views and WAVE format coefficients can borrow encoded input. Decoded WAVE views borrow
 //! output samples; allocated Audio owners are released with the original allocator. Parallel WAVE

@@ -5,11 +5,18 @@ const acclaim = wingman.acclaim;
 
 pub fn main(init: std.process.Init) !void {
     var skeleton_source = skeleton_text.*;
-    var skeleton = try acclaim.parseSkeletonAlloc(init.gpa, &skeleton_source, null, .{});
+    var skeleton = try acclaim.Skeleton.parseAlloc(init.gpa, &skeleton_source, null, .{});
+    // Defers run in reverse order: evaluator, motion, then their shared skeleton.
     defer skeleton.deinit(init.gpa);
     @memset(&skeleton_source, 0xff);
     var motion_source = motion_text.*;
-    var motion = try acclaim.parseMotionAlloc(init.gpa, &motion_source, skeleton.view(), null, .{});
+    var motion = try acclaim.Motion.parseAlloc(
+        init.gpa,
+        &motion_source,
+        skeleton.view(),
+        null,
+        .{},
+    );
     defer motion.deinit(init.gpa);
     @memset(&motion_source, 0xff);
     var evaluator = try acclaim.PoseEvaluator.initAlloc(init.gpa, skeleton.view(), .{});
@@ -17,17 +24,17 @@ pub fn main(init: std.process.Init) !void {
 
     const tip_index = skeleton.view().findBone("tip") orelse return error.MissingBone;
     if (tip_index != 1 or skeleton.bones[tip_index].id != 42) return error.WrongIdentity;
-    if (motion.frame(
-        0,
-    ).?.number != 1 or motion.frame(
-        1,
-    ).?.number != 5 or motion.frame(2) != null) return error.WrongFrameNumbers;
-    if (motion.frame(1).?.boneValues(2).?[0] != 90) return error.MissingCarriedChannel;
+    const first_frame = motion.frame(0) orelse return error.MissingFrame;
+    const second_frame = motion.frame(1) orelse return error.MissingFrame;
+    if (first_frame.number != 1 or second_frame.number != 5 or motion.frame(
+        2,
+    ) != null) return error.WrongFrameNumbers;
+    if (second_frame.boneValues(2).?[0] != 90) return error.MissingCarriedChannel;
 
     var local_storage: [3]wingman.RigidTransform = undefined;
     var global_storage: [4]wingman.RigidTransform = @splat(.identity);
-    const local = try evaluator.localPoseInto(motion.frame(0).?, &local_storage);
-    const global = try evaluator.globalPoseInto(motion.frame(0).?, &global_storage);
+    const local = try evaluator.localPoseInto(first_frame, &local_storage);
+    const global = try evaluator.globalPoseInto(first_frame, &global_storage);
     const expected = [_][3]f64{ .{ 2, 2, 3 }, .{ 2, 4, 3 }, .{ 2, 2, 3 } };
     for (global, expected) |actual, reference| {
         for (actual.translation, reference) |value, coordinate| {
@@ -49,14 +56,15 @@ pub fn main(init: std.process.Init) !void {
 
     var buffer: [1024]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
-    try output.interface.print("Acclaim: {d} bones, {d} samples, retained frame IDs 1 and 5\n", .{
-        skeleton.bones.len, motion.frame_numbers.len,
-    });
-    for (skeleton.bones, local, global, 0..) |bone, relative, absolute, index| {
-        try output.interface.print("  index {d}, ASF ID {d}, {s}: local {any}, global {any}\n", .{
-            index, bone.id, bone.name, relative.translation, absolute.translation,
-        });
-    }
+    try output.interface.print(
+        "Acclaim: {d} bones, {d} frames, retained frame numbers 1 and 5\n",
+        .{ skeleton.bones.len, motion.frame_numbers.len },
+    );
+    for (skeleton.bones, local, global, 0..) |bone, relative, absolute, index|
+        try output.interface.print(
+            "  index {d}, ASF ID {d}, {s}: local {any}, global {any}\n",
+            .{ index, bone.id, bone.name, relative.translation, absolute.translation },
+        );
     try output.interface.print(
         "tip endpoint: {any}; no sample rate or metre conversion inferred\n",
         .{endpoint},
