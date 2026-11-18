@@ -199,7 +199,7 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
 - KTX2 `Container` and derived views borrow immutable file bytes; descriptors and their block
   iterators also borrow their encoded backing. Supplied-level and basic-descriptor writers produce
   independent bytes in caller storage. Allocating KTX2 writes return bytes released with the same
-  allocator.
+  allocator. ETC1/EAC operations retain no input or output and use caller-owned block/tile storage.
 - DFONT containers and selected font resources borrow complete immutable resource-file bytes.
   SFNT directories, collection faces and raw tables borrow complete immutable font/container bytes.
   Copied tags, checksums and flavor values are independent; no allocator or cleanup is retained.

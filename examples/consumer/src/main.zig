@@ -410,19 +410,31 @@ test "raw DEFLATE levels and exact output errors are available to consumers" {
     try std.testing.expect(std.mem.allEqual(u8, &encoded_storage, 0xa5));
 }
 
-test "ETC and EAC blocks preserve constants and report refused work" {
-    const pixels: [16][4]u8 = @splat(.{ 0, 0, 0, 17 });
+test "ETC and EAC compose split tiles and report refused work" {
+    var pixels: [16][4]u8 = undefined;
+    for (&pixels, 0..) |*pixel, index| {
+        const color: u8 = if (index % 4 < 2) 0 else 255;
+        pixel.* = .{ color, color, color, 103 };
+    }
+    const samples: [16]u8 = @splat(103);
     var block: [8]u8 = undefined;
-    try etc.encodeBlock(&pixels, &block, .{});
+    try etc.encodeBlock(&pixels, &block, .{ .effort = .balanced });
     var decoded: [64]u8 = undefined;
     try etc.decodeBlock(&block, &decoded);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, decoded[0..4]);
-    const samples: [16]u8 = @splat(103);
+    for (0..16) |index|
+        try std.testing.expectEqual(255, decoded[index * 4 + 3]);
     try etc.encodeAlphaBlock(&samples, &block, .{});
     try std.testing.expect(block[1] >> 4 != 0);
     var alpha: [16]u8 = undefined;
     try etc.decodeAlphaBlock(&block, &alpha);
     try std.testing.expectEqualSlices(u8, &samples, &alpha);
+    for (alpha, 0..) |value, index| decoded[index * 4 + 3] = value;
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&pixels), &decoded);
+    const red_samples: [16]u8 = @splat(103);
+    try etc.encodeR11Block(&red_samples, &block, .{});
+    var red: [16]u16 = undefined;
+    try etc.decodeR11Block(&block, &red);
+    try std.testing.expect(std.mem.allEqual(u16, &red, 827));
     try std.testing.expectError(
         error.WorkBudgetExceeded,
         etc.encodeBlock(&pixels, &block, .{ .maximum_work_units = 0 }),

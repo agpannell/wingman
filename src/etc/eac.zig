@@ -1,18 +1,61 @@
-//! Unsigned EAC scalar blocks: alpha8 and R11 reconstruction, selector packing and bounded fitting.
-//! Both formats store the same fields, but R11 expands the base and treats multiplier zero as 1/8.
-//! Alpha8 decoders accept zero multipliers; alpha8 encoders must emit nonzero multipliers.
-
+//! Unsigned EAC alpha8 and R11 blocks store a base, a multiplier, a modifier-table index and
+//! sixteen three-bit selectors. Alpha8 reconstructs bytes; R11 reconstructs eleven-bit values. The
+//! base, table and multiplier form a palette of eight possible values; each texel's selector
+//! chooses one. Their field layout is shared, while base expansion and multiplier-zero rules
+//! differ. Wire selectors advance down columns; caller sample arrays advance across rows.
+//!
+//! Fitting converts normalized-byte R11 input to nearest eleven-bit samples, scores all sixteen
+//! texels in integer vector lanes and retains the first selector/candidate on equal error. Fast
+//! considers four tables, balanced all sixteen, and refined also searches adjacent base/scale
+//! pairs. Narrow R11 ranges additionally test multiplier zero. Alpha8 fitting always uses nonzero
+//! multipliers; alpha8 decoding accepts stored zero. Constant mappings and wire facts live here.
 const std = @import("std");
 const memory = @import("../common/byte_ranges.zig");
-const format = @import("format.zig");
+const etc = @import("../etc.zig");
 
-pub const DecodeError = format.DecodeError;
-const Encoding = format.ScalarEncoding;
+// One EAC header: both precisions share these fields but reconstruct different palettes.
+const Encoding = struct {
+    /// Raw eight-bit base code; R11 reconstructs base * 8 + 4 before modifiers.
+    base: u8,
+    /// One of sixteen signed-modifier tables.
+    table: u4,
+    /// Raw four-bit scale; zero has distinct alpha8 and R11 decoding rules.
+    multiplier: u4,
+
+    // Clamp in the selected precision. Alpha8 uses the raw base/scale; R11 expands the base, scales
+    // nonzero multipliers by eight and treats zero as an unscaled modifier.
+    fn palette(self: Encoding, comptime bits: u4) [8]u16 {
+        std.debug.assert(bits == 8 or bits == 11);
+        const base: i32 = if (bits == 8) self.base else @as(i32, self.base) * 8 + 4;
+        const multiplier: i32 = blk: {
+            if (bits == 8) break :blk self.multiplier;
+            if (self.multiplier == 0) break :blk 1;
+            break :blk @as(i32, self.multiplier) * 8;
+        };
+        var result: [8]u16 = undefined;
+        for (&result, modifier_tables[self.table]) |*entry, modifier| {
+            entry.* = @intCast(std.math.clamp(base + modifier * multiplier, 0, (1 << bits) - 1));
+        }
+        return result;
+    }
+
+    fn pack(self: Encoding, selectors: *const [16]u3, output: *[8]u8) void {
+        const base_bits = @as(u16, self.base) << 8;
+        const multiplier_bits = @as(u16, self.multiplier) << 4;
+        const header = base_bits | multiplier_bits | self.table;
+        var word = @as(u64, header) << 48;
+        for (selectors, 0..) |selector, pixel| {
+            const offset: u6 = @intCast(45 - ((pixel % 4) * 4 + pixel / 4) * 3);
+            word |= @as(u64, selector) << offset;
+        }
+        std.mem.writeInt(u64, output, word, .big);
+    }
+};
 
 /// Reads the first eight bytes of an EAC alpha block and writes sixteen row-major alpha bytes. This
 /// is the alpha half of ETC2 RGBA, not the R11 representation. Extra capacity is untouched; used
 /// source/output spans must be disjoint. Every failure preserves all output. Allocates nothing.
-pub fn decodeAlphaBlock(encoded: []const u8, destination: []u8) DecodeError!void {
+pub fn decodeAlphaBlock(encoded: []const u8, destination: []u8) etc.EacDecodeError!void {
     return decode(8, encoded, destination);
 }
 
@@ -28,7 +71,7 @@ test decodeAlphaBlock {
 /// extend to UNORM16 with `(value << 5) | (value >> 6)`. An RG11 block contains red then green R11
 /// blocks. Extra input/output is untouched; used spans must be disjoint. Every error preserves all
 /// output, and no allocation occurs. Signed EAC is not interpreted by this operation.
-pub fn decodeR11Block(encoded: []const u8, destination: []u16) DecodeError!void {
+pub fn decodeR11Block(encoded: []const u8, destination: []u16) etc.EacDecodeError!void {
     return decode(11, encoded, destination);
 }
 
@@ -43,7 +86,7 @@ fn decode(
     comptime bits: u4,
     encoded: []const u8,
     destination: [](if (bits == 8) u8 else u16),
-) DecodeError!void {
+) etc.EacDecodeError!void {
     if (encoded.len < 8) return error.TruncatedBlock;
     if (destination.len < 16) return error.DestinationTooSmall;
     const source = encoded[0..8];
@@ -54,7 +97,7 @@ fn decode(
         .table = @truncate(source[1]),
         .multiplier = @truncate(source[1] >> 4),
     };
-    const palette = format.scalarPalette(encoding, bits);
+    const palette = encoding.palette(bits);
     const word = std.mem.readInt(u64, source, .big);
     for (output, 0..) |*value, pixel| {
         const offset: u6 = @intCast(45 - ((pixel % 4) * 4 + pixel / 4) * 3);
@@ -63,52 +106,9 @@ fn decode(
     }
 }
 
-pub fn pack(encoding: Encoding, selectors: *const [16]u3, output: *[8]u8) void {
-    const base_bits = @as(u16, encoding.base) << 8;
-    const multiplier_bits = @as(u16, encoding.multiplier) << 4;
-    const header = base_bits | multiplier_bits | encoding.table;
-    var word = @as(u64, header) << 48;
-    for (selectors, 0..) |selector, pixel| {
-        const offset: u6 = @intCast(45 - ((pixel % 4) * 4 + pixel / 4) * 3);
-        word |= @as(u64, selector) << offset;
-    }
-    std.mem.writeInt(u64, output, word, .big);
-}
-
-// Alpha8 encoders require nonzero multipliers, including when the caller's hint contains zero.
-// OpenGL ES 3.0.6 C.1.3 distinguishes this encoder restriction from the decoder's zero rule.
-pub fn encodeAlphaHinted(samples: *const [16]u8, hint: u8, output: *[8]u8) void {
-    const minimum = std.mem.min(u8, samples);
-    const maximum = std.mem.max(u8, samples);
-    if (minimum == maximum) {
-        packAlphaConstant(minimum, output);
-        return;
-    }
-    const table: u4 = @truncate(hint);
-    const modifiers = format.scalar_modifiers[table];
-    const span: u32 = @intCast(modifiers[7] - modifiers[3]);
-    const negative: u32 = @intCast(-modifiers[3]);
-    const weighted_minimum = @as(u32, minimum) * span;
-    const offset = @as(u32, maximum - minimum) * negative;
-    const center = (weighted_minimum + offset + span / 2) / span;
-    const encoding: Encoding = .{
-        .base = @intCast(center),
-        .table = table,
-        .multiplier = @max(1, @as(u4, @truncate(hint >> 4))),
-    };
-    var values: [16]u16 = undefined;
-    for (samples, &values) |sample, *value| value.* = sample;
-    const candidate = select(encoding, &values, 8);
-    pack(candidate.encoding, &candidate.selectors, output);
-}
-
-pub fn encodeR11(samples: *const [16]u8, output: *[8]u8) void {
-    encode(samples, 11, .fast, output);
-}
-
 /// Conservative scalar admission: 256 setup units plus 128 per candidate, with at most 8/32/160
 /// candidates for fast/balanced/refined. Alpha8 and R11 share these bounds, not their palettes.
-pub fn scalarWorkUnits(effort: format.Effort) u64 {
+pub fn scalarWorkUnits(effort: etc.Effort) u64 {
     const candidates: u64 = switch (effort) {
         .fast => 8,
         .balanced => 32,
@@ -117,18 +117,19 @@ pub fn scalarWorkUnits(effort: format.Effort) u64 {
     return 256 + 128 * candidates;
 }
 
-pub fn encode(
+/// Fits an admitted alpha8 or normalized-byte R11 tile with exact integer component scores.
+pub fn fitBlock(
     samples: *const [16]u8,
     comptime bits: u4,
-    effort: format.Effort,
+    effort: etc.Effort,
     output: *[8]u8,
 ) void {
     const minimum = std.mem.min(u8, samples);
     const maximum = std.mem.max(u8, samples);
     if (minimum == maximum) {
         if (bits == 11) {
-            const entry = constant_encodings[minimum];
-            pack(entry.encoding, &@splat(entry.selector), output);
+            const entry = r11_constant_encodings[minimum];
+            entry.encoding.pack(&@splat(entry.selector), output);
         } else {
             packAlphaConstant(minimum, output);
         }
@@ -136,25 +137,26 @@ pub fn encode(
     }
     var values: [16]u16 = undefined;
     for (samples, &values) |sample, *value| {
-        value.* = if (bits == 11) normalized11(sample) else sample;
+        value.* = if (bits == 11) toUnorm11(sample) else sample;
     }
-    const low: u32 = if (bits == 11) normalized11(minimum) else minimum;
-    const high: u32 = if (bits == 11) normalized11(maximum) else maximum;
+    const low: u32 = if (bits == 11) toUnorm11(minimum) else minimum;
+    const high: u32 = if (bits == 11) toUnorm11(maximum) else maximum;
     const range = high - low;
-    var best: Candidate = .{ .error_squared = std.math.maxInt(u32) };
-    // The original four-table R11 search stays first, preserving its fast words and tie order.
+    var best: FittedBlock = .{ .error_squared = std.math.maxInt(u32) };
+    // Fast scores the first four tables in this order; wider searches include the same candidates
+    // before adding tables or neighbors. Only strict improvement replaces the complete block.
     const tables = [_]u4{ 2, 8, 11, 13, 0, 1, 3, 4, 5, 6, 7, 9, 10, 12, 14, 15 };
     const table_count: usize = if (effort == .fast) 4 else tables.len;
     var centers: [16]Encoding = undefined;
     for (tables[0..table_count]) |table| {
-        const encoding = centerEncoding(low, range, table, bits);
+        const encoding = estimateEncoding(low, range, table, bits);
         centers[table] = encoding;
-        const candidate = select(encoding, &values, bits);
+        const candidate = scoreBlock(encoding, &values, bits);
         if (candidate.error_squared < best.error_squared) best = candidate;
         if (bits == 11 and range <= 64) {
             var narrow = encoding;
             narrow.multiplier = 0;
-            const candidate_zero = select(narrow, &values, bits);
+            const candidate_zero = scoreBlock(narrow, &values, bits);
             if (candidate_zero.error_squared < best.error_squared) best = candidate_zero;
         }
     }
@@ -176,26 +178,27 @@ pub fn encode(
                         .table = table,
                         .multiplier = @intCast(multiplier),
                     };
-                    const candidate = select(adjacent, &values, bits);
+                    const candidate = scoreBlock(adjacent, &values, bits);
                     if (candidate.error_squared < best.error_squared) best = candidate;
                 }
             }
         }
     }
-    pack(best.encoding, &best.selectors, output);
+    best.encoding.pack(&best.selectors, output);
 }
 
 fn packAlphaConstant(value: u8, output: *[8]u8) void {
     // Table 13's selector 4 has modifier zero, preserving any constant with a nonzero multiplier.
-    pack(.{ .base = value, .table = 13, .multiplier = 1 }, &@splat(4), output);
+    Encoding.pack(.{ .base = value, .table = 13, .multiplier = 1 }, &@splat(4), output);
 }
 
-fn centerEncoding(low: u32, range: u32, table: u4, comptime bits: u4) Encoding {
-    const modifiers = format.scalar_modifiers[table];
+fn estimateEncoding(low: u32, range: u32, table: u4, comptime bits: u4) Encoding {
+    const modifiers = modifier_tables[table];
     const span: u32 = @intCast(modifiers[7] - modifiers[3]);
     const negative: u32 = @intCast(-modifiers[3]);
     const center = low * span + range * negative;
-    // Keep R11's established floor/nearest rules; alpha8 uses an unexpanded base and modifier.
+    // R11 floors its base estimate in eight-value steps; alpha8 rounds an unexpanded base. Both
+    // round the range-based multiplier, with R11's zero candidates scored separately.
     const scale: u32 = if (bits == 11) 8 else 1;
     const rounding: u32 = if (bits == 11) 0 else span / 2;
     return .{
@@ -205,18 +208,19 @@ fn centerEncoding(low: u32, range: u32, table: u4, comptime bits: u4) Encoding {
     };
 }
 
-fn normalized11(value: u8) u16 {
+// Round an unsigned normalized byte to its nearest eleven-bit UNORM sample.
+fn toUnorm11(value: u8) u16 {
     return @intCast((@as(u32, value) * 2047 + 127) / 255);
 }
 
-const Candidate = struct {
+const FittedBlock = struct {
     encoding: Encoding = undefined,
     selectors: [16]u3 = undefined,
     error_squared: u32,
 };
 
-fn select(encoding: Encoding, values: *const [16]u16, comptime bits: u4) Candidate {
-    const palette = format.scalarPalette(encoding, bits);
+fn scoreBlock(encoding: Encoding, values: *const [16]u16, comptime bits: u4) FittedBlock {
+    const palette = encoding.palette(bits);
     const samples: @Vector(16, i32) = @intCast(@as(@Vector(16, u16), values.*));
     var least: @Vector(16, u32) = @splat(std.math.maxInt(u32));
     var selectors: @Vector(16, u32) = @splat(0);
@@ -232,17 +236,17 @@ fn select(encoding: Encoding, values: *const [16]u16, comptime bits: u4) Candida
     return .{ .encoding = encoding, .selectors = indices, .error_squared = @reduce(.Add, least) };
 }
 
-const ConstantEncoding = struct { encoding: Encoding, selector: u3 };
+const ConstantR11Encoding = struct { encoding: Encoding, selector: u3 };
 
 // Derive exact constant mappings from EAC's zero-multiplier rule. No encoder lookup data is
 // imported. For each table/selector, the nearest legal base is sufficient; ties keep the first.
-const constant_encodings = blk: {
+const r11_constant_encodings = blk: {
     @setEvalBranchQuota(4_000_000);
-    var result: [256]ConstantEncoding = undefined;
+    var result: [256]ConstantR11Encoding = undefined;
     for (&result, 0..) |*entry, value| {
-        const target: i32 = normalized11(@intCast(value));
+        const target: i32 = toUnorm11(@intCast(value));
         var best: u32 = std.math.maxInt(u32);
-        for (format.scalar_modifiers, 0..) |modifiers, table| {
+        for (modifier_tables, 0..) |modifiers, table| {
             for (modifiers, 0..) |modifier, selector| {
                 const base = std.math.clamp(@divFloor(target - modifier, 8), 0, 255);
                 const reconstructed = std.math.clamp(base * 8 + 4 + modifier, 0, 2047);
@@ -310,42 +314,36 @@ test "EAC scalar admission preserves output and spare samples" {
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&before)[16..], bytes[16..]);
 }
 
-test "EAC constant byte mappings preserve alpha and normalized R11 at all values" {
-    for (0..256) |value| {
-        const samples: [16]u8 = @splat(@intCast(value));
-        var encoded: [8]u8 = undefined;
-        var alpha: [16]u8 = undefined;
-        var red: [16]u16 = undefined;
-        encodeAlphaHinted(&samples, 0, &encoded);
-        try decodeAlphaBlock(&encoded, &alpha);
-        try std.testing.expect(std.mem.allEqual(u8, &alpha, @intCast(value)));
-        try std.testing.expect(encoded[1] >> 4 != 0);
-        encodeR11(&samples, &encoded);
-        try decodeR11Block(&encoded, &red);
-        try std.testing.expect(std.mem.allEqual(u16, &red, normalized11(@intCast(value))));
-    }
-}
-
-test "EAC alpha repairs a zero multiplier for varying input" {
-    const samples = [_]u8{
-        0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255,
-    };
-    var encoded: [8]u8 = undefined;
-    encodeAlphaHinted(&samples, 13, &encoded);
-    try std.testing.expectEqual(1, encoded[1] >> 4);
-    var alpha: [16]u8 = undefined;
-    try decodeAlphaBlock(&encoded, &alpha);
-    try std.testing.expect(!std.mem.allEqual(u8, &alpha, alpha[0]));
-}
-
 test "EAC palette ties retain the first wire selector after clamping" {
     const half = [_]u16{ 0, 2, 4, 64, 124, 184, 244, 664 };
     const values = half ++ half;
     // Base zero, table 13 and multiplier 15 reconstruct 0/0/0/0/4/124/244/1084. Midpoints and
     // repeated entries select the first matching wire index.
-    const fitted = select(.{ .base = 0, .table = 13, .multiplier = 15 }, &values, 11);
+    const fitted = scoreBlock(.{ .base = 0, .table = 13, .multiplier = 15 }, &values, 11);
     const selectors = [_]u3{ 0, 0, 4, 4, 5, 5, 6, 6 };
     const expected = selectors ++ selectors;
     try std.testing.expectEqualSlices(u3, &expected, &fitted.selectors);
     try std.testing.expectEqual(367208, fitted.error_squared);
 }
+
+// OpenGL ES 3.0.6 appendix C, table C.10. Alpha8/R11 share these signed modifiers, while
+// Encoding.palette applies their distinct base and multiplier rules.
+// https://registry.khronos.org/OpenGL/specs/es/3.0/es_spec_3.0.pdf
+const modifier_tables = [16][8]i16{
+    .{ -3, -6, -9, -15, 2, 5, 8, 14 },
+    .{ -3, -7, -10, -13, 2, 6, 9, 12 },
+    .{ -2, -5, -8, -13, 1, 4, 7, 12 },
+    .{ -2, -4, -6, -13, 1, 3, 5, 12 },
+    .{ -3, -6, -8, -12, 2, 5, 7, 11 },
+    .{ -3, -7, -9, -11, 2, 6, 8, 10 },
+    .{ -4, -7, -8, -11, 3, 6, 7, 10 },
+    .{ -3, -5, -8, -11, 2, 4, 7, 10 },
+    .{ -2, -6, -8, -10, 1, 5, 7, 9 },
+    .{ -2, -5, -8, -10, 1, 4, 7, 9 },
+    .{ -2, -4, -8, -10, 1, 3, 7, 9 },
+    .{ -2, -5, -7, -10, 1, 4, 6, 9 },
+    .{ -3, -4, -7, -10, 2, 3, 6, 9 },
+    .{ -1, -2, -3, -10, 0, 1, 2, 9 },
+    .{ -4, -6, -8, -9, 3, 5, 7, 8 },
+    .{ -3, -5, -7, -9, 2, 4, 6, 8 },
+};
