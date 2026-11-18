@@ -447,23 +447,81 @@ test "KTX2 writes and borrows an explicitly supplied level" {
     try std.testing.expectEqual(null, descriptor_blocks.next());
     const pixels = [_]u8{ 23, 42 };
     const levels = [_]ktx2.Level{.{ .data = &pixels, .uncompressed_size = pixels.len }};
-    const texture: ktx2.EncodeTexture = .{
+    const entries = [_]ktx2.Metadata.Entry{
+        .{ .key = "a", .value = &.{ 0, 255, 0 } },
+        .{ .key = "é", .value = &.{} },
+    };
+    const texture: ktx2.TextureInput = .{
         .header = .{ .vk_format = 9, .width = 2, .height = 1 },
         .descriptor = descriptor_bytes,
         .levels = &levels,
+        .metadata = &entries,
     };
     var output: [256]u8 = @splat(0xa5);
-    const file = try ktx2.encodeInto(&texture, &output, .{});
-    const source = try ktx2.Source.open(file, .{});
-    const level = source.level(0).?;
+    const file = try texture.encodeInto(&output, .{});
+    const container = try ktx2.Container.open(file, .{});
+    try std.testing.expectEqual(file.len, try texture.encodedSize(.{}));
+    const metadata = try ktx2.Metadata.open(container.metadata.data, .{});
+    try std.testing.expectEqual(2, metadata.entry_count);
+    var iterator = metadata.iterator();
+    try std.testing.expectEqualSlices(u8, entries[0].value, iterator.next().?.value);
+    try std.testing.expectEqualStrings("é", iterator.next().?.key);
+    try std.testing.expectEqual(null, iterator.next());
+    const allocated = try texture.encode(std.testing.allocator, .{});
+    defer std.testing.allocator.free(allocated);
+    try std.testing.expectEqualSlices(u8, file, allocated);
+    const level = container.level(0).?;
     try std.testing.expectEqualSlices(u8, &pixels, level.data);
     try std.testing.expectEqual(2, level.uncompressed_size);
     try std.testing.expectEqual(@as(u8, 0xa5), output[file.len]);
-    try std.testing.expectEqual(null, source.level(1));
-    try std.testing.expectError(
-        error.DestinationTooSmall,
-        ktx2.encodeInto(&texture, output[0..1], .{}),
-    );
+    try std.testing.expectEqual(null, container.level(1));
+    try std.testing.expectError(error.DestinationTooSmall, texture.encodeInto(output[0..1], .{}));
+}
+
+test "KTX2 BasisLZ exposes encoded images and shared compressed codebooks" {
+    const samples = [_]KhronosDataFormatDescriptor.Sample{
+        .{ .bit_offset = 0, .bit_length = 64, .channel_type = 0, .lower = 0, .upper = 0xffffffff },
+    };
+    const descriptor: KhronosDataFormatDescriptor.BasicInput = .{
+        .color_model = 163,
+        .block_extent = .{ 4, 4, 1, 1 },
+        .bytes_plane = .{ 8, 0, 0, 0, 0, 0, 0, 0 },
+        .samples = &samples,
+    };
+    var descriptor_bytes: [44]u8 = undefined;
+    // One image record and three opaque one-byte compressed tables. Admission checks their framing
+    // and ranges; these deliberately minimal bytes are not a codec conformance input.
+    const global_bytes = [_]u8{
+        0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xe1, 0x51, 0x7a,
+    };
+    const levels = [_]ktx2.Level{.{ .data = &.{0x77}, .uncompressed_size = 0 }};
+    const input: ktx2.TextureInput = .{
+        .header = .{ .vk_format = 0, .width = 4, .height = 4, .supercompression = .basis_lz },
+        .descriptor = try descriptor.encodeInto(&descriptor_bytes),
+        .levels = &levels,
+        .supercompression_data = &global_bytes,
+    };
+    var output: [256]u8 = undefined;
+    const file = try input.encodeInto(&output, .{});
+    const container = try ktx2.Container.open(file, .{});
+    const basis = container.basisLz().?;
+    const copied = basis;
+    const image = copied.image(0, 0, 0, 0).?;
+    try std.testing.expectEqualSlices(u8, &.{0x77}, image.color);
+    try std.testing.expectEqual(0, image.alpha.len);
+    try std.testing.expectEqual(0, image.flags);
+    try std.testing.expectEqual(null, copied.image(1, 0, 0, 0));
+    const tables = copied.codebooks();
+    try std.testing.expectEqual(1, tables.endpoint_count);
+    try std.testing.expectEqual(1, tables.selector_count);
+    try std.testing.expectEqualSlices(u8, &.{0xe1}, tables.endpoints);
+    try std.testing.expectEqualSlices(u8, &.{0x51}, tables.selectors);
+    try std.testing.expectEqualSlices(u8, &.{0x7a}, tables.tables);
 }
 
 test "DFONT selected bytes remain resource-relative for the SFNT reader" {

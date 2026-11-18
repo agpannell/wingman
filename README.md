@@ -96,6 +96,8 @@ component blocks. Applications assemble image tiles and handle GPU upload.
 writes the texel-format descriptions used by KTX2.
 It also works independently of a container. Its `Sample`, `Block.Iterator` and `BasicInput`
 types group copied sample declarations, borrowed block traversal and basic-descriptor input.
+KTX2 groups file inspection in `Container`, supplied-level writing in `TextureInput`, and borrowed
+metadata and BasisLZ queries in `Metadata` and `BasisLz`.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
@@ -194,7 +196,10 @@ Input byte slices need no padding or extra alignment. Storage and lifetimes are 
 - Raw audio decoders write caller-provided storage. WAVE decoding offers either caller samples
   or an allocated `wav.Audio` owner independent of encoded input. Release that owner exactly once
   with the original allocator, after all sample views retire.
-- KTX2 source views borrow the complete input; allocating writes return caller-owned bytes.
+- KTX2 `Container` and derived views borrow immutable file bytes; descriptors and their block
+  iterators also borrow their encoded backing. Supplied-level and basic-descriptor writers produce
+  independent bytes in caller storage. Allocating KTX2 writes return bytes released with the same
+  allocator.
 - DFONT containers and selected font resources borrow complete immutable resource-file bytes.
   SFNT directories, collection faces and raw tables borrow complete immutable font/container bytes.
   Copied tags, checksums and flavor values are independent; no allocator or cleanup is retained.
