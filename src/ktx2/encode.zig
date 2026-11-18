@@ -6,7 +6,7 @@ const ktx2 = @import("../ktx2.zig");
 const memory = @import("../common/byte_ranges.zig");
 
 const Source = @import("container.zig").Source;
-const dfd = @import("dfd.zig");
+const KhronosDataFormatDescriptor = @import("../KhronosDataFormatDescriptor.zig");
 const fixture = @import("fixtures.zig");
 const global = @import("global_data.zig");
 const types = @import("format.zig");
@@ -82,7 +82,8 @@ fn writeValidated(image: *const EncodeTexture, result: []u8, layout: Layout) Enc
         header.levels,
         @backingInt(header.supercompression),
     };
-    for (fields, 0..) |value, index| put(u32, result, 12 + index * 4, value);
+    for (fields, 0..) |value, index|
+        put(u32, result, 12 + index * 4, value);
     const descriptor_offset = 80 + image.levels.len * 24;
     put(u32, result, 48, @intCast(descriptor_offset));
     put(u32, result, 52, @intCast(image.descriptor.len));
@@ -303,9 +304,10 @@ test "KTX2 allocating writer initializes the allocated bytes" {
 test "KTX2 writing preserves binary metadata and refuses unsorted or overlapping input" {
     const source = try Source.open(&fixture.r8_mips, .{});
     var levels = [_]types.Level{ source.level(0).?, source.level(1).? };
-    var entries = [_]types.KeyValue{ .{ .key = "a", .value = &.{
-        0, 255, 0,
-    } }, .{ .key = "é", .value = "" } };
+    var entries = [_]types.KeyValue{
+        .{ .key = "a", .value = &.{ 0, 255, 0 } },
+        .{ .key = "é", .value = "" },
+    };
     const image: EncodeTexture = .{
         .header = source.header,
         .descriptor = source.descriptor.data,
@@ -363,7 +365,8 @@ test "KTX2 BasisLZ validates codebooks, paired slices and animation references b
     var shared: [63]u8 = @splat(0);
     put(u16, &shared, 0, 1);
     put(u16, &shared, 2, 1);
-    for ([_]usize{ 4, 8, 12 }) |field| put(u32, &shared, field, 1);
+    for ([_]usize{ 4, 8, 12 }) |field|
+        put(u32, &shared, field, 1);
     put(u32, &shared, 28, 1);
     put(u32, &shared, 32, 1);
     put(u32, &shared, 36, 1);
@@ -452,7 +455,8 @@ test "KTX2 BasisLZ volume directory follows the shrinking depth of each mip" {
     var shared: [83]u8 = @splat(0);
     put(u16, &shared, 0, 1);
     put(u16, &shared, 2, 1);
-    for ([_]usize{ 4, 8, 12 }) |field| put(u32, &shared, field, 1);
+    for ([_]usize{ 4, 8, 12 }) |field|
+        put(u32, &shared, field, 1);
     for (0..3) |index| {
         put(u32, &shared, 24 + index * 20, if (index == 1) 1 else 0);
         put(u32, &shared, 28 + index * 20, 1);
@@ -524,7 +528,7 @@ test "KTX2 global directory counts reject overflow before walking image records"
 }
 
 fn globalTestDescriptor(storage: []u8, model: u8, alpha: bool) ![]const u8 {
-    const samples = [_]dfd.Sample{
+    const samples = [_]KhronosDataFormatDescriptor.Sample{
         .{ .bit_offset = 0, .bit_length = 64, .channel_type = 0, .lower = 0, .upper = 0xffffffff },
         .{
             .bit_offset = 64,
@@ -538,9 +542,12 @@ fn globalTestDescriptor(storage: []u8, model: u8, alpha: bool) ![]const u8 {
     planes[0] = 8;
     if (alpha) planes[1] = 8;
     const count: usize = if (alpha) 2 else 1;
-    const descriptor: dfd.BasicDescriptor = .{ .color_model = model, .block_extent = .{
-        4, 4, 1, 1,
-    }, .bytes_plane = planes, .samples = samples[0..count] };
+    const descriptor: KhronosDataFormatDescriptor.BasicInput = .{
+        .color_model = model,
+        .block_extent = .{ 4, 4, 1, 1 },
+        .bytes_plane = planes,
+        .samples = samples[0..count],
+    };
     return try descriptor.encodeInto(storage);
 }
 
@@ -554,7 +561,7 @@ fn preflight(image: *const EncodeTexture, options: types.Options) EncodeError!La
     if (image.descriptor.len > limits.maximum_descriptor_bytes) return error.LimitExceeded;
     if (image.metadata.len > limits.maximum_metadata_entries) return error.LimitExceeded;
     if (image.global_data.len > limits.maximum_encoded_bytes) return error.LimitExceeded;
-    const descriptor = try dfd.DataFormatDescriptor.open(image.descriptor);
+    const descriptor = try validate.openDescriptor(image.descriptor);
     try validate.header(image.header, descriptor, options);
     const needs_global = image.header.supercompression == .basis_lz;
     if (needs_global != (image.global_data.len != 0)) return error.InvalidKtx2;
@@ -821,18 +828,21 @@ test "KTX2 serialized output survives retirement of every input record and paylo
 }
 
 test "KTX2 RGB byte alignment uses lcm rather than a power-of-two rounding mask" {
-    const samples = [_]ktx2.Sample{
+    const samples = [_]KhronosDataFormatDescriptor.Sample{
         .{ .bit_offset = 0, .bit_length = 8, .channel_type = 0, .lower = 0, .upper = 255 },
         .{ .bit_offset = 8, .bit_length = 8, .channel_type = 1, .lower = 0, .upper = 255 },
         .{ .bit_offset = 16, .bit_length = 8, .channel_type = 2, .lower = 0, .upper = 255 },
     };
-    const descriptor: ktx2.BasicDescriptor = .{ .color_model = 1, .bytes_plane = .{
-        3, 0, 0, 0, 0, 0, 0, 0,
-    }, .samples = &samples };
+    const descriptor: KhronosDataFormatDescriptor.BasicInput = .{
+        .color_model = 1,
+        .bytes_plane = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+        .samples = &samples,
+    };
     var descriptor_bytes: [76]u8 = undefined;
-    const levels = [_]ktx2.Level{ .{ .data = &.{
-        1, 2, 3, 4, 5, 6, 7, 8, 9,
-    }, .uncompressed_size = 9 }, .{ .data = &.{ 10, 11, 12 }, .uncompressed_size = 3 } };
+    const levels = [_]ktx2.Level{
+        .{ .data = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }, .uncompressed_size = 9 },
+        .{ .data = &.{ 10, 11, 12 }, .uncompressed_size = 3 },
+    };
     const texture: ktx2.EncodeTexture = .{
         .header = .{ .vk_format = 23, .width = 3, .levels = 2 },
         .descriptor = try descriptor.encodeInto(&descriptor_bytes),

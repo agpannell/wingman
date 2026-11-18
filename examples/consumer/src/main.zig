@@ -1,32 +1,34 @@
 //! Complete public API calls from outside the library's test composition.
 const std = @import("std");
-const adler32 = @import("wingman").adler32;
-const Crc32IsoHdlc = @import("wingman").crc.Crc32IsoHdlc;
-const crc = @import("wingman").crc;
-const Xxh32 = @import("wingman").xxhash.Xxh32;
-const Xxh64 = @import("wingman").xxhash.Xxh64;
-const xxhash = @import("wingman").xxhash;
-const blake3 = @import("wingman").blake3;
-const lz4 = @import("wingman").lz4;
-const deflate = @import("wingman").deflate;
-const zlib = @import("wingman").zlib;
-const gzip = @import("wingman").gzip;
-const riff = @import("wingman").riff;
-const wav = @import("wingman").wav;
-const lpcm = @import("wingman").lpcm;
-const g711 = @import("wingman").g711;
-const adpcm = @import("wingman").adpcm;
-const png = @import("wingman").png;
-const exif = @import("wingman").exif;
-const icc = @import("wingman").icc;
-const ktx2 = @import("wingman").ktx2;
-const etc = @import("wingman").etc;
-const dfont = @import("wingman").dfont;
-const sfnt = @import("wingman").sfnt;
-const bvh = @import("wingman").bvh;
-const acclaim = @import("wingman").acclaim;
-const RigidTransform = @import("wingman").RigidTransform;
-const ImageRegion = @import("wingman").ImageRegion;
+const wingman = @import("wingman");
+const adler32 = wingman.adler32;
+const Crc32IsoHdlc = wingman.crc.Crc32IsoHdlc;
+const crc = wingman.crc;
+const Xxh32 = wingman.xxhash.Xxh32;
+const Xxh64 = wingman.xxhash.Xxh64;
+const xxhash = wingman.xxhash;
+const blake3 = wingman.blake3;
+const lz4 = wingman.lz4;
+const deflate = wingman.deflate;
+const zlib = wingman.zlib;
+const gzip = wingman.gzip;
+const riff = wingman.riff;
+const wav = wingman.wav;
+const lpcm = wingman.lpcm;
+const g711 = wingman.g711;
+const adpcm = wingman.adpcm;
+const png = wingman.png;
+const exif = wingman.exif;
+const icc = wingman.icc;
+const ktx2 = wingman.ktx2;
+const KhronosDataFormatDescriptor = wingman.KhronosDataFormatDescriptor;
+const etc = wingman.etc;
+const dfont = wingman.dfont;
+const sfnt = wingman.sfnt;
+const bvh = wingman.bvh;
+const acclaim = wingman.acclaim;
+const RigidTransform = wingman.RigidTransform;
+const ImageRegion = wingman.ImageRegion;
 
 test "PNG package decodes independently framed pixels and writes a PNG" {
     // Python zlib 1.3.2 compressed these RGBA8 rows; chunk lengths and CRCs were framed separately.
@@ -428,16 +430,21 @@ test "ETC and EAC blocks preserve constants and report refused work" {
 }
 
 test "KTX2 writes and borrows an explicitly supplied level" {
-    const samples = [_]ktx2.Sample{
+    const samples = [_]KhronosDataFormatDescriptor.Sample{
         .{ .bit_offset = 0, .bit_length = 8, .channel_type = 0, .lower = 0, .upper = 255 },
     };
-    const descriptor = ktx2.BasicDescriptor{
+    const descriptor = KhronosDataFormatDescriptor.BasicInput{
         .color_model = 1,
         .bytes_plane = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
         .samples = &samples,
     };
     var descriptor_storage: [44]u8 = undefined;
     const descriptor_bytes = try descriptor.encodeInto(&descriptor_storage);
+    const parsed_descriptor = try KhronosDataFormatDescriptor.open(descriptor_bytes);
+    try std.testing.expectEqual(8, parsed_descriptor.sample(0).?.bit_length);
+    var descriptor_blocks = parsed_descriptor.blocks();
+    try std.testing.expectEqual(0, descriptor_blocks.next().?.vendor_id);
+    try std.testing.expectEqual(null, descriptor_blocks.next());
     const pixels = [_]u8{ 23, 42 };
     const levels = [_]ktx2.Level{.{ .data = &pixels, .uncompressed_size = pixels.len }};
     const texture: ktx2.EncodeTexture = .{

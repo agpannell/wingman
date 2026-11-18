@@ -24,8 +24,9 @@
 //! SFNT table directories and TTC/OTC collection members. Table payloads remain opaque, with
 //! explicit checksums; glyph interpretation, shaping and rendering stay with callers.
 //!
-//! ktx2 inspects and writes texture containers with caller-supplied encoded mip levels. etc encodes
-//! and decodes ETC1 color and unsigned EAC component blocks.
+//! KhronosDataFormatDescriptor inspects and writes independent texel-format descriptors. ktx2
+//! inspects and writes texture containers with caller-supplied encoded mip levels. etc encodes and
+//! decodes ETC1 color and unsigned EAC component blocks.
 //!
 //! bvh owns a skeleton and its recorded frames; acclaim shares a reusable ASF skeleton among AMC
 //! clips and prepared pose evaluators. A skeleton supplies geometry/channel meanings, a frame holds
@@ -61,6 +62,7 @@ pub const ImageRegion = @import("common/ImageRegion.zig");
 pub const exif = @import("exif.zig");
 pub const icc = @import("icc.zig");
 
+pub const KhronosDataFormatDescriptor = @import("KhronosDataFormatDescriptor.zig");
 pub const ktx2 = @import("ktx2.zig");
 pub const etc = @import("etc.zig");
 
@@ -94,6 +96,7 @@ test {
     _ = exif;
     _ = icc;
 
+    _ = KhronosDataFormatDescriptor;
     _ = ktx2;
     _ = etc;
 

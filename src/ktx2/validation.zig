@@ -2,16 +2,42 @@
 
 const std = @import("std");
 const types = @import("format.zig");
-const dfd = @import("dfd.zig");
+const fixture = @import("fixtures.zig");
+const KhronosDataFormatDescriptor = @import("../KhronosDataFormatDescriptor.zig");
 
 pub const identifier = [_]u8{
     0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb,
     0x0d, 0x0a, 0x1a, 0x0a,
 };
 
+/// Opens the independent descriptor profile using the enclosing container's error vocabulary.
+/// Descriptor byte limits are checked by the reader/writer before calling this adapter.
+pub fn openDescriptor(data: []const u8) types.Error!KhronosDataFormatDescriptor {
+    return KhronosDataFormatDescriptor.open(data) catch |err| switch (err) {
+        error.InvalidDescriptor => error.InvalidKtx2,
+        error.UnsupportedDescriptor => error.UnsupportedFormat,
+    };
+}
+
+test openDescriptor {
+    var data = fixture.r8_mips[128..172].*;
+    const descriptor = try openDescriptor(&data);
+    try std.testing.expectEqual(8, descriptor.sample(0).?.bit_length);
+    data[0] = 43;
+    try std.testing.expectError(error.InvalidKtx2, openDescriptor(&data));
+    data[0] = 44;
+    data[4] = 1;
+    try std.testing.expectError(error.UnsupportedFormat, openDescriptor(&data));
+    data[4] = 0;
+    data[8] = 3;
+    try std.testing.expectError(error.UnsupportedFormat, openDescriptor(&data));
+    data[0] = 43;
+    try std.testing.expectError(error.InvalidKtx2, openDescriptor(&data));
+}
+
 pub fn header(
     value: types.Header,
-    descriptor: dfd.DataFormatDescriptor,
+    descriptor: KhronosDataFormatDescriptor,
     options: types.Options,
 ) types.Error!void {
     const limits = options.limits;
@@ -51,7 +77,7 @@ pub fn header(
 
 pub fn level(
     value: types.Header,
-    descriptor: dfd.DataFormatDescriptor,
+    descriptor: KhronosDataFormatDescriptor,
     index: u32,
     encoded: usize,
     expanded: u64,
@@ -86,7 +112,7 @@ pub fn level(
     if (expanded != expected) return error.InvalidKtx2;
 }
 
-pub fn levelAlignment(value: types.Header, descriptor: dfd.DataFormatDescriptor) usize {
+pub fn levelAlignment(value: types.Header, descriptor: KhronosDataFormatDescriptor) usize {
     if (value.supercompression != .none) return 1;
     const bytes: usize = descriptor.bytes_plane[0];
     // lcm(bytes, 4), including non-power-of-two RGB block sizes such as three bytes.
@@ -118,7 +144,7 @@ pub fn key(entry: types.KeyValue, previous: ?[]const u8) types.Error!void {
 
 // PVRTC1 requires at least two blocks along each image axis, unlike PVRTC2.
 test "PVRTC1 minimum block grid and PVRTC2 ordinary grid" {
-    var descriptor: dfd.DataFormatDescriptor = .{
+    var descriptor: KhronosDataFormatDescriptor = .{
         .data = &.{},
         .color_model = 164,
         .color_primaries = 0,

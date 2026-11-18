@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const types = @import("format.zig");
-const dfd = @import("dfd.zig");
+const KhronosDataFormatDescriptor = @import("../KhronosDataFormatDescriptor.zig");
 
 /// One image's borrowed encoded slices. The container checks their ranges, not their contents. Keep
 /// the original file alive and unchanged through their final use.
@@ -44,7 +44,7 @@ pub const Directory = struct {
 
     pub fn open(
         header: types.Header,
-        descriptor: dfd.DataFormatDescriptor,
+        descriptor: KhronosDataFormatDescriptor,
         data: []const u8,
         has_animation: bool,
         maximum_images: u64,
@@ -133,7 +133,7 @@ pub const Directory = struct {
 /// Reads an already admitted directory; coordinates have been range checked by the caller.
 pub fn imageSlice(
     header: types.Header,
-    descriptor: dfd.DataFormatDescriptor,
+    descriptor: KhronosDataFormatDescriptor,
     data: []const u8,
     level: []const u8,
     mip: u32,

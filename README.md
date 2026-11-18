@@ -92,6 +92,11 @@ Use `ktx2` to inspect or write texture containers carrying supplied mip levels, 
 format descriptors. Use `etc` to encode or decode individual ETC1 color and unsigned EAC
 component blocks. Applications assemble image tiles and handle GPU upload.
 
+[`KhronosDataFormatDescriptor`](docs/ktx2.md#inspect-or-construct-a-format-descriptor) inspects and
+writes the texel-format descriptions used by KTX2.
+It also works independently of a container. Its `Sample`, `Block.Iterator` and `BasicInput`
+types group copied sample declarations, borrowed block traversal and basic-descriptor input.
+
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |
 | [`ktx2`](docs/ktx2.md) | Borrowed texture levels, metadata, descriptors and supplied-level writing | `ktx2-example` |

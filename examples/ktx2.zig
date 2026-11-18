@@ -1,14 +1,18 @@
 //! Write and inspect a small texture container with one supplied R8 level.
 const std = @import("std");
-const ktx2 = @import("wingman").ktx2;
+const wingman = @import("wingman");
+const ktx2 = wingman.ktx2;
+const KhronosDataFormatDescriptor = wingman.KhronosDataFormatDescriptor;
 
 pub fn main(init: std.process.Init) !void {
-    const samples = [_]ktx2.Sample{
+    const samples = [_]KhronosDataFormatDescriptor.Sample{
         .{ .bit_offset = 0, .bit_length = 8, .channel_type = 0, .lower = 0, .upper = 255 },
     };
-    const descriptor = ktx2.BasicDescriptor{ .color_model = 1, .bytes_plane = .{
-        1, 0, 0, 0, 0, 0, 0, 0,
-    }, .samples = &samples };
+    const descriptor = KhronosDataFormatDescriptor.BasicInput{
+        .color_model = 1,
+        .bytes_plane = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .samples = &samples,
+    };
     var descriptor_storage: [44]u8 = undefined;
     const descriptor_bytes = try descriptor.encodeInto(&descriptor_storage);
     const pixels = [_]u8{ 23, 42 };

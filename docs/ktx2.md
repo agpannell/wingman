@@ -43,9 +43,9 @@ BasisLZ's paired ETC1S color/alpha slices are supported.
 
 Construct `EncodeTexture` with a header, complete data format descriptor, encoded levels and optional
 sorted `KeyValue` entries or BasisLZ global data. Supply levels largest first; the writer stores
-smaller levels first. `BasicDescriptor` can encode one basic descriptor, while raw descriptor bytes
-can retain additional vendor records. Caller-provided level bytes must already match their declared
-encoding: writing does not compress or convert them.
+smaller levels first. `wingman.KhronosDataFormatDescriptor.BasicInput` can encode one basic descriptor,
+while raw descriptor bytes can retain additional vendor records. Caller-provided level bytes must
+already match their declared encoding: writing does not compress or convert them.
 
 `encodedSize` validates input and returns the exact output size. `encodeInto` validates, checks
 capacity and rejects overlaps between the used output prefix and every admitted input span before
@@ -65,6 +65,45 @@ required wire padding to zero, and inputs remain immutable through either call.
 
 Allocating writes can also report allocator exhaustion. Failures publish no partial container view.
 
+## Inspect or construct a format descriptor
+
+`wingman.KhronosDataFormatDescriptor` describes texel blocks independently of their container. A
+texel is one texture pixel; a texel block is a repeating region encoded together, such as one
+uncompressed texel or a 4×4 compressed tile. Its sample declarations identify channel bit ranges,
+positions and numeric endpoints, rather than storing the image's actual component values.
+`open(bytes)` borrows complete immutable descriptor bytes; `sample(index)` returns a copied
+`Sample`, while `blocks()` returns a `Block.Iterator` whose records borrow those bytes. The profile
+starts with a Khronos basic-format version 2 block and preserves following opaque blocks.
+
+Use `BasicInput` to write a complete descriptor containing one basic block:
+
+```zig
+const Descriptor = @import("wingman").KhronosDataFormatDescriptor;
+
+pub fn describeR8(output: []u8) Descriptor.BasicInput.EncodeError![]u8 {
+    const samples = [_]Descriptor.Sample{
+        .{ .bit_offset = 0, .bit_length = 8, .channel_type = 0, .lower = 0, .upper = 255 },
+    };
+    const input: Descriptor.BasicInput = .{
+        .color_model = 1,
+        .bytes_plane = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .samples = &samples,
+    };
+    return input.encodeInto(output);
+}
+```
+
+Sizing validates representable sample counts, bit lengths and block extents. Writing also checks
+capacity and overlap with the actual input record and sample array before changing output; spare
+capacity stays untouched. The result is independent of those inputs and borrows the output buffer.
+Color-model interpretation and agreement with a Vulkan format remain separate checks.
+
+Direct descriptor opening reports `InvalidDescriptor` or `UnsupportedDescriptor`. Basic writing can
+report `InvalidDescriptor`, `DestinationTooSmall` or `OverlappingStorage`. KTX2 admission maps the
+descriptor failures to `InvalidKtx2` and `UnsupportedFormat`, respectively. The descriptor's public
+error types live with the operations: `OpenError`, `BasicInput.SizeError` and
+`BasicInput.EncodeError`.
+
 ## Interpretation and limits
 
 The descriptor exposes its basic block, samples and additional opaque vendor records. Admission
@@ -74,8 +113,10 @@ swizzles, sampling and GPU policy. For PVRTC1, level-size validation accounts fo
 stored block grid even for tiny mips; PVRTC2 uses its ordinary block grid. This does not decode either
 format or validate all format-specific restrictions.
 
-The [library entry](../src/ktx2.zig) and its shallow owners keep container framing, descriptor,
-global-data and writing contracts separate. The [shared byte-range overlap check](../src/common/byte_ranges.zig)
+The [library entry](../src/ktx2.zig), independent
+[Khronos descriptor](../src/KhronosDataFormatDescriptor.zig) and shallow container owners keep
+framing, format description, global-data and writing contracts separate.
+The [shared byte-range overlap check](../src/common/byte_ranges.zig)
 is also used by other libraries; each operation selects its own checked spans and error policy.
 The format is specified by the
 [KTX 2 specification](https://github.khronos.org/KTX-Specification/ktxspec.v2.html) and the

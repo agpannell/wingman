@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const types = @import("format.zig");
-const dfd = @import("dfd.zig");
+const KhronosDataFormatDescriptor = @import("../KhronosDataFormatDescriptor.zig");
 const validate = @import("validation.zig");
 const global = @import("global_data.zig");
 const fixture = @import("fixtures.zig");
@@ -30,7 +30,7 @@ pub const KeyValueIterator = struct {
 pub const Source = struct {
     data: []const u8,
     header: types.Header,
-    descriptor: dfd.DataFormatDescriptor,
+    descriptor: KhronosDataFormatDescriptor,
     metadata: []const u8,
     global_data: []const u8,
     metadata_count: usize,
@@ -68,7 +68,7 @@ pub const Source = struct {
         const descriptor_size = read(u32, data, 52);
         if (descriptor_size > options.limits.maximum_descriptor_bytes) return error.LimitExceeded;
         const descriptor_data = try span(data, index_end, descriptor_size);
-        const descriptor = try dfd.DataFormatDescriptor.open(descriptor_data);
+        const descriptor = try validate.openDescriptor(descriptor_data);
         try validate.header(header, descriptor, options);
         var position = index_end + descriptor_data.len;
 
@@ -296,14 +296,30 @@ fn read(comptime T: type, data: []const u8, offset: usize) T {
 }
 
 test "KTX2 complete framing rejects truncation, trailing bytes and displaced records" {
-    for (0..fixture.r8_mips.len) |size| {
+    for (0..fixture.r8_mips.len) |size|
         try testing.expectError(error.InvalidKtx2, Source.open(fixture.r8_mips[0..size], .{}));
-    }
     const trailing = fixture.r8_mips ++ [_]u8{0};
     try testing.expectError(error.InvalidKtx2, Source.open(&trailing, .{}));
-    for (
-        [_]usize{ 0, 20, 36, 40, 48, 52, 56, 60, 64, 72, 80, 88, 96, 104, 112, 120, 128, 172 + 1 },
-    ) |offset| {
+    for ([_]usize{
+        0,
+        20,
+        36,
+        40,
+        48,
+        52,
+        56,
+        60,
+        64,
+        72,
+        80,
+        88,
+        96,
+        104,
+        112,
+        120,
+        128,
+        172 + 1,
+    }) |offset| {
         var changed = fixture.r8_mips;
         changed[offset] ^= 1;
         try testing.expectError(error.InvalidKtx2, Source.open(&changed, .{}));
@@ -323,7 +339,6 @@ test "KTX2 malformed field mutations are bounded, including oversized level offs
         .{ .limits = .{ .maximum_descriptor_bytes = 43 } },
         .{ .limits = .{ .maximum_uncompressed_bytes = 2 } },
     };
-    for (
-        options,
-    ) |option| try testing.expectError(error.LimitExceeded, Source.open(&fixture.r8_mips, option));
+    for (options) |option|
+        try testing.expectError(error.LimitExceeded, Source.open(&fixture.r8_mips, option));
 }
