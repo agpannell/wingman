@@ -8,7 +8,8 @@ const Crc32Iscsi = @This();
 const Core = @import("portable.zig").Algorithm(u32, 0x1edc6f41, true);
 const std = @import("std");
 
-/// Unfinalized remainder. Initialize through `init` or copy a valid state.
+/// Reflected running remainder before the final XOR. Initialize through `init` or copy a valid
+/// state.
 remainder: u32,
 
 /// Starts an empty stream with numeric checksum zero.
@@ -53,10 +54,12 @@ test hash {
 
 /// Immutable word-sized polynomial advance factor. Copies may be shared concurrently.
 pub const CombineOperator = struct {
-    /// Construct using `forLength`; the value represents one exact second byte length.
+    /// Advance factor for a second sequence of `n` bytes: `x^(8*n)` modulo this CRC's generator.
+    /// Bit `i` represents `x^i` even though the checksum is reflected. Construct with
+    /// `forLength(n)`; for zero bytes the factor is one.
     factor: u32,
 
-    /// Precomputes a reusable operator for any u64 second byte length without reading input.
+    /// Precomputes an operator for a second sequence of any u64 byte length without reading input.
     pub fn forLength(second_length: u64) CombineOperator {
         return .{ .factor = Core.CombineOperator.forLength(second_length).factor };
     }

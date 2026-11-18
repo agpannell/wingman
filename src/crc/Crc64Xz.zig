@@ -8,7 +8,8 @@ const Crc64Xz = @This();
 const Core = @import("portable.zig").Algorithm(u64, 0x42f0e1eba9ea3693, true);
 const std = @import("std");
 
-/// Unfinalized remainder. Initialize through `init` or copy a valid state.
+/// Reflected running remainder before the final XOR. Initialize through `init` or copy a valid
+/// state.
 remainder: u64,
 
 /// Starts an empty stream with numeric checksum zero.
@@ -20,10 +21,11 @@ pub fn init() Crc64Xz {
 pub fn update(self: *Crc64Xz, bytes: []const u8) void {
     if (@inComptime()) {
         var comptime_state: Core = .{ .remainder = self.remainder };
-        comptime_state.updatePortableShort(bytes);
+        comptime_state.updatePortable(bytes);
         self.remainder = comptime_state.remainder;
         return;
     }
+    // Separate runtime helpers keep the folding kernel out of short calls.
     if (bytes.len < 16) {
         self.remainder = @call(.never_inline, updateShort, .{ self.remainder, bytes });
         return;
@@ -33,7 +35,7 @@ pub fn update(self: *Crc64Xz, bytes: []const u8) void {
 
 fn updateShort(initial: u64, bytes: []const u8) u64 {
     var state: Core = .{ .remainder = initial };
-    @call(.always_inline, Core.updatePortableShort, .{ &state, bytes });
+    @call(.always_inline, Core.updatePortable, .{ &state, bytes });
     return state.remainder;
 }
 
@@ -89,10 +91,12 @@ test "compile-time CRC64/XZ crosses the folding threshold" {
 
 /// Immutable word-sized polynomial advance factor. Copies may be shared concurrently.
 pub const CombineOperator = struct {
-    /// Construct using `forLength`; the value represents one exact second byte length.
+    /// Advance factor for a second sequence of `n` bytes: `x^(8*n)` modulo this CRC's generator.
+    /// Bit `i` represents `x^i` even though the checksum is reflected. Construct with
+    /// `forLength(n)`; for zero bytes the factor is one.
     factor: u64,
 
-    /// Precomputes a reusable operator for any u64 second byte length without reading input.
+    /// Precomputes an operator for a second sequence of any u64 byte length without reading input.
     pub fn forLength(second_length: u64) CombineOperator {
         return .{ .factor = Core.CombineOperator.forLength(second_length).factor };
     }

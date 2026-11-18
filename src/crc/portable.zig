@@ -66,32 +66,17 @@ pub fn Algorithm(comptime Word: type, comptime polynomial: Word, comptime reflec
                 self.remainder = folded64.update(self.remainder, bytes);
                 return;
             }
+            @call(.always_inline, updatePortable, .{ self, bytes });
+        }
+
+        /// Appends with the table recurrence only, including during compile-time evaluation.
+        pub fn updatePortable(self: *Self, bytes: []const u8) void {
             var remainder = self.remainder;
             var offset: usize = 0;
             while (bytes.len - offset >= 8) : (offset += 8) {
                 var combined: Word = 0;
                 // Each byte's table advances its contribution past the following bytes. The
                 // incoming remainder affects only the first word-width bytes of this block.
-                inline for (0..8) |position| {
-                    var index = bytes[offset + position];
-                    if (position < bits / 8) {
-                        const shift = if (reflected) position * 8 else bits - 8 - position * 8;
-                        index ^= @truncate(remainder >> shift);
-                    }
-                    combined ^= tables[7 - position][index];
-                }
-                remainder = combined;
-            }
-            for (bytes[offset..]) |byte| remainder = byteStep(remainder, byte);
-            self.remainder = remainder;
-        }
-
-        // Internal short path for the CRC-64/XZ wrapper. Keep the ordinary update path unchanged.
-        pub fn updatePortableShort(self: *Self, bytes: []const u8) void {
-            var remainder = self.remainder;
-            var offset: usize = 0;
-            while (bytes.len - offset >= 8) : (offset += 8) {
-                var combined: Word = 0;
                 inline for (0..8) |position| {
                     var index = bytes[offset + position];
                     if (position < bits / 8) {
@@ -148,6 +133,9 @@ pub fn Algorithm(comptime Word: type, comptime polynomial: Word, comptime reflec
 
         /// Immutable word-sized advance operator for a fixed second sequence length.
         pub const CombineOperator = struct {
+            /// Advance factor for a second sequence of `n` bytes: `x^(8*n)` modulo the normal
+            /// generator. Bit `i` represents `x^i` regardless of checksum reflection. Construct
+            /// with `forLength(n)`; for zero bytes the factor is one.
             factor: Word,
 
             /// Precomputes advancement for the full u64 byte-length range.
@@ -183,13 +171,11 @@ pub fn Algorithm(comptime Word: type, comptime polynomial: Word, comptime reflec
 }
 
 test "named portable CRCs agree with independent standard implementations and splits" {
-    inline for (.{ .{
-        u16, 0x1021, false, std.hash.crc.@"CRC-16/GENIBUS",
-    }, .{
-        u32, 0x1edc6f41, true, std.hash.crc.@"CRC-32/ISCSI",
-    }, .{
-        u64, 0x42f0e1eba9ea3693, true, std.hash.crc.@"CRC-64/XZ",
-    } }) |definition| {
+    inline for (.{
+        .{ u16, 0x1021, false, std.hash.crc.@"CRC-16/GENIBUS" },
+        .{ u32, 0x1edc6f41, true, std.hash.crc.@"CRC-32/ISCSI" },
+        .{ u64, 0x42f0e1eba9ea3693, true, std.hash.crc.@"CRC-64/XZ" },
+    }) |definition| {
         const Crc = Algorithm(definition[0], definition[1], definition[2]);
         const Reference = definition[3];
         var data: [1024]u8 = undefined;
@@ -247,13 +233,11 @@ fn matrixApply(comptime Word: type, columns: [@bitSizeOf(Word)]Word, input: Word
 }
 
 test "portable CRC raw remainders alignments snapshots and full length combination" {
-    inline for (.{ .{
-        u16, 0x1021, false,
-    }, .{
-        u32, 0x1edc6f41, true,
-    }, .{
-        u64, 0x42f0e1eba9ea3693, true,
-    } }) |definition| {
+    inline for (.{
+        .{ u16, 0x1021, false },
+        .{ u32, 0x1edc6f41, true },
+        .{ u64, 0x42f0e1eba9ea3693, true },
+    }) |definition| {
         const Word = definition[0];
         const polynomial = definition[1];
         const reflected = definition[2];
@@ -368,13 +352,11 @@ test "named CRC reads stay inside both protected input boundaries" {
     }
     const backing = mapping[page..][0 .. 2 * page];
     for (backing, 0..) |*value, index| value.* = @truncate(index *% 179 +% (index >> 3));
-    inline for (.{ .{
-        u16, 0x1021, false,
-    }, .{
-        u32, 0x1edc6f41, true,
-    }, .{
-        u64, 0x42f0e1eba9ea3693, true,
-    } }) |definition| {
+    inline for (.{
+        .{ u16, 0x1021, false },
+        .{ u32, 0x1edc6f41, true },
+        .{ u64, 0x42f0e1eba9ea3693, true },
+    }) |definition| {
         const Word = definition[0];
         const Crc = Algorithm(Word, definition[1], definition[2]);
         for (0..2049) |length| {

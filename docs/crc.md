@@ -11,6 +11,9 @@ not authenticate data. Wingman provides the following named algorithms under `wi
 | `Crc16Genibus` | `0x1021` | `0xffff` | Neither | `d64e` |
 | `Crc64Xz` | `0x42f0e1eba9ea3693` | `0xffffffffffffffff` | Both | `995dc9bbdf1939fa` |
 
+Reflected variants consume each input byte least-significant bit first and return a checksum in
+that reflected bit orientation. This is separate from the byte order of a serialized checksum.
+
 Polynomials omit the implicit leading term. Each type provides `init()`, `update`, snapshot `final`,
 `hash`, `combine` and `CombineOperator`. Copies continue independently; reassign `Type.init()` to
 reset. No operation allocates or retains input. All reads remain within the exact supplied slice.
@@ -118,6 +121,14 @@ The operator occupies one checksum word: two, four or eight bytes for its varian
 immutable, retains no input and can be copied or shared across threads.
 Each application requires a second sequence of exactly the length chosen by `forLength`. An empty
 second sequence uses length zero and checksum zero. No allocation or cleanup is required.
+
+The `factor` field stores a polynomial advance, `x^(8*n)` modulo the algorithm's generator for
+a second sequence of `n` bytes. Construct it with `forLength`; it is neither the original byte
+count nor a checksum. IEEE stores reflected coefficients: bit `31-i` represents the coefficient
+of `x^i`.
+The other variants use normal coefficients, with bit `i` representing `x^i`, even when their
+checksums are reflected. The zero-byte factor is therefore `0x80000000` for IEEE and one for the
+other variants. These coefficient conventions are unrelated to serialized byte order.
 
 ## How polynomial folding works
 

@@ -7,6 +7,10 @@ update as data arrives, without keeping those earlier bytes.
 Use it for zlib-compatible checksums and accidental corruption detection. It is a noncryptographic
 checksum with a small output; matching values do not establish that two inputs are identical.
 
+Use [the package setup](../README.md#use-it-in-a-project) with Zig 0.17.0. From the checkout,
+run `zig build example` or `zig build example -- "your text"` to try the runnable
+[example](../examples/adler32.zig).
+
 ## Complete and incremental input
 
 ```zig
@@ -77,6 +81,10 @@ Lengths use the full `u64` range, independently of the host's address width. The
 valid finalized checksums and the matching second length. For many equally sized second chunks,
 `CombineOperator.forLength(length)` reduces that length once; `apply(first, second)` reuses it.
 Copies of the operator are immutable and can be shared. No allocation or cleanup is required.
+
+The four-byte operator stores only the second length modulo 65521, in `length_mod`. Construct it
+with `forLength`; the field is a reduced byte count in 0...65520, rather than the full length.
+An empty second sequence uses length zero and checksum one.
 
 ## How the vector calculation works
 

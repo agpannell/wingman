@@ -34,9 +34,10 @@ const avx2 = blk: {
     if (!sse2 or builtin.zig_backend != .stage2_llvm) break :blk false;
     break :blk std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
 };
-const evex_vnni = avx2 and std.Target.x86.featureSetHasAll(builtin.cpu.features, &.{
-    .avx512vnni, .avx512vl,
-});
+const evex_vnni = avx2 and std.Target.x86.featureSetHasAll(
+    builtin.cpu.features,
+    &.{ .avx512vnni, .avx512vl },
+);
 const vnni = blk: {
     if (!avx2) break :blk false;
     if (std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni)) break :blk true;
@@ -62,9 +63,9 @@ const masked_tail = blk: {
 /// stream. Retains no input or allocator and needs no cleanup. Serialize mutation of a shared
 /// state.
 pub const Hasher = struct {
-    /// Byte sum plus one, reduced modulo 65521.
+    /// Byte sum plus the initial one, reduced modulo 65521 to 0...65520.
     first: u32 = 1,
-    /// Sum of successive `first` values, reduced modulo 65521.
+    /// Sum of successive `first` values, reduced modulo 65521 to 0...65520.
     second: u32 = 0,
 
     /// Starts an empty stream with checksum one.
@@ -133,10 +134,10 @@ test hash {
 /// Immutable reduced length for combining repeated second-chunk sizes. Copies can be shared across
 /// threads; construction and use allocate nothing.
 pub const CombineOperator = struct {
-    /// Initialize with `forLength` to store the second sequence's byte length modulo 65521.
+    /// Second sequence's byte length modulo 65521, in 0...65520. Construct with `forLength`.
     length_mod: u32,
 
-    /// Reduces the second sequence's byte length modulo the Adler prime.
+    /// Reduces the second sequence's u64 byte length modulo 65521 before storing the u32 residue.
     pub fn forLength(second_length: u64) CombineOperator {
         return .{ .length_mod = @intCast(second_length % modulus) };
     }

@@ -52,9 +52,10 @@ const aarch64 = blk: {
     break :blk builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .aarch64_be;
 };
 // Zig's AArch64 AES feature includes the 64-bit PMULL instructions.
-const pmull = aarch64 and std.Target.aarch64.featureSetHasAll(builtin.cpu.features, &.{
-    .aes, .neon,
-});
+const pmull = aarch64 and std.Target.aarch64.featureSetHasAll(
+    builtin.cpu.features,
+    &.{ .aes, .neon },
+);
 const arm_crc = aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc);
 const shuffled_tail = pclmul and std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3);
 const folding = pclmul or pmull;
@@ -69,9 +70,8 @@ const wide_bytes: usize = blk: {
     break :blk 16;
 };
 
-/// Four-byte incremental IEEE CRC-32 state owned by the caller. Initialize before updating. Copies
-/// continue independently and need no cleanup. Unfinalized CRC remainder; initialize through
-/// `init()` or copy a valid state.
+/// Reflected running remainder before the final XOR. Initialize through `init` or copy a valid
+/// state.
 remainder: u32 = 0xffffffff,
 
 /// Empty-stream state. Copy or assign `init()` to begin a new sequence with checksum zero.
@@ -120,6 +120,9 @@ test hash {
 /// Immutable four-byte polynomial operator for repeated second-chunk lengths. Construct once with
 /// `forLength`; copies can be shared across threads.
 pub const CombineOperator = struct {
+    /// Advance factor for a second sequence of `n` bytes: `x^(8*n)` modulo the IEEE generator.
+    /// Coefficients are reflected: bit `31-i` represents `x^i`. Construct with `forLength(n)`; for
+    /// zero bytes the factor is `0x80000000`.
     factor: u32,
 
     /// Precomputes an operator for a second sequence of exactly `second_length` bytes. Accepts the

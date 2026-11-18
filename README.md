@@ -29,6 +29,11 @@ noncryptographic values do not establish input identity or authenticate a messag
 a cryptographic digest and separate keyed and key-derivation modes. IEEE CRC-32 differs from
 CRC-32C and the x86 instruction named CRC32.
 
+All four families accept complete buffers and streamed fragments. `final` reads a snapshot;
+later updates continue the same stream. Adler-32 and CRC can also combine separately computed
+checksums without the original bytes. The guides explain each family's state construction,
+copying, failure rules and output encoding.
+
 ### Compression
 
 Use `lz4` for compatible raw blocks or standard frames, `deflate` for raw RFC 1951 streams,
