@@ -4,53 +4,57 @@
 //! Streaming states allocate nothing. `final` returns a snapshot and independent copies can
 //! continue separately. A custom secret is borrowed and must remain immutable, alive and disjoint
 //! from every mutable state copy until that copy is reinitialized or no longer used. Input passed
-//! to `update` must not overlap the mutable state. Numeric results are host-order integers; use
-//! big-endian bytes for xxHash's canonical representation.
+//! to `update` must not overlap the mutable state. Numeric results are independent of host byte
+//! order; use big-endian bytes for xxHash's canonical representation.
 //!
 //! Algorithm reference: https://github.com/Cyan4973/xxHash/blob/v0.8.4/xxhash.h
 
 const Xxh3_128 = @This();
 
-/// Internal state; initialize and modify it only through this type's functions.
-state: core.State,
-
 const core = @import("xxh3.zig");
 const small = @import("xxh3_small.zig");
 const overlaps = @import("../common/byte_ranges.zig").overlaps;
-const Xxh3Options = core.Xxh3Options;
+const Xxh3Options = @import("Xxh3Options.zig");
+const Xxh3State = @import("Xxh3State.zig");
 const std = @import("std");
 const testing = std.testing;
 
+/// Internal stream history, stripe lanes and secret selection. Manage through reset and update.
+state: Xxh3State,
+
+/// Reset validates the options and the secret's separation from the complete destination state.
+pub const ResetError = Xxh3Options.Error || error{
+    /// The borrowed secret overlaps this state's storage.
+    StorageOverlap,
+};
+
 /// Starts or restarts a stream with any 64-bit seed in caller-owned storage, which may be
 /// undefined. A previous custom-secret borrow ends when this call succeeds.
-pub fn init(self: *Xxh3_128, seed: u64) void {
+pub fn reset(self: *Xxh3_128, seed: u64) void {
     self.state.reset(seed);
 }
 
 /// Starts a stream using a seed or a borrowed custom secret. Secrets must contain at least 136
-/// bytes and must not overlap this state. A failed initialization leaves the entire state
-/// unchanged, including when its storage was undefined. A failed call preserves any previous secret
-/// borrow. A borrowed secret must remain immutable, alive and disjoint from all mutable state
-/// copies until each copy is successfully reinitialized or no longer used.
-pub fn initWithOptions(
-    self: *Xxh3_128,
-    options: Xxh3Options,
-) error{ InvalidSecret, StorageOverlap }!void {
+/// bytes and must not overlap this state. A failed reset leaves the entire state unchanged,
+/// including when its storage was undefined. A failed call preserves any previous secret borrow. A
+/// borrowed secret must remain immutable, alive and disjoint from all mutable state copies until
+/// each copy is successfully reinitialized or no longer used.
+pub fn resetWithOptions(self: *Xxh3_128, options: Xxh3Options) ResetError!void {
     switch (options.mode) {
-        .seed => |seed| self.init(seed),
+        .seed => |seed| self.reset(seed),
         .secret => |secret| {
-            if (secret.len < core.min_secret_size) return error.InvalidSecret;
+            if (secret.len < Xxh3Options.minimum_secret_length) return error.InvalidSecret;
             if (overlaps(secret, std.mem.asBytes(self))) return error.StorageOverlap;
             self.state.resetSecret(secret);
         },
     }
 }
 
-test initWithOptions {
+test resetWithOptions {
     const secret: [137]u8 = @splat(0xa5);
     var state: Xxh3_128 = undefined;
-    state.init(0);
-    try state.initWithOptions(.{ .mode = .{ .secret = &secret } });
+    state.reset(0);
+    try state.resetWithOptions(.{ .mode = .{ .secret = &secret } });
     state.update("abc");
     // Independent XXH3-128 result from xxHash v0.8.4.
     try testing.expectEqual(@as(u128, 0x42d23058767a303ffd6e986c28fac4d3), state.final());
@@ -64,7 +68,7 @@ pub fn update(self: *Xxh3_128, input: []const u8) void {
 
 test update {
     var state: Xxh3_128 = undefined;
-    state.init(1);
+    state.reset(1);
     state.update("a");
     const prefix = state.final();
     var copy = state;
@@ -109,11 +113,11 @@ test hashSeeded {
 
 /// Hashes an exact byte slice with a seed or a secret of at least 136 bytes. The secret and input
 /// are borrowed only for this call; they may overlap each other.
-pub fn hashWithOptions(options: Xxh3Options, bytes: []const u8) error{InvalidSecret}!u128 {
+pub fn hashWithOptions(options: Xxh3Options, bytes: []const u8) Xxh3Options.Error!u128 {
     switch (options.mode) {
         .seed => |seed| return hashSeeded(seed, bytes),
         .secret => |secret| {
-            if (secret.len < core.min_secret_size) return error.InvalidSecret;
+            if (secret.len < Xxh3Options.minimum_secret_length) return error.InvalidSecret;
             if (bytes.len <= 16) return small.hash128(bytes, secret[0..96], 0);
             if (bytes.len >= 97 and bytes.len <= 128) {
                 return small.hashSecret97To128(bytes, secret);
@@ -148,58 +152,57 @@ test "custom-secret medium boundaries support overlapping input" {
         .{ .len = 128, .digest = 0x4242c07439a4413abe72de99d896c8aa },
         .{ .len = 129, .digest = 0xd00374632dbf0873ce71d2ee64fd615c },
     };
-    for (cases) |case| {
+    for (cases) |case|
         try testing.expectEqual(case.digest, try hashWithOptions(options, bytes[0..case.len]));
-    }
 }
 
-test "failed option initialization preserves the state" {
+test "failed option reset preserves the state" {
     var state: Xxh3_128 = undefined;
-    state.init(1);
+    state.reset(1);
     state.update("prefix");
     const before = state.final();
     const too_short: [135]u8 = @splat(0);
     try testing.expectError(
         error.InvalidSecret,
-        state.initWithOptions(.{ .mode = .{ .secret = &too_short } }),
+        state.resetWithOptions(.{ .mode = .{ .secret = &too_short } }),
     );
     try testing.expectEqual(before, state.final());
     const self_bytes = std.mem.asBytes(&state);
     try testing.expectError(
         error.StorageOverlap,
-        state.initWithOptions(.{ .mode = .{ .secret = self_bytes[0..136] } }),
+        state.resetWithOptions(.{ .mode = .{ .secret = self_bytes[0..136] } }),
     );
     try testing.expectEqual(before, state.final());
     var uninitialized: Xxh3_128 = undefined;
     try testing.expectError(
         error.InvalidSecret,
-        uninitialized.initWithOptions(.{ .mode = .{ .secret = &too_short } }),
+        uninitialized.resetWithOptions(.{ .mode = .{ .secret = &too_short } }),
     );
-    uninitialized.init(1);
+    uninitialized.reset(1);
     uninitialized.update("abc");
     try testing.expectEqual(@as(u128, 0x7577b06fae9ee3ed6b4467b443c76228), uninitialized.final());
 }
 
-test "failed initialization preserves borrowed state and successful initialization releases it" {
+test "failed reset preserves borrowed state and successful reset releases it" {
     var secret: [137]u8 = @splat(0xa5);
     const options: Xxh3Options = .{ .mode = .{ .secret = &secret } };
     var state: Xxh3_128 = undefined;
     @memset(std.mem.asBytes(&state), 0xa5);
-    try state.initWithOptions(options);
+    try state.resetWithOptions(options);
     state.update("prefix");
     var copy = state;
     const before = std.mem.asBytes(&state).*;
     try testing.expectError(
         error.InvalidSecret,
-        state.initWithOptions(.{ .mode = .{ .secret = secret[0..135] } }),
+        state.resetWithOptions(.{ .mode = .{ .secret = secret[0..135] } }),
     );
     try testing.expectEqualSlices(u8, &before, std.mem.asBytes(&state));
     state.update("suffix");
     copy.update("suffix");
     try testing.expectEqual(try hashWithOptions(options, "prefixsuffix"), state.final());
     try testing.expectEqual(state.final(), copy.final());
-    state.init(1);
-    copy.init(1);
+    state.reset(1);
+    copy.reset(1);
     @memset(&secret, 0);
     state.update("abc");
     try testing.expectEqual(hashSeeded(1, "abc"), state.final());
@@ -289,7 +292,7 @@ test "upstream vectors and streaming boundaries" {
         try testing.expectEqual(case.digest, try hashWithOptions(options, bytes[0..case.len]));
         for (fragments) |fragment| {
             var state: Xxh3_128 = undefined;
-            try state.initWithOptions(options);
+            try state.resetWithOptions(options);
             var pos: usize = 0;
             while (pos < case.len) {
                 const count = @min(fragment, case.len - pos);
@@ -309,12 +312,12 @@ test "overlap admission leaves caller storage untouched" {
     const raw = std.mem.asBytes(&state);
     try testing.expectError(
         error.InvalidSecret,
-        state.initWithOptions(.{ .mode = .{ .secret = raw[0..135] } }),
+        state.resetWithOptions(.{ .mode = .{ .secret = raw[0..135] } }),
     );
     try testing.expectEqualSlices(u8, &before, raw);
     try testing.expectError(
         error.StorageOverlap,
-        state.initWithOptions(.{ .mode = .{ .secret = raw[0..136] } }),
+        state.resetWithOptions(.{ .mode = .{ .secret = raw[0..136] } }),
     );
     try testing.expectEqualSlices(u8, &before, raw);
 }
@@ -328,16 +331,16 @@ test "all short residual stripes and relocated copies" {
     for (1..64) |residual| {
         const end = 512 + residual;
         var state: Xxh3_128 = undefined;
-        state.init(0xfedcba9876543210);
+        state.reset(0xfedcba9876543210);
         state.update(bytes[0..end]);
         var moved = state;
-        state.init(0);
+        state.reset(0);
         moved.update(bytes[end..]);
         try testing.expectEqual(hashSeeded(0xfedcba9876543210, &bytes), moved.final());
-        try state.initWithOptions(options);
+        try state.resetWithOptions(options);
         state.update(bytes[0..end]);
         moved = state;
-        state.init(0);
+        state.reset(0);
         moved.update(bytes[end..]);
         try testing.expectEqual(try hashWithOptions(options, &bytes), moved.final());
     }
@@ -352,26 +355,33 @@ test "64-byte updates preserve mixed-boundary snapshots" {
         prefix: usize,
         seeded: [2]u128,
         secret: [2]u128,
-    }{ .{ .prefix = 192, .seeded = .{
-        0x632874bc3b4f1851e171c4058af35077, 0x6e5a8485443088e091c39ffece9a3644,
-    }, .secret = .{
-        0x6463781a1d2429327557cb38d1c4decd, 0x1fe86bca6ddb33a0cc599c907b6b63cf,
-    } }, .{ .prefix = 193, .seeded = .{
-        0x81bead69c7783baa95204103d0e4fc0b, 0x813be16afee7595a8b32b8265caa0e41,
-    }, .secret = .{
-        0x1d367ca8e3bfbf5afabef7a337d71faf, 0x9d37633461486f5c9cd8d74a6e5eda3f,
-    } }, .{ .prefix = 255, .seeded = .{
-        0xd74b21cee1daaa09a4adb43f78afc847, 0xaa67064e4c7adebcc62e64a8cb0f27b8,
-    }, .secret = .{
-        0x9e457bfb0366d5e7e263db7d86655821, 0xe3beeb3e9ec5068f247f046280cfa93b,
-    } }, .{ .prefix = 256, .seeded = .{
-        0x6e5a8485443088e091c39ffece9a3644, 0xde499b3be57e37d0d17a63171dcc88d6,
-    }, .secret = .{ 0x1fe86bca6ddb33a0cc599c907b6b63cf, 0x7e6f03a356476d1e21eee0af3b3595c9 } } };
+    }{
+        .{
+            .prefix = 192,
+            .seeded = .{ 0x632874bc3b4f1851e171c4058af35077, 0x6e5a8485443088e091c39ffece9a3644 },
+            .secret = .{ 0x6463781a1d2429327557cb38d1c4decd, 0x1fe86bca6ddb33a0cc599c907b6b63cf },
+        },
+        .{
+            .prefix = 193,
+            .seeded = .{ 0x81bead69c7783baa95204103d0e4fc0b, 0x813be16afee7595a8b32b8265caa0e41 },
+            .secret = .{ 0x1d367ca8e3bfbf5afabef7a337d71faf, 0x9d37633461486f5c9cd8d74a6e5eda3f },
+        },
+        .{
+            .prefix = 255,
+            .seeded = .{ 0xd74b21cee1daaa09a4adb43f78afc847, 0xaa67064e4c7adebcc62e64a8cb0f27b8 },
+            .secret = .{ 0x9e457bfb0366d5e7e263db7d86655821, 0xe3beeb3e9ec5068f247f046280cfa93b },
+        },
+        .{
+            .prefix = 256,
+            .seeded = .{ 0x6e5a8485443088e091c39ffece9a3644, 0xde499b3be57e37d0d17a63171dcc88d6 },
+            .secret = .{ 0x1fe86bca6ddb33a0cc599c907b6b63cf, 0x7e6f03a356476d1e21eee0af3b3595c9 },
+        },
+    };
     for (cases) |case| {
         inline for (.{ false, true }) |custom| {
             var state: Xxh3_128 = undefined;
-            state.init(1);
-            if (custom) try state.initWithOptions(.{ .mode = .{ .secret = &secret } });
+            state.reset(1);
+            if (custom) try state.resetWithOptions(.{ .mode = .{ .secret = &secret } });
             const expected = if (custom) case.secret else case.seeded;
             state.update(bytes[0..case.prefix]);
             state.update(bytes[case.prefix..][0..64]);

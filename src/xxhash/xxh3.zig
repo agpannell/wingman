@@ -4,29 +4,18 @@
 
 const std = @import("std");
 const small = @import("xxh3_small.zig");
-const long = @import("xxh3_long.zig");
-pub const State = @import("xxh3_stream.zig").State;
-
-/// Selects a 64-bit seed or a caller-provided XXH3 secret. Combined seed and secret is not a mode.
-pub const Xxh3Options = struct {
-    /// Default seed zero, another seed, or a secret of at least 136 bytes.
-    mode: union(enum) { seed: u64, secret: []const u8 } = .{ .seed = 0 },
-};
-
-/// Smallest custom secret accepted by the stable XXH3 interface.
-pub const min_secret_size = 136;
+const StripeAccumulator = @import("StripeAccumulator.zig");
+const Xxh3Options = @import("Xxh3Options.zig");
 
 pub fn hash64(input: []const u8, seed: u64, secret: ?[]const u8) u64 {
-    const options: SecretMode = if (secret) |key| .{ .secret = key } else .{ .seed = seed };
+    const options: Xxh3Options.Mode = if (secret) |key| .{ .secret = key } else .{ .seed = seed };
     return @truncate(hash(64, input, options));
 }
 
 pub fn hash128(input: []const u8, seed: u64, secret: ?[]const u8) u128 {
-    const options: SecretMode = if (secret) |key| .{ .secret = key } else .{ .seed = seed };
+    const options: Xxh3Options.Mode = if (secret) |key| .{ .secret = key } else .{ .seed = seed };
     return hash(128, input, options);
 }
-
-pub const SecretMode = union(enum) { seed: u64, secret: []const u8 };
 
 // For long seeded inputs XXH3 requires a derived copy; byte order remains fixed on every target.
 pub fn deriveSeededSecret(seed: u64) [192]u8 {
@@ -75,7 +64,7 @@ pub fn hashUpTo240(
     return (@as(u128, result.high) << 64) | result.low;
 }
 
-pub fn hash(comptime result_bits: u8, input: []const u8, options: SecretMode) u128 {
+pub fn hash(comptime result_bits: u8, input: []const u8, options: Xxh3Options.Mode) u128 {
     if (result_bits != 64 and result_bits != 128) @compileError(
         "XXH3 result width must be 64 or 128",
     );
@@ -88,36 +77,39 @@ pub fn hash(comptime result_bits: u8, input: []const u8, options: SecretMode) u1
         .secret => |value| value,
     };
     const secret = borrowed_secret orelse &default_secret;
-    std.debug.assert(secret.len >= 136);
+    std.debug.assert(secret.len >= Xxh3Options.minimum_secret_length);
     if (input.len <= 16) {
         if (result_bits == 128) return small.hash128(input, secret[0..96], seed);
         return small.hash64(input, secret[0..96], seed);
     }
     if (input.len <= 240) {
         if (result_bits == 64) {
-            if (borrowed_secret) |key| return hashMediumSecret64(input, key);
+            if (borrowed_secret) |key| return hashSecret17To240(input, key);
         }
         return hashUpTo240(result_bits, input, seed, borrowed_secret);
     }
     // The 64-bit caller benefits from inlining; keep 128-bit short calls free of long-path storage.
-    return if (result_bits == 64) @call(.always_inline, hashLong, .{
-        result_bits, input, options,
-    }) else @call(.never_inline, hashLong, .{ result_bits, input, options });
+    return if (result_bits == 64) @call(
+        .always_inline,
+        hashLong,
+        .{ result_bits, input, options },
+    ) else @call(.never_inline, hashLong, .{ result_bits, input, options });
 }
 
-// For seeded long-medium inputs the default secret is known at compile time.
-pub noinline fn hashSeededLongMedium64(input: []const u8, seed: u64) u64 {
+// Seeded XXH3-64 for 161 through 240 bytes; the default secret is known at compile time.
+pub noinline fn hashSeeded161To240(input: []const u8, seed: u64) u64 {
     std.debug.assert(input.len >= 161 and input.len <= 240);
     const result = @call(.always_inline, small.hash, .{ 64, input, &default_secret, seed });
     return result.low;
 }
 
-fn hashMediumSecret64(input: []const u8, secret: []const u8) u64 {
+// Custom-secret XXH3-64 for 17 through 240 bytes; secret mode always uses seed zero.
+fn hashSecret17To240(input: []const u8, secret: []const u8) u64 {
     const result = @call(.always_inline, small.hash, .{ 64, input, secret, 0 });
     return result.low;
 }
 
-fn hashLong(comptime result_bits: u8, input: []const u8, options: SecretMode) u128 {
+fn hashLong(comptime result_bits: u8, input: []const u8, options: Xxh3Options.Mode) u128 {
     var derived: [192]u8 = undefined;
     const long_secret: []const u8 = switch (options) {
         .secret => |value| value,
@@ -126,7 +118,7 @@ fn hashLong(comptime result_bits: u8, input: []const u8, options: SecretMode) u1
             break :seeded &derived;
         },
     };
-    const result = long.hash(result_bits, input, long_secret);
+    const result = StripeAccumulator.hash(result_bits, input, long_secret);
     return (@as(u128, result.high) << 64) | result.low;
 }
 
@@ -146,7 +138,6 @@ pub const default_secret = [_]u8{
 };
 
 test {
-    _ = State;
     _ = small;
-    _ = long;
+    _ = StripeAccumulator;
 }

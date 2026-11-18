@@ -7,11 +7,14 @@
 //! Initialize a caller-owned state with `init(seed)`, then `update` and `final`. Copies continue
 //! independently; `final` is a snapshot and input is never retained. The numeric result has no byte
 //! order: upstream canonical bytes are big-endian, while Zstandard stores the low 32 bits of the
-//! seed-zero result in little-endian order.
+//! seed-zero result in little-endian order. Manage the state fields through `init`, `reset` and
+//! `update`.
 //!
 //! Algorithm specification: https://github.com/Cyan4973/xxHash/blob/v0.8.3/doc/xxhash_spec.md
 
 const Xxh64 = @This();
+const std = @import("std");
+const testing = std.testing;
 
 /// Four running stripe accumulators. Initialize through `init` or `reset`.
 accumulators: [4]u64 = initialAccumulators(0),
@@ -23,9 +26,6 @@ tail: [32]u8 = @splat(0),
 buffered: u8 = 0,
 /// Remembers a processed stripe after the byte count wraps.
 striped: bool = false,
-
-const std = @import("std");
-const testing = std.testing;
 
 // Yann Collet's xxHash specification defines the word mixing. A stripe feeds four independent
 // accumulators with little-endian words; rotations and odd multipliers mix each contribution. The
@@ -244,18 +244,27 @@ const prefix_vectors = [_]struct {
 const seeded_lengths = [_]usize{ 0, 3, 31, 32, 33, 1024 };
 const seeded_vectors = blk: {
     const Vector = struct { seed: u64, hashes: [seeded_lengths.len]u64 };
-    const one: Vector = .{ .seed = 1, .hashes = .{
-        0xd5afba1336a3be4b, 0x07b9cb622c8be259, 0xcc6be4c4c8e18c13, 0xcebb91cd59829a16,
-        0xf698d682e27495ff, 0x3ba93a47f26b5a8a,
-    } };
-    const all_bits: Vector = .{ .seed = 0xffffffffffffffff, .hashes = .{
-        0x298f4c84b24f5380, 0x305b41494634382b, 0x762bf07e32fd0b22, 0x508e7826939de129,
-        0x8663b458f109718e, 0xfafdd2198093d443,
-    } };
-    const prime: Vector = .{ .seed = 0x9e3779b185ebca87, .hashes = .{
-        0x6ec6d05f61c7e7a7, 0x93279d6319598428, 0x6059d8e93e9c537d, 0x58744b00a801c62d,
-        0xa7a612fc8f19553a, 0x92ef5febb161fefb,
-    } };
+    const one: Vector = .{
+        .seed = 1,
+        .hashes = .{
+            0xd5afba1336a3be4b, 0x07b9cb622c8be259, 0xcc6be4c4c8e18c13, 0xcebb91cd59829a16,
+            0xf698d682e27495ff, 0x3ba93a47f26b5a8a,
+        },
+    };
+    const all_bits: Vector = .{
+        .seed = 0xffffffffffffffff,
+        .hashes = .{
+            0x298f4c84b24f5380, 0x305b41494634382b, 0x762bf07e32fd0b22, 0x508e7826939de129,
+            0x8663b458f109718e, 0xfafdd2198093d443,
+        },
+    };
+    const prime: Vector = .{
+        .seed = 0x9e3779b185ebca87,
+        .hashes = .{
+            0x6ec6d05f61c7e7a7, 0x93279d6319598428, 0x6059d8e93e9c537d, 0x58744b00a801c62d,
+            0xa7a612fc8f19553a, 0x92ef5febb161fefb,
+        },
+    };
     break :blk [_]Vector{ one, all_bits, prime };
 };
 
@@ -266,9 +275,8 @@ test "XXH64 seed-zero vectors and every prefix match the standard reference" {
     const storage = try testing.allocator.alloc(u8, 1025);
     defer testing.allocator.free(storage);
     for (storage, 0..) |*byte, i| byte.* = @truncate(i * 31 + 17);
-    for (prefix_vectors) |vector| {
+    for (prefix_vectors) |vector|
         try testing.expectEqual(vector.hash, hash(storage[1..][0..vector.bytes]));
-    }
     for (0..1025) |count| {
         const bytes = storage[1..][0..count];
         try testing.expectEqual(std.hash.XxHash64.hash(0, bytes), hash(bytes));
@@ -281,9 +289,8 @@ test "XXH64 seeded vectors and unaligned stripe boundaries match references" {
     for (storage, 0..) |*byte, i| byte.* = @truncate(i * 31 + 17);
 
     for (seeded_vectors) |vector| {
-        for (seeded_lengths, vector.hashes) |count, expected| {
+        for (seeded_lengths, vector.hashes) |count, expected|
             try testing.expectEqual(expected, hashSeeded(vector.seed, storage[1..][0..count]));
-        }
     }
 
     const seeds = [_]u64{ 0, 1, 0xffffffff00000000, 0xffffffffffffffff, prime_1 };
@@ -341,7 +348,8 @@ test "XXH64 every split, snapshots, independent copies and seeded reset" {
         }
     }
     var state = init(0);
-    for (storage) |byte| state.update(&.{byte});
+    for (storage) |byte|
+        state.update(&.{byte});
     try testing.expectEqual(hash(&storage), state.final());
     state = init(0);
     try testing.expectEqual(hash(""), state.final());

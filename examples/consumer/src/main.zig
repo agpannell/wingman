@@ -810,28 +810,52 @@ test "classic xxHash numeric encoding and zero-seed reset" {
     try std.testing.expectEqual(@as(u64, 0xef46db3751d8e999), state64.final());
 }
 
-test "XXH3 seeded and borrowed-secret streams" {
-    const input = "abc";
-    try std.testing.expectEqual(@as(u64, 0x78af5f94892f3950), xxhash.Xxh3_64.hash(input));
-    try std.testing.expectEqual(
-        @as(u128, 0x6b05ab6733a618578af5f94892f3950),
-        xxhash.Xxh3_128.hash(input),
-    );
-    var secret: [136]u8 = undefined;
-    for (&secret, 0..) |*byte, i| byte.* = @truncate(i * 71 + 13);
+test "XXH3 reset modes errors and borrowed-secret streams" {
+    const secret: [137]u8 = @splat(0xa5);
     const options: xxhash.Xxh3Options = .{ .mode = .{ .secret = &secret } };
-    var stream: xxhash.Xxh3_128 = undefined;
-    try stream.initWithOptions(options);
-    stream.update("a");
-    stream.update("bc");
-    try std.testing.expectEqual(
-        try xxhash.Xxh3_128.hashWithOptions(options, input),
-        stream.final(),
-    );
-    try std.testing.expectError(
-        error.InvalidSecret,
-        xxhash.Xxh3_64.hashWithOptions(.{ .mode = .{ .secret = secret[0..135] } }, input),
-    );
+    const invalid_secret: xxhash.Xxh3Options.Error = error.InvalidSecret;
+    const short_options: xxhash.Xxh3Options = .{
+        .mode = .{ .secret = secret[0 .. xxhash.Xxh3Options.minimum_secret_length - 1] },
+    };
+    inline for (.{ xxhash.Xxh3_64, xxhash.Xxh3_128 }) |Hasher| {
+        // Independent xxHash v0.8.4 values for seed zero, seed one and the secret above.
+        const Digest = if (Hasher == xxhash.Xxh3_64) u64 else u128;
+        const unseeded: Digest = if (Hasher == xxhash.Xxh3_64)
+            0x78af5f94892f3950
+        else
+            0x6b05ab6733a618578af5f94892f3950;
+        const seeded: Digest = if (Hasher == xxhash.Xxh3_64)
+            0x6b4467b443c76228
+        else
+            0x7577b06fae9ee3ed6b4467b443c76228;
+        const custom: Digest = if (Hasher == xxhash.Xxh3_64)
+            0xfd6e986c28fac4d3
+        else
+            0x42d23058767a303ffd6e986c28fac4d3;
+        var stream: Hasher = undefined;
+        @memset(std.mem.asBytes(&stream), 0xa5);
+        try stream.resetWithOptions(.{});
+        stream.update("abc");
+        try std.testing.expectEqual(unseeded, stream.final());
+        stream.reset(1);
+        stream.update("abc");
+        try std.testing.expectEqual(seeded, stream.final());
+        try stream.resetWithOptions(options);
+        stream.update("a");
+        const before = std.mem.asBytes(&stream).*;
+        try std.testing.expectError(invalid_secret, stream.resetWithOptions(short_options));
+        try std.testing.expectEqualSlices(u8, &before, std.mem.asBytes(&stream));
+        const overlap: Hasher.ResetError = error.StorageOverlap;
+        try std.testing.expectError(
+            overlap,
+            stream.resetWithOptions(.{ .mode = .{ .secret = std.mem.asBytes(&stream) } }),
+        );
+        try std.testing.expectEqualSlices(u8, &before, std.mem.asBytes(&stream));
+        stream.update("bc");
+        try std.testing.expectEqual(custom, stream.final());
+        try std.testing.expectEqual(custom, try Hasher.hashWithOptions(options, "abc"));
+        try std.testing.expectError(invalid_secret, Hasher.hashWithOptions(short_options, "abc"));
+    }
 }
 
 test "WAVE owned and caller samples retain rate and independent storage" {

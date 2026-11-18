@@ -9,7 +9,7 @@ pub fn main(init: std.process.Init) !void {
     const split = input.len / 2;
 
     var stream: xxhash.Xxh3_64 = undefined;
-    stream.init(42);
+    stream.reset(42);
     stream.update(input[0..split]);
     const prefix = stream.final();
     stream.update(input[split..]);
@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     for (&secret, 0..) |*byte, index| byte.* = @truncate(index * 71 + 13);
     const options: xxhash.Xxh3Options = .{ .mode = .{ .secret = &secret } };
     var secret_stream: xxhash.Xxh3_128 = undefined;
-    try secret_stream.initWithOptions(options);
+    try secret_stream.resetWithOptions(options);
     secret_stream.update(input);
     const custom = try xxhash.Xxh3_128.hashWithOptions(options, input);
     if (secret_stream.final() != custom) return error.HashMismatch;
@@ -33,9 +33,10 @@ pub fn main(init: std.process.Init) !void {
     try output.interface.print("XXH64:      {x:0>16}\n", .{xxhash.Xxh64.hash(input)});
     try output.interface.print("XXH3-64:    {x:0>16}\n", .{xxhash.Xxh3_64.hash(input)});
     try output.interface.print("XXH3-128:   {x:0>32}\n", .{xxhash.Xxh3_128.hash(input)});
-    try output.interface.print("seed 42 prefix: {x:0>16}; complete: {x:0>16}\n", .{
-        prefix, seeded,
-    });
+    try output.interface.print(
+        "seed 42 prefix: {x:0>16}; complete: {x:0>16}\n",
+        .{ prefix, seeded },
+    );
     try output.interface.print("custom-secret XXH3-128: {x:0>32}\n", .{custom});
     try output.interface.flush();
 }

@@ -1,8 +1,11 @@
-//! XXH3 stripe accumulation and merging for inputs longer than 240 bytes. Algorithm reference:
-//! xxHash v0.8.4, designed by Yann Collet and contributors.
+//! XXH3's eight-lane stripe accumulator, shared by complete and streamed long inputs. Each stripe
+//! contains 64 bytes. Callers select the secret stripe and the block-scrambling cadence; the
+//! complete `hash` helper also reserves the final stripe and merges the result. Algorithm
+//! reference: xxHash v0.8.4, designed by Yann Collet and contributors.
 
 const std = @import("std");
 const testing = std.testing;
+const StripeAccumulator = @This();
 
 const prime32_1: u64 = 0x9e3779b1;
 const prime64_1: u64 = 0x9e3779b185ebca87;
@@ -16,61 +19,53 @@ fn read64Le(bytes: []const u8, index: usize) u64 {
     return std.mem.readInt(u64, bytes[index..][0..8], .little);
 }
 
-// One accumulator owns all eight lanes for both digest widths. Its caller tracks the position in
-// the secret, so one-shot and streaming operations use the same stripe rule.
-pub const StripeAccumulator = struct {
-    values: [8]u64 = .{
-        0xc2b2ae3d, prime64_1, prime64_2, prime64_3, prime64_4, 0x85ebca77, prime64_5, prime32_1,
-    },
+/// Eight running lanes, initialized to the XXH3 stripe constants.
+values: [8]u64 = .{
+    0xc2b2ae3d, prime64_1, prime64_2, prime64_3, prime64_4, 0x85ebca77, prime64_5, prime32_1,
+},
 
-    pub fn addStripe(self: *StripeAccumulator, stripe: *const [64]u8, secret: *const [64]u8) void {
-        var input_words: [8]u64 = undefined;
-        var secret_words: [8]u64 = undefined;
-        inline for (0..8) |lane| {
-            input_words[lane] = read64Le(stripe, lane * 8);
-            secret_words[lane] = read64Le(secret, lane * 8);
-        }
-        // Adjacent lanes exchange their data contribution; keyed products remain in their own lane.
-        const values: @Vector(8, u64) = input_words;
-        const keys: @Vector(8, u64) = secret_words;
-        const adjacent = @shuffle(
-            u64,
-            values,
-            undefined,
-            @Vector(8, i32){ 1, 0, 3, 2, 5, 4, 7, 6 },
-        );
-        const keyed = values ^ keys;
-        const mask: @Vector(8, u64) = @splat(0xffffffff);
-        const shift: @Vector(8, u6) = @splat(32);
-        const products = (keyed & mask) *% (keyed >> shift);
-        const previous: @Vector(8, u64) = self.values;
-        self.values = previous +% adjacent +% products;
+/// Mixes one exact 64-byte input stripe with the selected 64 secret bytes.
+pub fn addStripe(self: *StripeAccumulator, stripe: *const [64]u8, secret: *const [64]u8) void {
+    var input_words: [8]u64 = undefined;
+    var secret_words: [8]u64 = undefined;
+    inline for (0..8) |lane| {
+        input_words[lane] = read64Le(stripe, lane * 8);
+        secret_words[lane] = read64Le(secret, lane * 8);
     }
+    // Adjacent lanes exchange their data contribution; keyed products remain in their own lane.
+    const values: @Vector(8, u64) = input_words;
+    const keys: @Vector(8, u64) = secret_words;
+    const adjacent = @shuffle(u64, values, undefined, @Vector(8, i32){ 1, 0, 3, 2, 5, 4, 7, 6 });
+    const keyed = values ^ keys;
+    const mask: @Vector(8, u64) = @splat(0xffffffff);
+    const shift: @Vector(8, u6) = @splat(32);
+    const products = (keyed & mask) *% (keyed >> shift);
+    const previous: @Vector(8, u64) = self.values;
+    self.values = previous +% adjacent +% products;
+}
 
-    pub fn scrambleBlock(self: *StripeAccumulator, secret: *const [64]u8) void {
-        inline for (0..8) |lane| {
-            const mixed = self.values[lane] ^ (self.values[lane] >> 47) ^ read64Le(
-                secret,
-                lane * 8,
-            );
-            self.values[lane] = mixed *% prime32_1;
-        }
+/// Scrambles all lanes after a full secret block.
+pub fn scrambleBlock(self: *StripeAccumulator, secret: *const [64]u8) void {
+    inline for (0..8) |lane| {
+        const mixed = self.values[lane] ^ (self.values[lane] >> 47) ^ read64Le(secret, lane * 8);
+        self.values[lane] = mixed *% prime32_1;
     }
+}
 
-    pub fn finish(self: StripeAccumulator, secret: *const [64]u8, initial: u64) u64 {
-        var sum = initial;
-        inline for (0..4) |pair| {
-            const first = self.values[2 * pair] ^ read64Le(secret, 16 * pair);
-            const second = self.values[2 * pair + 1] ^ read64Le(secret, 16 * pair + 8);
-            const product: u128 = @as(u128, first) * second;
-            const low: u64 = @truncate(product);
-            const high: u64 = @truncate(product >> 64);
-            sum +%= low ^ high;
-        }
-        const mixed = (sum ^ (sum >> 37)) *% avalanche_prime;
-        return mixed ^ (mixed >> 32);
+/// Merges the lane pairs into one digest word without changing this accumulator.
+pub fn finish(self: StripeAccumulator, secret: *const [64]u8, initial: u64) u64 {
+    var sum = initial;
+    inline for (0..4) |pair| {
+        const first = self.values[2 * pair] ^ read64Le(secret, 16 * pair);
+        const second = self.values[2 * pair + 1] ^ read64Le(secret, 16 * pair + 8);
+        const product: u128 = @as(u128, first) * second;
+        const low: u64 = @truncate(product);
+        const high: u64 = @truncate(product >> 64);
+        sum +%= low ^ high;
     }
-};
+    const mixed = (sum ^ (sum >> 37)) *% avalanche_prime;
+    return mixed ^ (mixed >> 32);
+}
 
 test "stripe lanes mix neighbors and scrambleBlock independently" {
     var input: [64]u8 = undefined;

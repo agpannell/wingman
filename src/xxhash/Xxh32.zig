@@ -6,13 +6,16 @@
 //! big-endian order; LZ4 frame fields use little-endian order.
 //!
 //! Initialize a caller-owned state with `init(seed)`, then `update` and `final`. Copies continue
-//! independently; `final` is a snapshot and input is never retained.
+//! independently; `final` is a snapshot and input is never retained. Manage the state fields
+//! through `init`, `reset` and `update`.
 //!
 //! Algorithm specification and streaming reference:
 //! https://github.com/Cyan4973/xxHash/blob/v0.8.4/doc/xxhash_spec.md
 //! https://github.com/Cyan4973/xxHash/blob/v0.8.4/xxhash.h
 
 const Xxh32 = @This();
+const std = @import("std");
+const testing = std.testing;
 
 /// Four running stripe accumulators. Initialize through `init` or `reset`.
 accumulators: [4]u32 = initialAccumulators(0),
@@ -24,9 +27,6 @@ tail: [16]u8 = @splat(0),
 buffered: u8 = 0,
 /// Remembers a processed stripe after the byte count wraps.
 striped: bool = false,
-
-const std = @import("std");
-const testing = std.testing;
 
 // Yann Collet's xxHash specification defines the word mixing. A stripe feeds four independent
 // accumulators with little-endian words; rotations and odd multipliers mix each contribution. The
@@ -223,7 +223,8 @@ test "XXH32 every split, snapshots, independent copies and reset" {
         }
     }
     var state = init(0);
-    for (storage) |byte| state.update(&.{byte});
+    for (storage) |byte|
+        state.update(&.{byte});
     try testing.expectEqual(hash(&storage), state.final());
     state = init(0);
     try testing.expectEqual(hash(""), state.final());

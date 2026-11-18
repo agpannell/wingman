@@ -1,18 +1,42 @@
-//! Shared XXH3 streaming history, stripe accumulation and snapshot finalization. Algorithm
-//! reference: xxHash v0.8.4, designed by Yann Collet and contributors.
+//! Shared XXH3 streaming state for both result widths. It owns pending input, stripe cadence and
+//! seeded secret bytes; custom secret bytes remain borrowed. Finalization snapshots the lanes and
+//! history so later updates can continue. Algorithm reference: xxHash v0.8.4, designed by Yann
+//! Collet and contributors.
 
 const std = @import("std");
 const one_shot = @import("xxh3.zig");
-const long = @import("xxh3_long.zig");
+const StripeAccumulator = @import("StripeAccumulator.zig");
+const Xxh3Options = @import("Xxh3Options.zig");
+const Xxh3State = @This();
 const default_secret: *const [192]u8 = &one_shot.default_secret;
 const prime1: u64 = 0x9e3779b185ebca87;
 const prime2: u64 = 0xc2b2ae3d27d4eb4f;
 
+/// Running stripe lanes and their position in the current secret block.
+accumulator: Accumulator,
+/// Bytes retained for partial updates, the last stripe and wrapped-length finalization.
+history: History,
+/// Accepted byte count modulo 2^64, matching xxHash's reference behavior.
+total: u64,
+/// Selected seed; zero in custom-secret mode.
+seed: u64,
+/// Immutable caller secret, retained until successful reset or the last use of this state copy.
+borrowed_secret: ?[]const u8,
+/// Inline secret derived for a nonzero seed; inactive in seed-zero and custom-secret modes.
+derived_secret: [192]u8,
+
 // The retained 256 bytes model reference buffer evolution even when the 64-bit total wraps. The
 // separately tracked next stripe position prevents a stream fragment from changing block cadence.
-const History = struct { bytes: [256]u8 = @splat(0), length: usize = 0 };
+const History = struct {
+    /// Pending bytes at the front and the preceding stripe at the end when a short tail needs it.
+    bytes: [256]u8 = @splat(0),
+    /// Active prefix length in bytes, at most 256; independent of the wrapped stream length.
+    length: usize = 0,
+};
 const Accumulator = struct {
-    lanes: long.StripeAccumulator = .{},
+    /// Eight running lanes after all complete stripes already removed from history.
+    lanes: StripeAccumulator = .{},
+    /// Next secret stripe within the current block; advances independently of the stream length.
     next_stripe: usize = 0,
 
     fn appendStripes(self: *Accumulator, data: []const u8, count: usize, secret: []const u8) void {
@@ -41,7 +65,8 @@ const Accumulator = struct {
 };
 
 // Writing directly into stream storage allows initialization without a returned-array copy while
-// keeping the one-shot path independent. Both derivations must produce the same little-endian bytes.
+// keeping the one-shot path independent. Both derivations must produce the same little-endian
+// bytes.
 inline fn writeSeededSecret(derived: *[192]u8, seed: u64) void {
     for (0..12) |pair| {
         const offset = pair * 16;
@@ -57,7 +82,7 @@ test "stream secret writer matches shared derivation and preserves initialized h
         var derived: [192]u8 = undefined;
         writeSeededSecret(&derived, seed);
         try std.testing.expectEqualSlices(u8, &one_shot.deriveSeededSecret(seed), &derived);
-        var state: State = undefined;
+        var state: Xxh3State = undefined;
         @memset(std.mem.asBytes(&state), 0xa5);
         state.reset(seed);
         try std.testing.expectEqualSlices(u8, &@as([256]u8, @splat(0)), &state.history.bytes);
@@ -67,169 +92,160 @@ test "stream secret writer matches shared derivation and preserves initialized h
     }
 }
 
-pub const State = struct {
-    accumulator: Accumulator,
-    history: History,
-    total: u64,
-    seed: u64,
-    borrowed_secret: ?[]const u8,
-    derived_secret: [192]u8,
+pub fn reset(self: *Xxh3State, seed: u64) void {
+    self.configure(.{ .seed = seed });
+}
 
-    pub fn reset(self: *State, seed: u64) void {
-        self.configure(.{ .seed = seed });
+pub fn resetSecret(self: *Xxh3State, secret: []const u8) void {
+    self.configure(.{ .secret = secret });
+}
+
+pub fn final64(self: *const Xxh3State) u64 {
+    return @truncate(self.digest(64));
+}
+
+pub fn final128(self: *const Xxh3State) u128 {
+    return self.digest(128);
+}
+
+fn configure(self: *Xxh3State, options: Xxh3Options.Mode) void {
+    // A wrapped byte count can select a short digest, which reads initialized history bytes.
+    self.history = .{};
+    self.accumulator = .{};
+    self.total = 0;
+    self.seed = 0;
+    self.borrowed_secret = null;
+    switch (options) {
+        .seed => |value| {
+            self.seed = value;
+            if (value != 0) writeSeededSecret(&self.derived_secret, value);
+        },
+        .secret => |value| self.borrowed_secret = value,
     }
+}
 
-    pub fn resetSecret(self: *State, secret: []const u8) void {
-        self.configure(.{ .secret = secret });
-    }
+fn secretBytes(self: *const Xxh3State) []const u8 {
+    if (self.borrowed_secret) |secret| return secret;
+    return if (self.seed == 0) default_secret else &self.derived_secret;
+}
 
-    pub fn final64(self: *const State) u64 {
-        return @truncate(self.digest(64));
-    }
-
-    pub fn final128(self: *const State) u128 {
-        return self.digest(128);
-    }
-
-    fn configure(self: *State, options: one_shot.SecretMode) void {
-        // A wrapped byte count can select a short digest, which reads initialized history bytes.
-        self.history = .{};
-        self.accumulator = .{};
-        self.total = 0;
-        self.seed = 0;
-        self.borrowed_secret = null;
-        switch (options) {
-            .seed => |value| {
-                self.seed = value;
-                if (value != 0) writeSeededSecret(&self.derived_secret, value);
-            },
-            .secret => |value| self.borrowed_secret = value,
-        }
-    }
-
-    fn secretBytes(self: *const State) []const u8 {
-        if (self.borrowed_secret) |secret| return secret;
-        return if (self.seed == 0) default_secret else &self.derived_secret;
-    }
-
-    pub fn update(self: *State, input: []const u8) void {
-        self.total +%= @truncate(input.len);
-        // Fixed-size fragments avoid the generic copy path while retaining exact bounds.
-        switch (input.len) {
-            64 => if (self.history.length <= 192) {
-                @memcpy(self.history.bytes[self.history.length..][0..64], input[0..64]);
-                self.history.length += 64;
-                return;
-            },
-            16 => if (self.history.length <= 240) {
-                @memcpy(self.history.bytes[self.history.length..][0..16], input[0..16]);
-                self.history.length += 16;
-                return;
-            },
-            8 => if (self.history.length <= 248) {
-                @memcpy(self.history.bytes[self.history.length..][0..8], input[0..8]);
-                self.history.length += 8;
-                return;
-            },
-            3 => if (self.history.length <= 253) {
-                @memcpy(self.history.bytes[self.history.length..][0..3], input[0..3]);
-                self.history.length += 3;
-                return;
-            },
-            else => {},
-        }
-        if (input.len <= self.history.bytes.len - self.history.length) {
-            @memcpy(self.history.bytes[self.history.length..][0..input.len], input);
-            self.history.length += input.len;
+pub fn update(self: *Xxh3State, input: []const u8) void {
+    self.total +%= @truncate(input.len);
+    // Fixed-size fragments avoid the generic copy path while retaining exact bounds.
+    switch (input.len) {
+        64 => if (self.history.length <= 192) {
+            @memcpy(self.history.bytes[self.history.length..][0..64], input[0..64]);
+            self.history.length += 64;
             return;
-        }
-        self.updateOverflow(input);
-    }
-
-    noinline fn updateOverflow(self: *State, input: []const u8) void {
-        const secret = self.secretBytes();
-        if (input.len == 64 and self.history.length == 256) {
-            // This transition always flushes four stripes; specialize that fixed-size case.
-            @call(
-                .always_inline,
-                Accumulator.appendStripes,
-                .{ &self.accumulator, &self.history.bytes, 4, secret },
-            );
-            @memcpy(self.history.bytes[0..64], input[0..64]);
-            self.history.length = 64;
+        },
+        16 => if (self.history.length <= 240) {
+            @memcpy(self.history.bytes[self.history.length..][0..16], input[0..16]);
+            self.history.length += 16;
             return;
-        }
-        var offset: usize = 0;
-        if (self.history.length != 0) {
-            const needed = self.history.bytes.len - self.history.length;
-            @memcpy(self.history.bytes[self.history.length..], input[0..needed]);
-            offset = needed;
-            self.accumulator.appendStripes(&self.history.bytes, 4, secret);
-            self.history.length = 0;
-        }
-        if (input.len - offset > self.history.bytes.len) {
-            const complete = (input.len - offset - 1) / 64;
-            self.accumulator.appendStripes(input[offset..], complete, secret);
-            offset += complete * 64;
-            // A short final tail can need bytes from this preceding stripe during finalization.
-            @memcpy(self.history.bytes[192..256], input[offset - 64 ..][0..64]);
-        }
-        const tail = input[offset..];
-        @memcpy(self.history.bytes[0..tail.len], tail);
-        self.history.length = tail.len;
+        },
+        8 => if (self.history.length <= 248) {
+            @memcpy(self.history.bytes[self.history.length..][0..8], input[0..8]);
+            self.history.length += 8;
+            return;
+        },
+        3 => if (self.history.length <= 253) {
+            @memcpy(self.history.bytes[self.history.length..][0..3], input[0..3]);
+            self.history.length += 3;
+            return;
+        },
+        else => {},
     }
-
-    fn snapshotAccumulator(self: *const State, secret: []const u8) long.StripeAccumulator {
-        var lanes = self.accumulator.lanes;
-        if (self.history.length >= 64) {
-            const ordinary = (self.history.length - 1) / 64;
-            const stripes_per_block = (secret.len - 64) / 8;
-            var next_stripe = self.accumulator.next_stripe;
-            // A snapshot has at most three ordinary buffered stripes; handle them directly while
-            // keeping the caller's stream unchanged.
-            for (0..ordinary) |index| {
-                lanes.addStripe(
-                    self.history.bytes[index * 64 ..][0..64],
-                    secret[next_stripe * 8 ..][0..64],
-                );
-                next_stripe += 1;
-                if (next_stripe == stripes_per_block) {
-                    lanes.scrambleBlock(secret[secret.len - 64 ..][0..64]);
-                    next_stripe = 0;
-                }
-            }
-            lanes.addStripe(
-                self.history.bytes[self.history.length - 64 ..][0..64],
-                secret[secret.len - 71 ..][0..64],
-            );
-        } else {
-            // Reconstruct the final stripe from the preserved bytes and the current short tail.
-            var stripe: [64]u8 = undefined;
-            const previous = 64 - self.history.length;
-            @memcpy(stripe[0..previous], self.history.bytes[256 - previous ..]);
-            @memcpy(stripe[previous..], self.history.bytes[0..self.history.length]);
-            lanes.addStripe(&stripe, secret[secret.len - 71 ..][0..64]);
-        }
-        return lanes;
+    if (input.len <= self.history.bytes.len - self.history.length) {
+        @memcpy(self.history.bytes[self.history.length..][0..input.len], input);
+        self.history.length += input.len;
+        return;
     }
+    self.updateOverflow(input);
+}
 
-    fn digest(self: *const State, comptime result_bits: u8) u128 {
-        if (result_bits != 64 and result_bits != 128) @compileError(
-            "XXH3 result width must be 64 or 128",
+noinline fn updateOverflow(self: *Xxh3State, input: []const u8) void {
+    const secret = self.secretBytes();
+    if (input.len == 64 and self.history.length == 256) {
+        // This transition always flushes four stripes; specialize that fixed-size case.
+        @call(
+            .always_inline,
+            Accumulator.appendStripes,
+            .{ &self.accumulator, &self.history.bytes, 4, secret },
         );
-        if (self.total <= 240) {
-            const input = self.history.bytes[0..@intCast(self.total)];
-            return one_shot.hashUpTo240(result_bits, input, self.seed, self.borrowed_secret);
-        }
-        const secret = self.secretBytes();
-        const lanes = self.snapshotAccumulator(secret);
-        if (result_bits == 64) return lanes.finish(secret[11..][0..64], self.total *% prime1);
-        return finishWide(lanes, secret, self.total);
+        @memcpy(self.history.bytes[0..64], input[0..64]);
+        self.history.length = 64;
+        return;
     }
-};
+    var offset: usize = 0;
+    if (self.history.length != 0) {
+        const needed = self.history.bytes.len - self.history.length;
+        @memcpy(self.history.bytes[self.history.length..], input[0..needed]);
+        offset = needed;
+        self.accumulator.appendStripes(&self.history.bytes, 4, secret);
+        self.history.length = 0;
+    }
+    if (input.len - offset > self.history.bytes.len) {
+        const complete = (input.len - offset - 1) / 64;
+        self.accumulator.appendStripes(input[offset..], complete, secret);
+        offset += complete * 64;
+        // A short final tail can need bytes from this preceding stripe during finalization.
+        @memcpy(self.history.bytes[192..256], input[offset - 64 ..][0..64]);
+    }
+    const tail = input[offset..];
+    @memcpy(self.history.bytes[0..tail.len], tail);
+    self.history.length = tail.len;
+}
+
+fn snapshotAccumulator(self: *const Xxh3State, secret: []const u8) StripeAccumulator {
+    var lanes = self.accumulator.lanes;
+    if (self.history.length >= 64) {
+        const ordinary = (self.history.length - 1) / 64;
+        const stripes_per_block = (secret.len - 64) / 8;
+        var next_stripe = self.accumulator.next_stripe;
+        // A snapshot has at most three ordinary buffered stripes; handle them directly while
+        // keeping the caller's stream unchanged.
+        for (0..ordinary) |index| {
+            lanes.addStripe(
+                self.history.bytes[index * 64 ..][0..64],
+                secret[next_stripe * 8 ..][0..64],
+            );
+            next_stripe += 1;
+            if (next_stripe == stripes_per_block) {
+                lanes.scrambleBlock(secret[secret.len - 64 ..][0..64]);
+                next_stripe = 0;
+            }
+        }
+        lanes.addStripe(
+            self.history.bytes[self.history.length - 64 ..][0..64],
+            secret[secret.len - 71 ..][0..64],
+        );
+    } else {
+        // Reconstruct the final stripe from the preserved bytes and the current short tail.
+        var stripe: [64]u8 = undefined;
+        const previous = 64 - self.history.length;
+        @memcpy(stripe[0..previous], self.history.bytes[256 - previous ..]);
+        @memcpy(stripe[previous..], self.history.bytes[0..self.history.length]);
+        lanes.addStripe(&stripe, secret[secret.len - 71 ..][0..64]);
+    }
+    return lanes;
+}
+
+fn digest(self: *const Xxh3State, comptime result_bits: u8) u128 {
+    if (result_bits != 64 and result_bits != 128) @compileError(
+        "XXH3 result width must be 64 or 128",
+    );
+    if (self.total <= 240) {
+        const input = self.history.bytes[0..@intCast(self.total)];
+        return one_shot.hashUpTo240(result_bits, input, self.seed, self.borrowed_secret);
+    }
+    const secret = self.secretBytes();
+    const lanes = self.snapshotAccumulator(secret);
+    if (result_bits == 64) return lanes.finish(secret[11..][0..64], self.total *% prime1);
+    return finishWide(lanes, secret, self.total);
+}
 
 // Keep the two-merge path out of the common streaming caller's generated code.
-noinline fn finishWide(lanes: long.StripeAccumulator, secret: []const u8, length: u64) u128 {
+noinline fn finishWide(lanes: StripeAccumulator, secret: []const u8, length: u64) u128 {
     const low = lanes.finish(secret[11..][0..64], length *% prime1);
     const high = lanes.finish(secret[secret.len - 75 ..][0..64], ~(length *% prime2));
     return (@as(u128, high) << 64) | low;
@@ -239,10 +255,10 @@ test "short fragment copies change only their exact history bytes" {
     var input: [272]u8 = undefined;
     for (&input, 0..) |*byte, index| byte.* = @truncate(index * 53 + 7);
     const secret: [137]u8 = @splat(0xa5);
-    for ([_]one_shot.SecretMode{ .{ .seed = 1 }, .{ .secret = &secret } }) |mode| {
+    for ([_]Xxh3Options.Mode{ .{ .seed = 1 }, .{ .secret = &secret } }) |mode| {
         for (0..257) |prefix| {
             for (0..16) |fragment| {
-                var state: State = undefined;
+                var state: Xxh3State = undefined;
                 state.configure(mode);
                 state.update(input[0..prefix]);
                 const before = state.history.bytes;
@@ -266,8 +282,8 @@ test "fragmented updates and snapshots match one-shot seeded and secret modes" {
     for (&bytes, 0..) |*byte, index| byte.* = @truncate(index * 53 + 7);
     var secret: [137]u8 = undefined;
     for (&secret, 0..) |*byte, index| byte.* = @truncate(index * 71 + 13);
-    for ([_]one_shot.SecretMode{ .{ .seed = 1 }, .{ .secret = &secret } }) |mode| {
-        var state: State = undefined;
+    for ([_]Xxh3Options.Mode{ .{ .seed = 1 }, .{ .secret = &secret } }) |mode| {
+        var state: Xxh3State = undefined;
         state.configure(mode);
         var offset: usize = 0;
         while (offset < bytes.len) {
@@ -354,9 +370,9 @@ test "16-byte fragments and snapshots cross history and secret-block boundaries"
             .secret128 = 0xdc6f45532e637a4f6b9bc359710fbd45,
         },
     };
-    var seeded: State = undefined;
+    var seeded: Xxh3State = undefined;
     seeded.reset(1);
-    var custom: State = undefined;
+    var custom: Xxh3State = undefined;
     custom.resetSecret(&secret);
     var offset: usize = 0;
     for (cases) |case| {
@@ -381,7 +397,7 @@ test "16-byte fragments and snapshots cross history and secret-block boundaries"
 test "secret-mode copies diverge without retaining the input" {
     var secret: [137]u8 = undefined;
     for (&secret, 0..) |*byte, index| byte.* = @truncate(index * 71 + 13);
-    var original: State = undefined;
+    var original: Xxh3State = undefined;
     original.resetSecret(&secret);
     var prefix = [_]u8{ 'a', 'b' };
     original.update(&prefix);
@@ -389,7 +405,7 @@ test "secret-mode copies diverge without retaining the input" {
     @memset(&prefix, 0);
     original.update("c");
     copy.update("d");
-    const options: one_shot.SecretMode = .{ .secret = &secret };
+    const options: Xxh3Options.Mode = .{ .secret = &secret };
     try std.testing.expectEqual(one_shot.hash(128, "abc", options), original.digest(128));
     try std.testing.expectEqual(one_shot.hash(128, "abd", options), copy.digest(128));
     try std.testing.expectEqual(original.digest(128), original.digest(128));
@@ -410,35 +426,52 @@ test "synthetic counter wraps preserve reference snapshots and independent copie
         suffix: usize,
         expected64: [3]u64,
         expected128: [3]u128,
-    }{ .{ .prefix = 256, .gap = 1, .suffix = 1, .expected64 = .{
-        0x2d06800538d394c2, 0x4dc5b0cc826f6703,
-        0xd7e03ade0d5d1fea,
-    }, .expected128 = .{
-        0x99aa06d3014798d86001c324468d497f, 0xd9265cc53bb2b9ae6131b78f753823cd,
-        0x727fc9ec235130efbe9fa3050315264a,
-    } }, .{ .prefix = 257, .gap = 3, .suffix = 19, .expected64 = .{
-        0x6d0c544a5f0e3cbf, 0x833956aa5ba853ef,
-        0x8c7194b5e7da571c,
-    }, .expected128 = .{
-        0x6216cf3d5da61b626e2708ecb6ddf8f0, 0x0d1dd0488b0be275f7c39b2165dee777,
-        0x961b5b6d59208d6d3e660cb7577ecb14,
-    } }, .{ .prefix = 65, .gap = 1, .suffix = 241, .expected64 = .{
-        0x03cd521d1b70148c, 0x34e22829e76ae36a,
-        0x52b104c974d7d3c3,
-    }, .expected128 = .{
-        0x2ed31ad641c7acd89efeef0e7d50c9d6, 0x37634a793f72be644bf8c37564f95183,
-        0x15f9f54976badc4d256ec78109281249,
-    } }, .{ .prefix = 257, .gap = 2, .suffix = 243, .expected64 = .{
-        0xa945ea294afaf513, 0x958ab9076b00a78c,
-        0x409ae681b5061435,
-    }, .expected128 = .{
-        0x2e861d28f20056c1a945ea294afaf513, 0x8a91be4ea627cbfe958ab9076b00a78c,
-        0x6dbcb0b026e5aa0a409ae681b5061435,
-    } } };
-    const modes = [_]one_shot.SecretMode{ .{ .seed = 0 }, .{ .seed = 1 }, .{ .secret = &secret } };
+    }{
+        .{
+            .prefix = 256,
+            .gap = 1,
+            .suffix = 1,
+            .expected64 = .{ 0x2d06800538d394c2, 0x4dc5b0cc826f6703, 0xd7e03ade0d5d1fea },
+            .expected128 = .{
+                0x99aa06d3014798d86001c324468d497f, 0xd9265cc53bb2b9ae6131b78f753823cd,
+                0x727fc9ec235130efbe9fa3050315264a,
+            },
+        },
+        .{
+            .prefix = 257,
+            .gap = 3,
+            .suffix = 19,
+            .expected64 = .{ 0x6d0c544a5f0e3cbf, 0x833956aa5ba853ef, 0x8c7194b5e7da571c },
+            .expected128 = .{
+                0x6216cf3d5da61b626e2708ecb6ddf8f0, 0x0d1dd0488b0be275f7c39b2165dee777,
+                0x961b5b6d59208d6d3e660cb7577ecb14,
+            },
+        },
+        .{
+            .prefix = 65,
+            .gap = 1,
+            .suffix = 241,
+            .expected64 = .{ 0x03cd521d1b70148c, 0x34e22829e76ae36a, 0x52b104c974d7d3c3 },
+            .expected128 = .{
+                0x2ed31ad641c7acd89efeef0e7d50c9d6, 0x37634a793f72be644bf8c37564f95183,
+                0x15f9f54976badc4d256ec78109281249,
+            },
+        },
+        .{
+            .prefix = 257,
+            .gap = 2,
+            .suffix = 243,
+            .expected64 = .{ 0xa945ea294afaf513, 0x958ab9076b00a78c, 0x409ae681b5061435 },
+            .expected128 = .{
+                0x2e861d28f20056c1a945ea294afaf513, 0x8a91be4ea627cbfe958ab9076b00a78c,
+                0x6dbcb0b026e5aa0a409ae681b5061435,
+            },
+        },
+    };
+    const modes = [_]Xxh3Options.Mode{ .{ .seed = 0 }, .{ .seed = 1 }, .{ .secret = &secret } };
     for (cases) |case| {
         for (modes, 0..) |mode, index| {
-            var state: State = undefined;
+            var state: Xxh3State = undefined;
             state.configure(mode);
             state.update(input[0..case.prefix]);
             state.total = 0 -% case.gap;

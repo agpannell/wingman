@@ -15,7 +15,7 @@
 //! The XXH3 types also accept `Xxh3Options` for a custom secret. Complete calls borrow it only
 //! during the call. A streaming state borrows it until successful reinitialization or the last use
 //! of every copy; keep it alive, immutable and disjoint from each mutable state. See
-//! `Xxh3_64.initWithOptions` for a module-context example and the family guide for more modes.
+//! `Xxh3_64.resetWithOptions` for a module-context example and the family guide for more modes.
 //!
 //! ```zig
 //! const std = @import("std");
@@ -23,27 +23,33 @@
 //!
 //! test "stream a seeded XXH3-64 digest" {
 //!     var state: xxhash.Xxh3_64 = undefined;
-//!     state.init(1);
+//!     state.reset(1);
 //!     state.update("a");
 //!     state.update("bc");
 //!     try std.testing.expectEqual(xxhash.Xxh3_64.hashSeeded(1, "abc"), state.final());
 //! }
 //! ```
 
+const core = @import("xxhash/xxh3.zig");
+const Xxh3State = @import("xxhash/Xxh3State.zig");
+const small = @import("xxhash/xxh3_small.zig");
+const StripeAccumulator = @import("xxhash/StripeAccumulator.zig");
+const byte_ranges = @import("common/byte_ranges.zig");
+
 pub const Xxh32 = @import("xxhash/Xxh32.zig");
 pub const Xxh64 = @import("xxhash/Xxh64.zig");
 pub const Xxh3_64 = @import("xxhash/Xxh3_64.zig");
 pub const Xxh3_128 = @import("xxhash/Xxh3_128.zig");
-pub const Xxh3Options = @import("xxhash/xxh3.zig").Xxh3Options;
+pub const Xxh3Options = @import("xxhash/Xxh3Options.zig");
 
 test {
     _ = Xxh32;
     _ = Xxh64;
     _ = Xxh3_64;
     _ = Xxh3_128;
-    _ = @import("xxhash/xxh3.zig");
-    _ = @import("xxhash/xxh3_stream.zig");
-    _ = @import("xxhash/xxh3_small.zig");
-    _ = @import("xxhash/xxh3_long.zig");
-    _ = @import("common/byte_ranges.zig");
+    _ = core;
+    _ = Xxh3State;
+    _ = small;
+    _ = StripeAccumulator;
+    _ = byte_ranges;
 }
