@@ -1,8 +1,11 @@
-//! Bounded participant scratch and ordered subtree results for parallel updates.
+//! Hashes admitted, aligned power-of-two subtrees in caller-owned parallel workspaces. The hasher
+//! owns byte-range admission, task submission and joining; these jobs compute ordered subtree
+//! children without deciding whether their final parent is the root.
 const std = @import("std");
 const compression = @import("compression.zig");
-const ChunkState = @import("chunk.zig").ChunkState;
-const Output = compression.Output;
+const ChunkState = @import("ChunkState.zig");
+const ParallelWorkspace = @import("ParallelWorkspace.zig");
+const CompressionInput = @import("CompressionInput.zig");
 const ChainingValue = compression.Cv;
 const chunk_bytes = compression.chunk_bytes;
 
@@ -15,120 +18,94 @@ pub const ParallelOptions = struct {
     minimum_job_bytes: usize = 64 * 1024,
 };
 
-/// Address-stable scratch for one parallel participant, including the calling thread. Reserve a
-/// slice within the application's worker budget. No allocator is retained. Input pointers retire
-/// before return, but key-derived words remain until overwritten or explicitly cleared.
-pub const Worker = struct {
-    key: ChainingValue,
-    mode: u32,
-    input: []const u8,
-    counter: u64,
-    result: [2]ChainingValue,
-    batch: [128]ChainingValue,
-    messages: [256]u32 align(64),
+pub fn run(workspace: *ParallelWorkspace, comptime kernel: compression.Kernel) void {
+    workspace.result = subtree(
+        workspace,
+        kernel,
+        workspace.input.ptr,
+        workspace.input.len / chunk_bytes,
+        workspace.counter,
+    );
+}
 
-    /// Erases the entire reservation, including key-derived scratch. No initialization is needed
-    /// before reuse by another parallel operation.
-    pub fn clear(self: *Worker) void {
-        const bytes: [*]volatile u8 = @ptrCast(self);
-        for (bytes[0..@sizeOf(Worker)]) |*byte| byte.* = 0;
+pub fn runNative(workspace: *ParallelWorkspace) void {
+    run(workspace, compression.preferred);
+}
+
+pub fn runScalar(workspace: *ParallelWorkspace) void {
+    run(workspace, .scalar);
+}
+
+fn subtree(
+    workspace: *ParallelWorkspace,
+    comptime kernel: compression.Kernel,
+    input: [*]const u8,
+    count: usize,
+    counter: u64,
+) [2]ChainingValue {
+    std.debug.assert(count >= 2 and std.math.isPowerOfTwo(count));
+    if (count > workspace.batch.len) {
+        const half = count / 2;
+        const left = subtree(workspace, kernel, input, half, counter);
+        const right = subtree(workspace, kernel, input + half * chunk_bytes, half, counter + half);
+        return .{
+            parent(workspace, kernel, left[0], left[1]),
+            parent(workspace, kernel, right[0], right[1]),
+        };
     }
 
-    fn run(self: *Worker, comptime kernel: compression.Kernel) void {
-        self.result = self.subtree(
-            kernel,
-            self.input.ptr,
-            self.input.len / chunk_bytes,
-            self.counter,
+    if (kernel == .scalar) {
+        for (0..count) |i| {
+            var chunk: ChunkState = undefined;
+            chunk.reset(workspace.key, counter + i);
+            chunk.update(.scalar, input[i * chunk_bytes ..][0..chunk_bytes], workspace.mode);
+            workspace.batch[i] = chunk.compressionInput(workspace.mode).chainingValue(.scalar);
+        }
+    } else {
+        compression.batchChunks(
+            workspace.key,
+            input,
+            counter,
+            workspace.mode,
+            count,
+            &workspace.messages,
+            &workspace.batch,
         );
     }
 
-    fn runNative(self: *Worker) void {
-        self.run(compression.preferred);
-    }
-
-    fn runScalar(self: *Worker) void {
-        self.run(.scalar);
-    }
-
-    fn subtree(
-        self: *Worker,
-        comptime kernel: compression.Kernel,
-        input: [*]const u8,
-        count: usize,
-        counter: u64,
-    ) [2]ChainingValue {
-        std.debug.assert(count >= 2 and std.math.isPowerOfTwo(count));
-        if (count > self.batch.len) {
-            const half = count / 2;
-            const left = self.subtree(kernel, input, half, counter);
-            const right = self.subtree(kernel, input + half * chunk_bytes, half, counter + half);
-            return .{
-                self.parent(kernel, left[0], left[1]),
-                self.parent(kernel, right[0], right[1]),
-            };
-        }
-
+    // Keep the last two children separate so finalization can still apply ROOT to their parent.
+    var remaining = count;
+    while (remaining > 2) : (remaining /= 2) {
         if (kernel == .scalar) {
-            for (0..count) |i| {
-                var chunk: ChunkState = undefined;
-                chunk.reset(self.key, counter + i);
-                chunk.update(.scalar, input[i * chunk_bytes ..][0..chunk_bytes], self.mode);
-                self.batch[i] = chunk.output(self.mode).chaining(.scalar);
+            for (0..remaining / 2) |i| {
+                const left = workspace.batch[i * 2];
+                const right = workspace.batch[i * 2 + 1];
+                workspace.batch[i] = parent(workspace, kernel, left, right);
             }
         } else {
-            compression.batchChunks(
-                self.key,
-                input,
-                counter,
-                self.mode,
-                count,
-                &self.messages,
-                &self.batch,
+            compression.batchParents(
+                workspace.key,
+                &workspace.batch,
+                workspace.mode,
+                remaining / 2,
+                &workspace.messages,
+                &workspace.batch,
             );
         }
-
-        // Keep the last two children separate so finalization can still apply ROOT to their parent.
-        var remaining = count;
-        while (remaining > 2) : (remaining /= 2) {
-            if (kernel == .scalar) {
-                for (0..remaining / 2) |i| {
-                    const left = self.batch[i * 2];
-                    const right = self.batch[i * 2 + 1];
-                    self.batch[i] = self.parent(kernel, left, right);
-                }
-            } else {
-                compression.batchParents(
-                    self.key,
-                    &self.batch,
-                    self.mode,
-                    remaining / 2,
-                    &self.messages,
-                    &self.batch,
-                );
-            }
-        }
-        return self.batch[0..2].*;
     }
+    return workspace.batch[0..2].*;
+}
 
-    fn parent(
-        self: *const Worker,
-        comptime kernel: compression.Kernel,
-        left: ChainingValue,
-        right: ChainingValue,
-    ) ChainingValue {
-        return Output.parent(self.key, left, right, self.mode).chaining(kernel);
-    }
-};
-
-// The state owner schedules these existing functions without exposing worker internals.
-pub const run = Worker.run;
-pub const runNative = Worker.runNative;
-pub const runScalar = Worker.runScalar;
-
-test "clear erases the complete worker reservation" {
-    var worker: Worker = undefined;
-    @memset(std.mem.asBytes(&worker), 0xa5);
-    worker.clear();
-    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&worker), 0));
+fn parent(
+    workspace: *const ParallelWorkspace,
+    comptime kernel: compression.Kernel,
+    left: ChainingValue,
+    right: ChainingValue,
+) ChainingValue {
+    return CompressionInput.parent(
+        workspace.key,
+        left,
+        right,
+        workspace.mode,
+    ).chainingValue(kernel);
 }

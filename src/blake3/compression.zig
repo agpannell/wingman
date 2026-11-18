@@ -1,4 +1,11 @@
-//! Block compression, target-selected SIMD batches and root-output descriptors.
+//! BLAKE3 block compression and target-selected chunk/parent batches. A 64-byte message block,
+//! incoming eight-word chaining value, counter, length and flags enter seven mixing rounds. The
+//! first eight output words advance an interior node; ROOT compression supplies digest/XOF bytes.
+//!
+//! Two SIMD layouts serve different work: four-word rows parallelize the four mixes of one block,
+//! while column vectors place the same algorithm word from independent messages in separate lanes.
+//! Chunk/parent batches transpose caller data into those columns and back. Algorithm words are
+//! host-order integers; external message and output bytes use little-endian encoding.
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -6,91 +13,7 @@ const testing = std.testing;
 pub const block_bytes = 64;
 pub const chunk_bytes = 1024;
 const blocks_per_chunk = chunk_bytes / block_bytes;
-const Digest = [32]u8;
-const compression = @This();
-const ChainingValue = Cv;
-const MessageBlock = Block;
-const mode_flags = flags;
-
-pub const Output = struct {
-    cv: ChainingValue,
-    block: MessageBlock,
-    counter: u64,
-    length: u32,
-    flags: u32,
-
-    pub inline fn chaining(self: Output, comptime kernel: compression.Kernel) ChainingValue {
-        return compression.chaining(
-            kernel,
-            self.cv,
-            self.block,
-            self.counter,
-            self.length,
-            self.flags,
-        );
-    }
-
-    pub inline fn parent(
-        key: ChainingValue,
-        left: ChainingValue,
-        right: ChainingValue,
-        mode: u32,
-    ) Output {
-        return .{
-            .cv = key,
-            .block = left ++ right,
-            .counter = 0,
-            .length = block_bytes,
-            .flags = mode | mode_flags.parent,
-        };
-    }
-
-    pub inline fn rootDigest(self: Output, comptime kernel: compression.Kernel) Digest {
-        const cv = compression.chaining(
-            kernel,
-            self.cv,
-            self.block,
-            0,
-            self.length,
-            self.flags | mode_flags.root,
-        );
-        var result: Digest = undefined;
-        compression.storeCv(cv, &result);
-        return result;
-    }
-
-    pub fn writeRootBytes(
-        self: Output,
-        comptime kernel: compression.Kernel,
-        offset: u64,
-        out: []u8,
-    ) void {
-        var counter = offset / block_bytes;
-        var skip: usize = @intCast(offset % block_bytes);
-        var remaining = out;
-        while (remaining.len != 0) {
-            const words = compression.compress(
-                kernel,
-                self.cv,
-                self.block,
-                counter,
-                self.length,
-                self.flags | mode_flags.root,
-            );
-            var bytes: [block_bytes]u8 = undefined;
-            for (words, 0..) |word, i| {
-                const word_offset = i * @sizeOf(u32);
-                std.mem.writeInt(u32, bytes[word_offset..][0..4], word, .little);
-            }
-
-            const count = @min(remaining.len, block_bytes - skip);
-            @memcpy(remaining[0..count], bytes[skip..][0..count]);
-            remaining = remaining[count..];
-            counter += 1;
-            skip = 0;
-        }
-    }
-};
+const CompressionInput = @import("CompressionInput.zig");
 
 /// Eight chaining words in algorithm order, independent of host byte order.
 pub const Cv = [8]u32;
@@ -122,8 +45,13 @@ pub const flags = struct {
     pub const derive_material: u32 = 64;
 };
 
-/// Compile-time compression choice for the native owner and independent checks.
-pub const Kernel = enum { scalar, row };
+/// Selects one block's mixing layout. Chunk/parent batch widths follow the target separately.
+pub const Kernel = enum {
+    /// Scalar u32 mixing, independent of the explicit row-vector implementation.
+    scalar,
+    /// Four-word rows perform the four independent mixes of one block together.
+    row,
+};
 
 /// Row vectors are profitable candidates on targets with native four-word SIMD.
 pub const preferred: Kernel = switch (builtin.cpu.arch) {
@@ -177,7 +105,8 @@ pub inline fn loadBlock(bytes: []const u8) Block {
 
 /// Writes all chaining words as exactly 32 little-endian bytes.
 pub fn storeCv(cv: Cv, out: *[32]u8) void {
-    for (cv, 0..) |word, i| std.mem.writeInt(u32, out[i * 4 ..][0..4], word, .little);
+    for (cv, 0..) |word, i|
+        std.mem.writeInt(u32, out[i * 4 ..][0..4], word, .little);
 }
 
 /// Compresses one message block and returns all sixteen output words. `cv` is the incoming chaining
@@ -217,7 +146,8 @@ pub fn MessageWorkspace(comptime lanes: usize) type {
         @compileError("BLAKE3 batch width must be 4, 8 or 16");
     }
     return struct {
-        /// Backing storage; target-specific kernels may interpret its bytes as scratch records.
+        /// Ordinary batches use words[word][message lane]; target kernels may reuse these bytes as
+        /// scratch records. Read results from the output argument.
         words: [16]@Vector(lanes, u32),
     };
 }
@@ -240,6 +170,8 @@ pub noinline fn chunks(
         for (&result, 0..) |*value, i| value.* = @intCast(i);
         break :blk result;
     };
+    // Each lane hashes a successive chunk. Add lane offsets to the low counter word and carry into
+    // the high word independently; a batch can straddle a 2^32 chunk-index boundary.
     const base: Word = @splat(@truncate(counter));
     const low = base +% increments;
     const carry = @select(u32, low < base, @as(Word, @splat(1)), @as(Word, @splat(0)));
@@ -370,7 +302,9 @@ pub noinline fn parents(
     noalias messages: *MessageWorkspace(lanes),
     out: *[lanes]Cv,
 ) void {
-    // These are host-native words, so byte-order correction differs from external chunks.
+    // Load every child before writing any parent, so one fixed-width call accepts arbitrary
+    // overlap. Children already contain host-order words; undo external-byte load correction on
+    // big-endian targets before compression.
     loadColumns(lanes, @ptrCast(input), block_bytes, 0, messages);
     if (builtin.cpu.arch.endian() != .little) {
         inline for (&messages.words) |*word| word.* = @byteSwap(word.*);
@@ -444,20 +378,20 @@ pub fn batchParents(
             var remaining = crossing + 1;
             while (remaining != 0) {
                 remaining -= 1;
-                out[remaining] = Output.parent(
+                out[remaining] = CompressionInput.parent(
                     key,
                     input[remaining * 2],
                     input[remaining * 2 + 1],
                     mode,
-                ).chaining(preferred);
+                ).chainingValue(preferred);
             }
             for (crossing + 1..count) |i| {
-                out[i] = Output.parent(
+                out[i] = CompressionInput.parent(
                     key,
                     input[i * 2],
                     input[i * 2 + 1],
                     mode,
-                ).chaining(preferred);
+                ).chainingValue(preferred);
             }
             return;
         }
@@ -484,32 +418,26 @@ pub fn batchParents(
     for (0..count) |i| {
         const left = input[i * 2];
         const right = input[i * 2 + 1];
-        out[i] = Output.parent(key, left, right, mode).chaining(preferred);
+        out[i] = CompressionInput.parent(key, left, right, mode).chainingValue(preferred);
     }
 }
 
 const schedule: [7][16]u8 = makeSchedule();
 
 // Four independent mixes visit columns first, then diagonals, in every round.
-const column_round: [4][4]usize = .{ .{
-    0, 1, 2, 3,
-}, .{
-    4, 5, 6, 7,
-}, .{
-    8, 9, 10, 11,
-}, .{
-    12, 13, 14, 15,
-} };
+const column_round: [4][4]usize = .{
+    .{ 0, 1, 2, 3 },
+    .{ 4, 5, 6, 7 },
+    .{ 8, 9, 10, 11 },
+    .{ 12, 13, 14, 15 },
+};
 
-const diagonal_round: [4][4]usize = .{ .{
-    0, 1, 2, 3,
-}, .{
-    5, 6, 7, 4,
-}, .{
-    10, 11, 8, 9,
-}, .{
-    15, 12, 13, 14,
-} };
+const diagonal_round: [4][4]usize = .{
+    .{ 0, 1, 2, 3 },
+    .{ 5, 6, 7, 4 },
+    .{ 10, 11, 8, 9 },
+    .{ 15, 12, 13, 14 },
+};
 
 fn makeSchedule() [7][16]u8 {
     const permutation = [16]u8{ 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8 };
@@ -575,6 +503,8 @@ fn scalar(cv: Cv, block: Block, counter: u64, length: u32, block_flags: u32) Blo
     return state;
 }
 
+// One four-word row of the 4x4 compression state. mix runs its four column operations together;
+// rotating b/c/d turns those columns into diagonals for the second half of each round.
 const Row = @Vector(4, u32);
 
 inline fn row(cv: Cv, block: Block, counter: u64, length: u32, block_flags: u32) Block {
@@ -642,6 +572,9 @@ inline fn rowRounds(
     }
 }
 
+// Repeat a four-word selector within each independent row group. Width 8 holds two compression
+// states. Nonnegative indices select a; ~index selects b, so second-source offsets subtract base.
+// For example, {1,2,3,0} becomes {1,2,3,0,5,6,7,4}, rotating each row independently.
 fn rowMask(comptime width: usize, comptime mask: [4]i32) [width]i32 {
     var result: [width]i32 = undefined;
     for (0..width) |i| {
@@ -654,11 +587,16 @@ fn rowMask(comptime width: usize, comptime mask: [4]i32) [width]i32 {
 
 const Word16 = @Vector(16, u32);
 
+// Four vectors after transposing each four-word bank of four source rows. Fields a/b/c/d hold
+// columns 0/1/2/3; wider vectors carry another independent 4x4 bank every four lanes.
 fn Quad(comptime lanes: usize) type {
     const Word = @Vector(lanes, u32);
     return struct { a: Word, b: Word, c: Word, d: Word };
 }
 
+// out.words[word][lane] receives that word from one message. stride is the byte distance between
+// messages; position selects their block. Four-row transposes and quarter gathers extend the same
+// layout to 4, 8 or 16 messages without scalar word-at-a-time loads.
 inline fn loadColumns(
     comptime lanes: usize,
     noalias input: [*]const u8,
@@ -712,6 +650,7 @@ inline fn loadColumns(
     }
 }
 
+// Reverse the word/lane transpose: out[lane][word] becomes one complete chaining value.
 inline fn storeColumns(
     comptime lanes: usize,
     cv: *const [8]@Vector(lanes, u32),
@@ -721,9 +660,12 @@ inline fn storeColumns(
     const b = transposeQuad(lanes, cv[4], cv[5], cv[6], cv[7]);
     if (lanes == 4) {
         inline for (.{ "a", "b", "c", "d" }, 0..) |field, lane| {
-            const words = @shuffle(u32, @field(a, field), @field(b, field), [8]i32{
-                0, 1, 2, 3, -1, -2, -3, -4,
-            });
+            const words = @shuffle(
+                u32,
+                @field(a, field),
+                @field(b, field),
+                [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 },
+            );
             const destination: *align(1) @Vector(8, u32) = @ptrCast(&out[lane]);
             destination.* = words;
         }
@@ -761,6 +703,8 @@ inline fn loadQuad(comptime lanes: usize, input: [*]const u8, stride: usize) Qua
     return transposeQuad(lanes, a, b, c, d);
 }
 
+// Within each bank, [a0 a1 a2 a3], [b0 b1 b2 b3], ... become the column vectors [a0 b0 c0 d0], [a1
+// b1 c1 d1], ... . The same exchanges operate on all banks together.
 inline fn transposeQuad(
     comptime lanes: usize,
     a: @Vector(lanes, u32),
@@ -785,6 +729,10 @@ inline fn loadVector(comptime lanes: usize, bytes: [*]const u8) @Vector(lanes, u
     return if (builtin.cpu.arch.endian() == .little) native.* else @byteSwap(native.*);
 }
 
+// Interleave groups from matching halves of each independent bank in a and b. group and bank count
+// u32 lanes; half selects the low (0) or high (1) half within each bank. For bank=4, group=1,
+// half=0, the first bank is [a0,b0,a1,b1]; group=2 gives [a0,a1,b0,b1]. @shuffle encodes a lane
+// from b as the bitwise complement of its index.
 inline fn zip(
     comptime lanes: usize,
     comptime group: usize,
@@ -809,6 +757,8 @@ inline fn zip(
     return @shuffle(u32, a, b, mask);
 }
 
+// Gather quarters 0/2 (half=0) or 1/3 (half=1) from a, then the same quarters from b. These
+// four-word groups assemble or split the 16-message column layout.
 inline fn quarters(comptime half: usize, a: Word16, b: Word16) Word16 {
     const mask: [16]i32 = blk: {
         if (half == 0) {
@@ -819,6 +769,8 @@ inline fn quarters(comptime half: usize, a: Word16, b: Word16) Word16 {
     return @shuffle(u32, a, b, mask);
 }
 
+// Unlike four-word row SIMD, every lane here is an independent message: cv[word][lane] and
+// message.words[word][lane] refer to the same message throughout all seven rounds.
 inline fn laneCompress(
     comptime lanes: usize,
     cv: *[8]@Vector(lanes, u32),
@@ -1052,12 +1004,19 @@ fn asmQuarter(
 // All addressable chunk scratch lives in the supplied message workspace. Transpose rows and
 // algorithm state use fixed registers; no message matrix reaches memory.
 const ChunkWorkspace16 = extern struct {
+    /// Eight chaining-word columns, one u32 per independent chunk lane.
     cv: [8][16]u32 align(64),
+    /// Low/high chunk-index word columns, including per-lane carry.
     counters: [2][16]u32 align(64),
+    /// Hashing-mode bits; the assembled loop adds the first/last-block flags.
     mode: u32,
+    /// First four IV words, broadcast into the third row of every compression state.
     initial: [4]u32,
+    /// Temporary pointer to sixteen complete chunks, retired when the kernel clears scratch.
     input: [*]const u8,
+    /// Two-source 64-bit lane indices used to gather four-word groups into message columns.
     permutations: [2][8]u64 align(64),
+    /// Copied mode key, broadcast for the first block of every chunk.
     key: Cv,
 };
 

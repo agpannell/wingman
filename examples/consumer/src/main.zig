@@ -1270,23 +1270,23 @@ test "BLAKE3 keyed and derived modes own retained state" {
     _ = try state.hash("abc");
 }
 
-test "BLAKE3 public parallel API permits inline provider and retires workers" {
+test "BLAKE3 public parallel API permits inline provider and retires input borrows" {
     const input = try std.testing.allocator.alloc(u8, 262144);
     defer std.testing.allocator.free(input);
     for (input, 0..) |*byte, index| byte.* = @intCast(index % 251);
     const state = try std.testing.allocator.create(blake3.Hasher);
     defer std.testing.allocator.destroy(state);
     defer state.clear();
-    const workers = try std.testing.allocator.alloc(blake3.Worker, 4);
-    defer std.testing.allocator.free(workers);
-    defer for (workers) |*worker| worker.clear();
+    const workspaces = try std.testing.allocator.alloc(blake3.ParallelWorkspace, 4);
+    defer std.testing.allocator.free(workspaces);
+    defer for (workspaces) |*workspace| workspace.clear();
     state.reset();
-    try state.updateParallel(std.Io.failing, input, workers, .{});
+    try state.updateParallel(std.Io.failing, input, workspaces, .{});
     var expected: blake3.Digest = undefined;
     std.crypto.hash.Blake3.hash(input, &expected, .{});
     try std.testing.expectEqual(expected, state.final());
-    for (workers) |worker|
-        try std.testing.expectEqual(0, worker.input.len);
+    for (workspaces) |workspace|
+        try std.testing.expectEqual(0, workspace.input.len);
 }
 
 test "LZ4 literal wire fixed counts exact extent and spare capacity" {

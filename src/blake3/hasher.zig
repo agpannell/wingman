@@ -1,17 +1,20 @@
-//! Streaming tree admission, snapshots, mode initialization and parallel orchestration.
+//! Incremental BLAKE3 hashing: input admission, binary tree reduction, snapshots and explicit
+//! parallel updates. Hasher and ScalarHasher specialize the same state for a compile-time kernel.
+//! Completed chunks become chaining values; final compression remains deferred until the root is
+//! known. No caller bytes are retained after an operation returns.
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 const compression = @import("compression.zig");
 const parallel = @import("parallel.zig");
 const fixtures = @import("fixtures.zig");
-const ChunkState = @import("chunk.zig").ChunkState;
-const Output = compression.Output;
+const ChunkState = @import("ChunkState.zig");
+const CompressionInput = @import("CompressionInput.zig");
 const ChainingValue = compression.Cv;
 const block_bytes = compression.block_bytes;
 const chunk_bytes = compression.chunk_bytes;
 const mode_flags = compression.flags;
-const Worker = parallel.Worker;
+const ParallelWorkspace = @import("ParallelWorkspace.zig");
 const ParallelOptions = parallel.ParallelOptions;
 const vector_key = fixtures.key;
 const vector_context = fixtures.context;
@@ -30,42 +33,63 @@ pub const key_length = 32;
 /// Full default digest, with no framing or domain prefix supplied by this library.
 pub const Digest = [digest_length]u8;
 
-/// Algorithm-supported input/output range overflow, diagnosed before mutation.
-pub const Error = error{SizeOverflow};
+/// An input byte count or requested output range exceeds the algorithm's u64 limits.
+pub const Error = error{
+    /// Input length or the exclusive end of an output range cannot be represented as u64.
+    SizeOverflow,
+};
 
-/// Parallel hashing also propagates provider cancellation after acquiring every borrowed worker.
-/// Reset the hasher before reuse after `Canceled`.
+/// Parallel hashing can also return provider cancellation after joining every acquired task. Reset
+/// the hasher before reuse after `Canceled`.
 pub const ParallelError = Error || std.Io.Cancelable;
 
 /// Hashing state selected for the compile-time CPU target; construct it at its final address. For
-/// one buffer, use [hash](#wingman.blake3.state.State.hash). For a stream, call
-/// [reset](#wingman.blake3.state.State.reset), [update](#wingman.blake3.state.State.update) and
-/// [final](#wingman.blake3.state.State.final). Start keyed hashing with
-/// [resetKeyed](#wingman.blake3.state.State.resetKeyed), or key derivation with
-/// [resetDerive](#wingman.blake3.state.State.resetDerive).
-/// [finalizeSeek](#wingman.blake3.state.State.finalizeSeek) copies extended output, and
-/// [updateParallel](#wingman.blake3.state.State.updateParallel) uses supplied workers.
-/// [clear](#wingman.blake3.state.State.clear) erases retained state. All methods allocate nothing
-/// and retain no input; `ScalarHasher` provides the same methods. The `update`, `resetKeyed` and
-/// `finalizeSeek` pages include executable examples.
-pub const Hasher = State(compression.preferred);
+/// one buffer, use [hash](#wingman.blake3.hasher.HasherFor.hash). For a stream, call
+/// [reset](#wingman.blake3.hasher.HasherFor.reset),
+/// [update](#wingman.blake3.hasher.HasherFor.update) and
+/// [final](#wingman.blake3.hasher.HasherFor.final). Start keyed hashing with
+/// [resetKeyed](#wingman.blake3.hasher.HasherFor.resetKeyed), or key derivation with
+/// [resetDerive](#wingman.blake3.hasher.HasherFor.resetDerive).
+/// [finalizeSeek](#wingman.blake3.hasher.HasherFor.finalizeSeek) copies extended output, and
+/// [updateParallel](#wingman.blake3.hasher.HasherFor.updateParallel) uses supplied workspaces.
+/// [clear](#wingman.blake3.hasher.HasherFor.clear) erases retained state. All methods allocate
+/// nothing and retain no input; `ScalarHasher` provides the same methods. The `update`,
+/// `resetKeyed` and `finalizeSeek` pages include executable examples.
+pub const Hasher = HasherFor(compression.preferred);
 
 /// Portable scalar state with the same methods and ownership contract as `Hasher`. Use it when a
 /// scalar implementation is required independently of the selected CPU features.
-pub const ScalarHasher = State(.scalar);
+pub const ScalarHasher = HasherFor(.scalar);
 
-fn State(comptime kernel: compression.Kernel) type {
+/// Incremental BLAKE3 state specialized for one compression kernel. The current chunk, ordered
+/// subtree stack and batch scratch belong to this state. Public callers choose
+/// [Hasher](#wingman.blake3.Hasher) or [ScalarHasher](#wingman.blake3.ScalarHasher).
+///
+/// Initialize and modify it through the reset/update methods. Finalization returns snapshots; clear
+/// erases the complete reservation, including retained key-derived scratch. Copies of initialized
+/// state continue independently and own their copied key-derived values; clear each sensitive copy
+/// separately.
+fn HasherFor(comptime kernel: compression.Kernel) type {
     return struct {
         const Self = @This();
         const batch_capacity = if (kernel == .scalar) 2 else @max(2, compression.max_lanes * 8);
 
+        /// Copied chaining key: IV for unkeyed/context hashing, decoded caller/context key
+        /// otherwise.
         key: ChainingValue,
+        /// Current chunk's chaining words, pending final block and zero-based chunk index.
         chunk: ChunkState,
+        /// Accepted input bytes in this stream. Update checks u64 overflow before mutation.
         total_bytes: u64,
+        /// Unkeyed (zero), keyed, derivation-context or derivation-material flags.
         mode: u32,
+        /// Initialized prefix length of stack, measured in chaining values.
         stack_len: u8,
+        /// Ordered subtree values for the accepted chunk prefix; the last parent can stay split.
         stack: [max_depth + 1]ChainingValue,
+        /// Temporary chunk/parent values; only the active batch prefix is initialized.
         batch: [batch_capacity]ChainingValue,
+        /// Target-dependent transpose/message scratch. Scalar states reserve no message words.
         messages: [if (kernel == .scalar) 0 else 16 * compression.max_lanes]u32 align(64),
 
         /// Starts unkeyed hashing directly in supplied, possibly uninitialized storage.
@@ -79,7 +103,7 @@ fn State(comptime kernel: compression.Kernel) type {
         /// survives clearing; the caller owns the original key and its lifetime. Reset the cleared
         /// state before reuse.
         pub fn resetKeyed(self: *Self, key: [key_length]u8) void {
-            self.resetMode(keyWords(key), mode_flags.keyed);
+            self.resetMode(decodeKey(key), mode_flags.keyed);
         }
 
         test resetKeyed {
@@ -110,7 +134,7 @@ fn State(comptime kernel: compression.Kernel) type {
         pub fn resetDerive(self: *Self, context: []const u8) Error!void {
             self.resetMode(compression.iv, mode_flags.derive_context);
             try self.update(context);
-            self.resetMode(keyWords(self.final()), mode_flags.derive_material);
+            self.resetMode(decodeKey(self.final()), mode_flags.derive_material);
         }
 
         /// Consumes exact bytes; overflow leaves all previously accepted state unchanged.
@@ -123,7 +147,10 @@ fn State(comptime kernel: compression.Kernel) type {
             var bytes = input;
             while (bytes.len != 0) {
                 if (self.chunk.length() == chunk_bytes) {
-                    self.push(self.chunk.output(self.mode).chaining(kernel), self.chunk.counter);
+                    self.pushSubtree(
+                        self.chunk.compressionInput(self.mode).chainingValue(kernel),
+                        self.chunk.counter,
+                    );
                     self.chunk.reset(self.key, self.chunk.counter + 1);
                 }
 
@@ -138,7 +165,7 @@ fn State(comptime kernel: compression.Kernel) type {
                     while (self.chunk.counter & (batch_chunks - 1) != 0) batch_chunks /= 2;
                     if (batch_chunks >= 2) {
                         const batch_bytes = batch_chunks * chunk_bytes;
-                        self.processBatch(bytes.ptr, batch_chunks);
+                        self.appendSubtree(bytes.ptr, batch_chunks);
                         self.chunk.counter += batch_chunks;
                         bytes = bytes[batch_bytes..];
                         continue;
@@ -174,11 +201,12 @@ fn State(comptime kernel: compression.Kernel) type {
             );
         }
 
-        /// Appends bytes using `io` and caller-owned worker scratch. Small/unaligned spans retain
-        /// ordinary update behavior. Workers, state and input must be disjoint and remain stable
-        /// until return. Each wave submits at most `workers.len - 1` jobs; the caller computes one
-        /// partition. The provider may execute jobs inline. All accepted jobs finish before return,
-        /// including cancellation, and no borrowed input pointers remain in the workers.
+        /// Appends bytes using `io` and caller-owned parallel scratch. Small updates and partial
+        /// chunks use ordinary update behavior. Workspaces, state and input must be disjoint and
+        /// stable until return. Each wave submits at most `workspaces.len - 1` jobs; the caller
+        /// computes one partition. The provider may execute jobs inline. All accepted jobs finish
+        /// before return, including cancellation. Participating workspaces' input pointers are then
+        /// empty; unused entries remain untouched.
         ///
         /// Length overflow refuses before mutation or scheduling. `Canceled` may leave a partial
         /// update; reset before reuse. The provider owns scheduling resources and allocation
@@ -187,14 +215,14 @@ fn State(comptime kernel: compression.Kernel) type {
             self: *Self,
             io: std.Io,
             input: []const u8,
-            workers: []Worker,
+            workspaces: []ParallelWorkspace,
             options: ParallelOptions,
         ) ParallelError!void {
             const input_byte_count = std.math.cast(u64, input.len) orelse return error.SizeOverflow;
             const new_total_bytes = std.math.add(u64, self.total_bytes, input_byte_count) catch {
                 return error.SizeOverflow;
             };
-            if (workers.len < 2 or input.len < options.minimum_bytes) return self.update(input);
+            if (workspaces.len < 2 or input.len < options.minimum_bytes) return self.update(input);
 
             var bytes = input;
 
@@ -205,7 +233,10 @@ fn State(comptime kernel: compression.Kernel) type {
                 try self.update(bytes[0..take]);
                 bytes = bytes[take..];
                 if (bytes.len != 0 and self.chunk.length() == chunk_bytes) {
-                    self.push(self.chunk.output(self.mode).chaining(kernel), self.chunk.counter);
+                    self.pushSubtree(
+                        self.chunk.compressionInput(self.mode).chainingValue(kernel),
+                        self.chunk.counter,
+                    );
                     self.chunk.reset(self.key, self.chunk.counter + 1);
                 }
             }
@@ -219,7 +250,7 @@ fn State(comptime kernel: compression.Kernel) type {
                 const minimum_chunks = @max(2, rounded_job_chunks);
                 const participants = std.math.floorPowerOfTwo(
                     usize,
-                    @min(workers.len, chunks / minimum_chunks),
+                    @min(workspaces.len, chunks / minimum_chunks),
                 );
                 if (participants < 2) {
                     // Advance past the alignment boundary without scheduling tiny jobs. The next
@@ -228,8 +259,8 @@ fn State(comptime kernel: compression.Kernel) type {
                     try self.update(bytes[0..take]);
                     bytes = bytes[take..];
                     if (bytes.len != 0 and self.chunk.length() == chunk_bytes) {
-                        self.push(
-                            self.chunk.output(self.mode).chaining(kernel),
+                        self.pushSubtree(
+                            self.chunk.compressionInput(self.mode).chainingValue(kernel),
                             self.chunk.counter,
                         );
                         self.chunk.reset(self.key, self.chunk.counter + 1);
@@ -242,28 +273,28 @@ fn State(comptime kernel: compression.Kernel) type {
                 var group: std.Io.Group = .init;
                 defer {
                     group.cancel(io);
-                    for (workers[0..participants]) |*worker| worker.input = &.{};
+                    for (workspaces[0..participants]) |*workspace| workspace.input = &.{};
                 }
-                for (workers[0..participants], 0..) |*worker, i| {
-                    worker.key = self.key;
-                    worker.mode = self.mode;
+                for (workspaces[0..participants], 0..) |*workspace, i| {
+                    workspace.key = self.key;
+                    workspace.mode = self.mode;
                     const input_offset = i * job_bytes;
                     const chunk_offset = i * job_chunks;
-                    worker.input = bytes[input_offset..][0..job_bytes];
-                    worker.counter = self.chunk.counter + chunk_offset;
+                    workspace.input = bytes[input_offset..][0..job_bytes];
+                    workspace.counter = self.chunk.counter + chunk_offset;
                     if (i != 0) group.async(
                         io,
                         if (kernel == .scalar) parallel.runScalar else parallel.runNative,
-                        .{worker},
+                        .{workspace},
                     );
                 }
-                parallel.run(&workers[0], kernel);
+                parallel.run(&workspaces[0], kernel);
                 try group.await(io);
 
                 // Completion order is irrelevant: reduce subtrees in their original input order.
-                for (workers[0..participants]) |*worker| {
-                    self.push(worker.result[0], worker.counter);
-                    self.push(worker.result[1], worker.counter + job_chunks / 2);
+                for (workspaces[0..participants]) |*workspace| {
+                    self.pushSubtree(workspace.result[0], workspace.counter);
+                    self.pushSubtree(workspace.result[1], workspace.counter + job_chunks / 2);
                 }
                 self.chunk.counter += chunks;
                 bytes = bytes[chunks * chunk_bytes ..];
@@ -281,21 +312,23 @@ fn State(comptime kernel: compression.Kernel) type {
             const bytes = try allocator.alloc(u8, 262144);
             defer allocator.free(bytes);
             for (bytes, 0..) |*byte, i| byte.* = @truncate(i % 251);
-            const workers = try allocator.alloc(Worker, 4);
-            defer allocator.free(workers);
+            const workspaces = try allocator.alloc(ParallelWorkspace, 4);
+            defer allocator.free(workspaces);
             const state = try allocator.create(Self);
             defer allocator.destroy(state);
             state.reset();
-            try state.updateParallel(provider.io(), bytes, workers, .{});
+            try state.updateParallel(provider.io(), bytes, workspaces, .{});
             var expected: Digest = undefined;
             std.crypto.hash.Blake3.hash(bytes, &expected, .{});
             try testing.expectEqual(expected, state.final());
-            for (workers) |worker| try testing.expectEqual(@as(usize, 0), worker.input.len);
+            for (
+                workspaces,
+            ) |workspace| try testing.expectEqual(@as(usize, 0), workspace.input.len);
         }
 
         /// Returns a full 32-byte snapshot without modifying state or consuming input.
         pub fn final(self: *const Self) Digest {
-            return self.rootOutput().rootDigest(kernel);
+            return self.rootInput().rootDigest(kernel);
         }
 
         /// Copies `out.len` bytes of the current stream's extended output, starting at byte
@@ -311,7 +344,7 @@ fn State(comptime kernel: compression.Kernel) type {
         pub fn finalizeSeek(self: *const Self, offset: u64, out: []u8) Error!void {
             const output_byte_count = std.math.cast(u64, out.len) orelse return error.SizeOverflow;
             _ = std.math.add(u64, offset, output_byte_count) catch return error.SizeOverflow;
-            if (out.len != 0) self.rootOutput().writeRootBytes(kernel, offset, out);
+            if (out.len != 0) self.rootInput().writeRootBytes(kernel, offset, out);
         }
 
         test finalizeSeek {
@@ -364,14 +397,18 @@ fn State(comptime kernel: compression.Kernel) type {
             self.chunk.reset(key, 0);
         }
 
-        fn rootOutput(self: *const Self) Output {
+        // ROOT changes the last compression, so a chaining value alone cannot produce root bytes.
+        // Copy the pending block or final two children, then reduce the remaining forest into it.
+        fn rootInput(self: *const Self) CompressionInput {
             var count: usize = self.stack_len;
-            var output: Output = blk: {
-                if (self.chunk.length() != 0 or count < 2) break :blk self.chunk.output(self.mode);
+            var node_input: CompressionInput = blk: {
+                if (self.chunk.length() != 0 or count < 2) break :blk self.chunk.compressionInput(
+                    self.mode,
+                );
 
                 // A complete batched subtree leaves two children on the stack, with no chunk tail.
                 count -= 2;
-                break :blk Output.parent(
+                break :blk CompressionInput.parent(
                     self.key,
                     self.stack[count],
                     self.stack[count + 1],
@@ -380,34 +417,38 @@ fn State(comptime kernel: compression.Kernel) type {
             };
             while (count != 0) {
                 count -= 1;
-                const right = output.chaining(kernel);
-                output = Output.parent(self.key, self.stack[count], right, self.mode);
+                const right = node_input.chainingValue(kernel);
+                node_input = CompressionInput.parent(self.key, self.stack[count], right, self.mode);
             }
-            return output;
+            return node_input;
         }
 
+        // The set bits of the completed chunk count describe its left-to-right forest of
+        // power-of-two subtrees. Merge excess children as new input proves their parent interior.
         fn mergeStack(self: *Self, chunks: u64) void {
             const target: usize = @popCount(chunks);
             while (self.stack_len > target) {
                 const left = self.stack_len - 2;
-                const parent = Output.parent(
+                const parent = CompressionInput.parent(
                     self.key,
                     self.stack[left],
                     self.stack[left + 1],
                     self.mode,
                 );
-                self.stack[left] = parent.chaining(kernel);
+                self.stack[left] = parent.chainingValue(kernel);
                 self.stack_len -= 1;
             }
         }
 
-        fn push(self: *Self, cv: ChainingValue, position: u64) void {
+        fn pushSubtree(self: *Self, cv: ChainingValue, position: u64) void {
             self.mergeStack(position);
             self.stack[self.stack_len] = cv;
             self.stack_len += 1;
         }
 
-        fn processBatch(self: *Self, input: [*]const u8, chunk_count: usize) void {
+        // Hash one aligned power-of-two subtree and retain its final two children. The update
+        // caller advances the chunk counter and commits the admitted total byte count.
+        fn appendSubtree(self: *Self, input: [*]const u8, chunk_count: usize) void {
             std.debug.assert(chunk_count >= 2 and chunk_count <= batch_capacity);
             std.debug.assert(std.math.isPowerOfTwo(chunk_count));
             std.debug.assert(self.chunk.counter & (chunk_count - 1) == 0);
@@ -418,8 +459,8 @@ fn State(comptime kernel: compression.Kernel) type {
 
             // Preserve both final children: only finalization knows whether their parent is the
             // root and must receive ROOT compression.
-            self.push(self.batch[0], self.chunk.counter);
-            self.push(self.batch[1], self.chunk.counter + chunk_count / 2);
+            self.pushSubtree(self.batch[0], self.chunk.counter);
+            self.pushSubtree(self.batch[1], self.chunk.counter + chunk_count / 2);
         }
 
         fn compressChunks(self: *Self, input: [*]const u8, count: usize) void {
@@ -476,13 +517,19 @@ fn State(comptime kernel: compression.Kernel) type {
             for (0..count) |i| {
                 const left = self.batch[i * 2];
                 const right = self.batch[i * 2 + 1];
-                self.batch[i] = Output.parent(self.key, left, right, self.mode).chaining(kernel);
+                self.batch[i] = CompressionInput.parent(
+                    self.key,
+                    left,
+                    right,
+                    self.mode,
+                ).chainingValue(kernel);
             }
         }
     };
 }
 
-fn keyWords(key: Digest) ChainingValue {
+// Keys and derived digests encode each algorithm word in little-endian byte order.
+fn decodeKey(key: Digest) ChainingValue {
     var words: ChainingValue = undefined;
     for (&words, 0..) |*word, i| {
         const word_offset = i * @sizeOf(u32);
@@ -498,7 +545,7 @@ test "all official modes and extended output match independent vectors across ke
     defer allocator.free(source);
 
     inline for (.{ compression.Kernel.scalar, compression.Kernel.row }) |kernel| {
-        const hasher = try allocator.create(State(kernel));
+        const hasher = try allocator.create(HasherFor(kernel));
         defer allocator.destroy(hasher);
         for (official_vectors) |case| {
             const size = case.input_len;
@@ -578,6 +625,55 @@ test "incremental block chunk and tree boundaries preserve snapshot and reset co
     };
 }
 
+test "copied states retain independent prefixes keys and continuations" {
+    var bytes: [4097]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index % 251);
+    const prefixes = [_]usize{ 0, 1, 63, 64, 65, 1023, 1024, 1025, 2048, 2049, 4096, 4097 };
+
+    inline for (.{ Hasher, ScalarHasher }) |Owner| {
+        const state = try testing.allocator.create(Owner);
+        defer testing.allocator.destroy(state);
+        defer state.clear();
+        const copy = try testing.allocator.create(Owner);
+        defer testing.allocator.destroy(copy);
+        defer copy.clear();
+
+        for (0..3) |mode| {
+            for (prefixes) |length| {
+                switch (mode) {
+                    0 => state.reset(),
+                    1 => state.resetKeyed(vector_key),
+                    2 => try state.resetDerive(vector_context),
+                    else => unreachable,
+                }
+                var reference = switch (mode) {
+                    0 => std.crypto.hash.Blake3.init(.{}),
+                    1 => std.crypto.hash.Blake3.init(.{ .key = vector_key }),
+                    2 => std.crypto.hash.Blake3.initKdf(vector_context, .{}),
+                    else => unreachable,
+                };
+                try state.update(bytes[0..length]);
+                reference.update(bytes[0..length]);
+                copy.* = state.*;
+                var reference_copy = reference;
+
+                try state.update(" first");
+                reference.update(" first");
+                var expected: Digest = undefined;
+                reference.final(&expected);
+                try testing.expectEqual(expected, state.final());
+
+                try copy.update(" second");
+                reference_copy.update(" second");
+                reference_copy.final(&expected);
+                try testing.expectEqual(expected, copy.final());
+                state.clear();
+                try testing.expectEqual(expected, copy.final());
+            }
+        }
+    }
+}
+
 test "length overflow preserves state and output and clear erases the complete owner" {
     const hasher = try testing.allocator.create(Hasher);
     defer testing.allocator.destroy(hasher);
@@ -598,7 +694,8 @@ test "length overflow preserves state and output and clear erases the complete o
     try testing.expectEqual(@as([32]u8, @splat(0xa7)), output);
 
     hasher.clear();
-    for (std.mem.asBytes(hasher)) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (std.mem.asBytes(hasher)) |byte|
+        try testing.expectEqual(@as(u8, 0), byte);
     const first = try hasher.hash("reused");
     const second = try hasher.hash("reused");
     try testing.expectEqual(first, second);
@@ -780,13 +877,20 @@ test "compile-time selection preserves modes snapshots seeks and clearing" {
 // thread pool. This fixture is used only by the serialized calls below.
 const TestIo = struct {
     const Pending = struct {
-        context: [@sizeOf(*Worker)]u8 align(@alignOf(*Worker)),
+        /// Copied type-erased callback argument: one pointer to participant scratch.
+        context: [@sizeOf(*ParallelWorkspace)]u8 align(@alignOf(*ParallelWorkspace)),
+        /// Callback that interprets context and runs the admitted subtree job.
         start: *const fn (*const anyopaque) void,
     };
+    /// Queued jobs for at most eight participants; the caller computes one partition itself.
     pending: [7]Pending = undefined,
+    /// Number of initialized queued jobs still waiting for reverse-order completion.
     count: usize = 0,
+    /// Cumulative submitted jobs, used to verify admission and fallback.
     submitted: usize = 0,
+    /// Completed await/cancel waves, used to verify that all borrows retire.
     joined: usize = 0,
+    /// Makes await return Canceled after it has completed the queued jobs.
     canceled: bool = false,
 
     const vtable: std.Io.VTable = blk: {
@@ -805,8 +909,8 @@ const TestIo = struct {
         start: *const fn (*const anyopaque) void,
     ) void {
         const self: *TestIo = @ptrCast(@alignCast(pointer.?));
-        std.debug.assert(context.len == @sizeOf(*Worker));
-        std.debug.assert(alignment == std.mem.Alignment.of(*Worker));
+        std.debug.assert(context.len == @sizeOf(*ParallelWorkspace));
+        std.debug.assert(alignment == std.mem.Alignment.of(*ParallelWorkspace));
         std.debug.assert(self.count < self.pending.len);
         const task = &self.pending[self.count];
         @memcpy(&task.context, context);
@@ -851,8 +955,8 @@ test "parallel ordered subtrees preserve modes prefixes snapshots and seeked XOF
     const bytes = try allocator.alloc(u8, 1048577);
     defer allocator.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @truncate(i % 251);
-    const workers = try allocator.alloc(Worker, 8);
-    defer allocator.free(workers);
+    const workspaces = try allocator.alloc(ParallelWorkspace, 8);
+    defer allocator.free(workspaces);
     const state = try allocator.create(Hasher);
     defer allocator.destroy(state);
     const serial = try allocator.create(ScalarHasher);
@@ -886,7 +990,7 @@ test "parallel ordered subtrees preserve modes prefixes snapshots and seeked XOF
                 try state.updateParallel(
                     scheduler.io(),
                     bytes[0..length],
-                    workers[0..worker_budget],
+                    workspaces[0..worker_budget],
                     .{ .minimum_bytes = 0, .minimum_job_bytes = 2048 },
                 );
                 try serial.update(bytes[0..length]);
@@ -908,9 +1012,9 @@ test "parallel ordered subtrees preserve modes prefixes snapshots and seeked XOF
         }
     }
 
-    for (workers) |*worker| {
-        worker.clear();
-        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(worker), 0));
+    for (workspaces) |*workspace| {
+        workspace.clear();
+        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(workspace), 0));
     }
 }
 
@@ -918,12 +1022,16 @@ test "parallel admission skips small work and rejects overflow before submission
     const allocator = testing.allocator;
     const state = try allocator.create(Hasher);
     defer allocator.destroy(state);
-    const workers = try allocator.alloc(Worker, 2);
-    defer allocator.free(workers);
+    const workspaces = try allocator.alloc(ParallelWorkspace, 2);
+    defer allocator.free(workspaces);
+    @memset(std.mem.sliceAsBytes(workspaces), 0xa5);
+    const workspace_before = try allocator.dupe(u8, std.mem.sliceAsBytes(workspaces));
+    defer allocator.free(workspace_before);
     var scheduler: TestIo = .{};
     state.reset();
-    try state.updateParallel(scheduler.io(), "small record", workers, .{});
+    try state.updateParallel(scheduler.io(), "small record", workspaces, .{});
     try testing.expectEqual(@as(usize, 0), scheduler.submitted);
+    try testing.expectEqualSlices(u8, workspace_before, std.mem.sliceAsBytes(workspaces));
     var expected: Digest = undefined;
     std.crypto.hash.Blake3.hash("small record", &expected, .{});
     try testing.expectEqual(expected, state.final());
@@ -934,13 +1042,14 @@ test "parallel admission skips small work and rejects overflow before submission
         state.updateParallel(
             scheduler.io(),
             "x",
-            workers,
+            workspaces,
             .{ .minimum_bytes = 0, .minimum_job_bytes = 0 },
         ),
     );
     try testing.expectEqual(expected, state.final());
     try testing.expectEqual(@as(usize, 0), scheduler.submitted);
     try testing.expectEqual(@as(usize, 0), scheduler.joined);
+    try testing.expectEqualSlices(u8, workspace_before, std.mem.sliceAsBytes(workspaces));
 }
 
 test "compile-time native and scalar parallel owners retain their kernel choice" {
@@ -948,8 +1057,8 @@ test "compile-time native and scalar parallel owners retain their kernel choice"
     const bytes = try allocator.alloc(u8, 1048576);
     defer allocator.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @truncate(i % 251);
-    const workers = try allocator.alloc(Worker, 2);
-    defer allocator.free(workers);
+    const workspaces = try allocator.alloc(ParallelWorkspace, 2);
+    defer allocator.free(workspaces);
     var expected: Digest = undefined;
     std.crypto.hash.Blake3.hash(bytes, &expected, .{});
 
@@ -958,39 +1067,41 @@ test "compile-time native and scalar parallel owners retain their kernel choice"
         defer allocator.destroy(state);
         var scheduler: TestIo = .{};
         state.reset();
-        try state.updateParallel(scheduler.io(), bytes, workers, .{});
+        try state.updateParallel(scheduler.io(), bytes, workspaces, .{});
         try testing.expectEqual(expected, state.final());
         try testing.expectEqual(@as(usize, 1), scheduler.submitted);
         try testing.expectEqual(@as(usize, 1), scheduler.joined);
     }
 }
 
-test "parallel cancellation acquires workers and reset permits reuse" {
+test "parallel cancellation joins jobs retires input and reset permits reuse" {
     const allocator = testing.allocator;
     const bytes = try allocator.alloc(u8, 262144);
     defer allocator.free(bytes);
     @memset(bytes, 0x5a);
-    const workers = try allocator.alloc(Worker, 4);
-    defer allocator.free(workers);
+    const workspaces = try allocator.alloc(ParallelWorkspace, 4);
+    defer allocator.free(workspaces);
     const state = try allocator.create(Hasher);
     defer allocator.destroy(state);
     var provider: TestIo = .{ .canceled = true };
     state.reset();
     try testing.expectError(
         error.Canceled,
-        state.updateParallel(provider.io(), bytes, workers, .{}),
+        state.updateParallel(provider.io(), bytes, workspaces, .{}),
     );
     try testing.expectEqual(@as(usize, 0), provider.count);
     try testing.expectEqual(@as(usize, 1), provider.joined);
-    for (workers) |worker| try testing.expectEqual(@as(usize, 0), worker.input.len);
+    for (workspaces) |workspace|
+        try testing.expectEqual(@as(usize, 0), workspace.input.len);
 
     // The inline provider needs no scheduler reservation; reset is the recovery contract.
     state.reset();
-    try state.updateParallel(std.Io.failing, bytes, workers, .{});
+    try state.updateParallel(std.Io.failing, bytes, workspaces, .{});
     var expected: Digest = undefined;
     std.crypto.hash.Blake3.hash(bytes, &expected, .{});
     try testing.expectEqual(expected, state.final());
-    for (workers) |worker| try testing.expectEqual(@as(usize, 0), worker.input.len);
+    for (workspaces) |workspace|
+        try testing.expectEqual(@as(usize, 0), workspace.input.len);
 }
 
 test {

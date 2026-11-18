@@ -1,12 +1,13 @@
-//! Computes BLAKE3 digests over exact caller bytes. The default digest is 32 raw bytes. Keyed
-//! hashing and context-based key derivation use distinct modes; extended output supplies more bytes
-//! from the same final state.
+//! BLAKE3 supplies cryptographic content digests, keyed authentication and context-based key
+//! derivation over exact caller bytes. The default digest is 32 raw bytes; extended output supplies
+//! more bytes from the same final state.
 //!
 //! ## Hash a buffer or a stream
 //!
 //! Use `Hasher.hash` for one complete buffer. For incremental input, call
-//! [reset](#wingman.blake3.state.State.reset), [update](#wingman.blake3.state.State.update) for
-//! each fragment, then [final](#wingman.blake3.state.State.final) to obtain the digest.
+//! [reset](#wingman.blake3.hasher.HasherFor.reset),
+//! [update](#wingman.blake3.hasher.HasherFor.update) for each fragment, then
+//! [final](#wingman.blake3.hasher.HasherFor.final) to obtain the digest.
 //!
 //! `Hasher` incrementally consumes a byte stream. Each update continues that stream; call
 //! boundaries are not encoded. Hashing "ab" then "c" therefore hashes the same bytes as "a" then
@@ -19,7 +20,7 @@
 //!
 //! Construct the large state directly at its final address. Each update consumes its borrowed input
 //! before returning, and the copied digest outlives both the input and the state. The
-//! [incremental example](#wingman.blake3.state.State.update) demonstrates those lifetimes.
+//! [incremental example](#wingman.blake3.hasher.HasherFor.update) demonstrates those lifetimes.
 //!
 //! Reuse a reservation through its pointer. The reset methods begin a new stream in possibly
 //! uninitialized storage; `hash` resets, hashes one complete unkeyed buffer and finalizes. No
@@ -33,34 +34,38 @@
 //! state unchanged; seek-range overflow leaves output unchanged. A new reset/hash intentionally
 //! replaces the previous stream.
 //!
+//! A copy of an initialized state continues independently, including its own retained key-derived
+//! values. Clear each sensitive copy separately.
+//!
 //! The clear method erases the entire reservation, including retained key-derived values. Reset
 //! before reuse. Resetting or destroying state does not clear it, and caller keys, material and
 //! copied output retain their separate lifetimes. The
-//! [keyed](#wingman.blake3.state.State.resetKeyed) and
-//! [derived-output](#wingman.blake3.state.State.finalizeSeek) doctests show explicit clearing.
+//! [keyed](#wingman.blake3.hasher.HasherFor.resetKeyed) and
+//! [derived-output](#wingman.blake3.hasher.HasherFor.finalizeSeek) doctests show explicit clearing.
 //!
 //! ## Parallel and low-level operations
 //!
 //! CPU features follow the compile-time build target. The compression namespace exposes scalar, row
 //! SIMD and batched chunk/parent primitives. `ScalarHasher` provides portable scalar hashing with
 //! the same byte and lifetime contract. Parallel updates explicitly borrow a `std.Io` provider and
-//! caller-owned worker scratch; ordinary updates never start workers. Algorithm and modes:
+//! caller-owned `ParallelWorkspace` entries; ordinary updates never start workers. Algorithm and
+//! modes:
 //! https://github.com/BLAKE3-team/BLAKE3/blob/f55849f89cd85083c1c9daa2c5de20766f309c00/README.md
 
-const state = @import("blake3/state.zig");
+const hasher = @import("blake3/hasher.zig");
 const parallel = @import("blake3/parallel.zig");
 const compression_impl = @import("blake3/compression.zig");
 
-pub const digest_length = state.digest_length;
-pub const key_length = state.key_length;
-pub const Digest = state.Digest;
-pub const Error = state.Error;
-pub const ParallelError = state.ParallelError;
-pub const Hasher = state.Hasher;
-pub const ScalarHasher = state.ScalarHasher;
+pub const digest_length = hasher.digest_length;
+pub const key_length = hasher.key_length;
+pub const Digest = hasher.Digest;
+pub const Error = hasher.Error;
+pub const ParallelError = hasher.ParallelError;
+pub const Hasher = hasher.Hasher;
+pub const ScalarHasher = hasher.ScalarHasher;
 
 pub const ParallelOptions = parallel.ParallelOptions;
-pub const Worker = parallel.Worker;
+pub const ParallelWorkspace = @import("blake3/ParallelWorkspace.zig");
 
 /// Low-level BLAKE3 block and tree compression. Most callers use `Hasher`; these primitives serve
 /// applications that manage chunk counters, mode flags and tree/root construction themselves. A
@@ -88,7 +93,8 @@ pub const compression = struct {
 };
 
 test {
-    _ = state;
+    _ = hasher;
+    _ = ParallelWorkspace;
     _ = parallel;
     _ = compression_impl;
 }
