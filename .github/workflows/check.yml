@@ -25,7 +25,7 @@ jobs:
       - name: Check compiler and formatting
         run: |
           test "$(zig version)" = "$ZIG_VERSION"
-          zig fmt --check build.zig build.zig.zon src examples
+          zig fmt --check build.zig build.zig.zon autodoc_html.zig src examples
       - name: Checked baseline tests
         run: zig build test -Doptimize=ReleaseSafe -Dcpu=baseline --seed=0 --summary all
       - name: Optimized baseline tests

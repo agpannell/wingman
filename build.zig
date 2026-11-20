@@ -163,13 +163,17 @@ pub fn build(b: *std.Build) void {
         },
     };
     for (examples) |example| {
-        const module = b.createModule(
-            .{ .root_source_file = b.path(example.source), .target = target, .optimize = optimize },
-        );
+        const module = b.createModule(.{
+            .root_source_file = b.path(example.source),
+            .target = target,
+            .optimize = optimize,
+        });
         module.addImport("wingman", wingman);
-        const executable = b.addExecutable(
-            .{ .name = example.executable, .root_module = module, .use_llvm = true },
-        );
+        const executable = b.addExecutable(.{
+            .name = example.executable,
+            .root_module = module,
+            .use_llvm = true,
+        });
         const run = b.addRunArtifact(executable);
         run.addPassthruArgs();
         b.step(example.step, example.description).dependOn(&run.step);
@@ -177,12 +181,29 @@ pub fn build(b: *std.Build) void {
     }
 
     const reference = b.addObject(.{ .name = "wingman", .root_module = wingman, .use_llvm = true });
-    const install_reference = b.addInstallDirectory(
-        .{
-            .source_dir = reference.getEmittedDocs(),
-            .install_dir = .prefix,
-            .install_subdir = "docs",
-        },
+    const install_reference = b.addInstallDirectory(.{
+        .source_dir = reference.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const reference_html_module = b.createModule(.{
+        .root_source_file = b.path("autodoc_html.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const reference_html = b.addExecutable(.{
+        .name = "wingman-autodoc-html",
+        .root_module = reference_html_module,
+        .use_llvm = true,
+    });
+    const style_reference = b.addRunArtifact(reference_html);
+    style_reference.setStdIn(.{ .lazy_path = reference.getEmittedDocs().path(b, "index.html") });
+    const install_reference_html = b.addInstallFileWithDir(
+        style_reference.captureStdOut(.{}),
+        .prefix,
+        "docs/index.html",
     );
-    b.step("docs", "Generate the browsable API reference").dependOn(&install_reference.step);
+    // Install the compiler's complete reference first, then replace only its HTML layout.
+    install_reference_html.step.dependOn(&install_reference.step);
+    b.step("docs", "Generate the browsable API reference").dependOn(&install_reference_html.step);
 }
