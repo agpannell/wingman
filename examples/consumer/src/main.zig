@@ -555,7 +555,7 @@ test "DFONT selected bytes remain resource-relative for the SFNT reader" {
     @memcpy(bytes[82..86], "sfnt");
     std.mem.writeInt(u16, bytes[88..90], 10, .big);
     std.mem.writeInt(u16, bytes[92..94], 0xffff, .big);
-    try std.testing.expect(dfont.hasHeader(&bytes));
+    try std.testing.expect(dfont.Container.hasHeader(&bytes));
     const container = try dfont.Container.open(&bytes);
     try std.testing.expectEqual(1, container.faceCount());
     const font = try container.faceBytes(0);
@@ -589,7 +589,7 @@ test "SFNT shared table borrows and head checksum exceptions work outside the pa
     const ordinary = (try directory.find("DATA".*)).?;
     const head = (try directory.find("head".*)).?;
     try std.testing.expectEqual(.truetype, directory.flavor);
-    try std.testing.expect(directory.ordered);
+    try std.testing.expect(directory.tags_ordered);
     try std.testing.expectEqual(ordinary.data.ptr, head.data.ptr);
     try std.testing.expectEqual(@intFromPtr(&bytes) + 48, @intFromPtr(head.data.ptr));
     try std.testing.expect(ordinary.checksumMatches() and head.checksumMatches());

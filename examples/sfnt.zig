@@ -6,20 +6,26 @@ pub fn main(init: std.process.Init) !void {
     // The collection, directories and tables all borrow this immutable storage.
     const bytes = sampleCollection();
     const collection = try sfnt.Collection.open(&bytes);
-    const first = try collection.face(0);
-    const second = try collection.face(1);
-    const first_table = (try first.find("DATA".*)) orelse return error.MissingTable;
-    const second_table = (try second.find("DATA".*)) orelse return error.MissingTable;
+    const first_table, const second_table = selected: {
+        const first = try collection.face(0);
+        const second = try collection.face(1);
+        if (try first.find(
+            "name".*,
+        ) != null or first.table(1) != null) return error.UnexpectedTable;
+        // Direct selection retains the complete collection as the table-offset origin.
+        const direct = try sfnt.Directory.openAt(&bytes, second.offset);
+        const direct_table = direct.table(0) orelse return error.MissingTable;
+        if (direct_table.offset != 96) return error.RebasedTable;
+        break :selected .{
+            (try first.find("DATA".*)) orelse return error.MissingTable,
+            (try second.find("DATA".*)) orelse return error.MissingTable,
+        };
+    };
+    // Both Tables remain usable after their Directory descriptors retire.
     if (first_table.data.ptr != second_table.data.ptr) return error.LostSharedStorage;
     if (first_table.offset != 96 or first_table.data.len != 5) return error.WrongExtent;
     if (!first_table.checksumMatches() or !second_table.checksumMatches())
         return error.WrongChecksum;
-    if (try first.find("name".*) != null or first.table(1) != null) return error.UnexpectedTable;
-    // A collection table offset is measured from the complete collection, even when opening a
-    // directory directly at a nonzero offset.
-    const direct = try sfnt.Directory.openAt(&bytes, second.offset);
-    const direct_table = direct.table(0) orelse return error.MissingTable;
-    if (direct_table.offset != 96) return error.RebasedTable;
 
     var buffer: [1024]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);

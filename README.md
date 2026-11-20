@@ -111,10 +111,11 @@ metadata and BasisLZ queries in `Metadata` and `BasisLz`.
 
 ### Font containers
 
-Use `dfont` to select an SFNT resource from a Macintosh data-fork container. Use `sfnt` to
-enumerate opaque font tables or select a TTC/OTC collection member before handing
-its bytes to a table-specific reader. Opening checks storage ranges; it does not establish that a
-font can render text. Checksums are explicit, and glyphs, layout and rendering stay with callers.
+Use `dfont.Container` to select an SFNT resource from a Macintosh data-fork container. Use
+`sfnt.Directory` to inspect a font's table records, or `sfnt.Collection` to select a TTC/OTC member.
+Pass a selected table's `data` to its table-specific reader. Collection table offsets refer to the
+complete collection; DFONT font offsets refer to the selected resource. Opening checks storage
+ranges, with explicit checksums; glyph interpretation, shaping and rendering stay with callers.
 
 | Library and guide | Purpose | Example step |
 | --- | --- | --- |

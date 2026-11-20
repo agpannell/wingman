@@ -16,10 +16,12 @@ The example checks two different directory flavors sharing one table at an absol
 ## Open and inspect a directory
 
 ```zig
-const sfnt = @import("wingman").sfnt;
+const Directory = @import("wingman").sfnt.Directory;
 
-pub fn selectedTable(bytes: []const u8, tag: sfnt.Tag) sfnt.Error!?sfnt.Table {
-    const directory = try sfnt.Directory.open(bytes);
+pub const SelectionError = Directory.OpenError || Directory.LookupError;
+
+pub fn selectedTable(bytes: []const u8, tag: Directory.Tag) SelectionError!?Directory.Table {
+    const directory = try Directory.open(bytes);
     return directory.find(tag);
 }
 ```
@@ -29,12 +31,12 @@ opens one at an absolute position in the complete source. Both check the whole r
 every table's range before returning. Empty directories and zero-length tables at the source end
 are admitted for raw inspection. No table bytes are swept or interpreted while opening.
 
-A directory recognizes the `truetype`, `apple_truetype`, `opentype_cff` and `apple_type1` flavors.
-The signature identifies a declared container technology; it does not establish that the expected
+A directory's `Directory.Flavor` recognizes `truetype`, `apple_truetype`, `opentype_cff` and
+`apple_type1` signatures. The signature identifies a declared container technology; it does not establish that the expected
 outlines exist or can be decoded. Unsupported signatures return `UnsupportedFormat`.
 
-Tags are exact four-byte arrays with significant case and spaces; `"CFF "` differs from `"CFF2"`.
-Raw inspection also preserves nonprintable tags. `directory.table(index)` returns a copied record
+`Directory.Tag` is an exact four-byte array with significant case and spaces; `"CFF "` differs from
+`"CFF2"`. Raw inspection also preserves nonprintable tags. `directory.table(index)` returns a copied record
 with a borrowed payload, or `null` out of range. Indexed enumeration preserves encoded order and
 all duplicates. Maximum-size indices are refused before record arithmetic.
 
@@ -48,16 +50,17 @@ records use a linear scan. Encoded search accelerator fields are ignored.
 ```zig
 const sfnt = @import("wingman").sfnt;
 
-pub fn collectionFace(bytes: []const u8, index: u32) sfnt.Error!sfnt.Directory {
+pub fn collectionFace(bytes: []const u8, index: u32) sfnt.Collection.FaceError!sfnt.Directory {
     const collection = try sfnt.Collection.open(bytes);
     return collection.face(index);
 }
 ```
 
 `Collection.open` admits version-one or version-two framing, a nonzero face count, the complete
-offset array and every member directory's extent. Version two also checks its optional DSIG
-signature descriptor and byte range. `collection.signature` borrows those bytes; no cryptographic
-signature is authenticated. A null descriptor must have all three fields zero.
+offset array and every member directory's extent. Version two always has a twelve-byte DSIG
+descriptor after its offset array. All three descriptor fields must be zero when no signature is
+present; otherwise `collection.signature` borrows its checked byte range. No cryptographic
+signature is authenticated.
 
 Opening the collection does not select every member or validate its payload ranges. A structurally
 present member may have an unsupported flavor or a malformed table payload. `collection.face(index)`
@@ -68,7 +71,8 @@ Failure on one member leaves the collection available for selecting another.
 source when opening a directory at a nonzero position. In the example, both directories point to
 byte 96 of the complete collection. Passing only a suffix beginning at a directory would change
 the meaning of its encoded offsets. Different face records may name the
-same directory, and different tables may borrow the same bytes.
+same directory, and different tables may borrow the same bytes. Pass each selected `Table.data` to
+its table reader; a collection member is not a separate self-contained font slice.
 
 ## Verify checksums explicitly
 
@@ -88,7 +92,8 @@ Checksums detect accidental corruption; they do not authenticate a font or prove
 ## Borrowing, failures and work
 
 Directories, collections, table payloads, record arrays and optional DSIG bytes borrow complete
-immutable source through their last use. Copying a view keeps that borrow. Tags, checksums,
+immutable source through their last use. A selected directory, table or body can outlive its parent
+descriptor; keep the complete source alive. Copying a view keeps that borrow. Tags, checksums,
 flavors, counts, offsets and versions are copied values. Construct views through their opening
 operations and preserve the admitted fields; changing source, record spans, counts or ordering
 flags can invalidate later access. There is no allocator, retained mutable cache or cleanup.
@@ -100,6 +105,11 @@ flags can invalidate later access. There is no allocator, retained mutable cache
 | `InvalidFace` | The requested collection index is outside the admitted count |
 | `AmbiguousTag` | Unique lookup found multiple matching records |
 | `null` | A table index or selected tag is absent |
+
+Errors belong to the operation's type: `Directory.OpenError` covers opening,
+`Directory.LookupError` covers unique lookup, `Collection.OpenError` covers collection framing and
+`Collection.FaceError` includes selected-directory failures and an invalid face index. No opening
+operation can report tag ambiguity; indexed table access and checksums are infallible after admission.
 
 Opening and selection leave input unchanged and publish no view on failure. Arithmetic is checked
 before loads and slices. Count fields and admitted source extents bound traversal: a directory
@@ -120,9 +130,10 @@ does not check canonical padding, glyphs, character maps, metrics, table-specifi
 cross-table agreement. Signature bytes are only opaque ranges. Consumers select the policies and
 table decoders needed for their use; successful container admission alone is not a font sanitizer.
 
-The [SFNT source](../src/sfnt.zig) keeps the small container contract and inline assertions together.
-Checked binary reads and array arithmetic have their own [common support](../src/common/font_binary.zig),
-without adding another root library namespace. The format references are the
+The [SFNT facade](../src/sfnt.zig) presents the independent
+[Directory](../src/sfnt/Directory.zig) and [Collection](../src/sfnt/Collection.zig) types. Each owns its
+operations, related types and inline tests. Checked binary reads and encoded ranges share
+[common support](../src/common/font_binary.zig). The format references are the
 [OpenType file organization](https://learn.microsoft.com/en-us/typography/opentype/spec/otff),
 [font-header checksum adjustment](https://learn.microsoft.com/en-us/typography/opentype/spec/head)
 and [Apple font tables](https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6.html).

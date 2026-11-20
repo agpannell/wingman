@@ -5,11 +5,16 @@ const wingman = @import("wingman");
 pub fn main(init: std.process.Init) !void {
     // Keep the whole source alive while the selected font and its table are in use.
     const source = sampleContainer();
-    const container = try wingman.dfont.Container.open(&source);
-    const font_bytes = try container.faceBytes(0);
-    const directory = try wingman.sfnt.Directory.open(font_bytes);
-    const table = (try directory.find("DATA".*)) orelse return error.MissingTable;
-    if (container.faceCount() != 1 or table.offset != 28) return error.WrongExtent;
+    const font_bytes, const face_count = selected: {
+        const container = try wingman.dfont.Container.open(&source);
+        break :selected .{ try container.faceBytes(0), container.faceCount() };
+    };
+    // The payload outlives its Container; the selected table then outlives its Directory.
+    const table = selected: {
+        const directory = try wingman.sfnt.Directory.open(font_bytes);
+        break :selected (try directory.find("DATA".*)) orelse return error.MissingTable;
+    };
+    if (face_count != 1 or table.offset != 28) return error.WrongExtent;
     if (!table.checksumMatches() or !std.mem.eql(u8, table.data, &.{ 1, 2, 3, 4 })) {
         return error.WrongTable;
     }
@@ -24,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
     try output.interface.print(
         "DFONT: {d} face; {s} table, {d} bytes, checksum {x:0>8}\n",
-        .{ container.faceCount(), &table.tag, table.data.len, table.computedChecksum() },
+        .{ face_count, &table.tag, table.data.len, table.computedChecksum() },
     );
     try output.interface.writeAll("This authored storage is not a complete renderable font.\n");
     try output.interface.flush();

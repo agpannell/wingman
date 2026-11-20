@@ -2,6 +2,9 @@
 
 const std = @import("std");
 
+/// A nonempty span's exclusive address end cannot be represented.
+pub const Error = error{SizeOverflow};
+
 /// Reports whether two borrowed byte spans share any byte; empty spans never overlap. Reads only
 /// addresses and lengths, without inspecting or retaining either span. Pointer-end addition is
 /// avoided so the comparison cannot overflow.
@@ -15,7 +18,7 @@ pub fn overlaps(first: []const u8, second: []const u8) bool {
 /// Reports overlap after checking that both nonempty spans have representable end addresses. Empty
 /// spans never overlap and do not require the other end address to be representable. Reads only
 /// addresses and lengths; failure returns SizeOverflow without inspecting either span.
-pub fn overlapsChecked(first: []const u8, second: []const u8) error{SizeOverflow}!bool {
+pub fn overlapsChecked(first: []const u8, second: []const u8) Error!bool {
     if (first.len == 0 or second.len == 0) return false;
     const a = @intFromPtr(first.ptr);
     const b = @intFromPtr(second.ptr);
@@ -25,9 +28,16 @@ pub fn overlapsChecked(first: []const u8, second: []const u8) error{SizeOverflow
 }
 
 test overlapsChecked {
-    var bytes: [4]u8 = undefined;
-    try std.testing.expect(try overlapsChecked(bytes[0..2], bytes[1..3]));
-    try std.testing.expect(!try overlapsChecked(bytes[0..2], bytes[2..4]));
+    var bytes: [24]u8 = undefined;
+    try std.testing.expect(!try overlapsChecked(bytes[0..8], bytes[8..16]));
+    try std.testing.expect(!try overlapsChecked(bytes[0..8], bytes[16..24]));
+    try std.testing.expect(!try overlapsChecked(bytes[0..0], &bytes));
+    try std.testing.expect(try overlapsChecked(bytes[0..8], bytes[7..16]));
+    try std.testing.expect(try overlapsChecked(&bytes, bytes[8..16]));
+    try std.testing.expect(try overlapsChecked(bytes[8..16], &bytes));
+    // Synthetic addresses exercise end arithmetic only; these slices are never dereferenced.
+    const wrapped = @as([*]const u8, @ptrFromInt(std.math.maxInt(usize) - 3))[0..8];
+    try std.testing.expectError(error.SizeOverflow, overlapsChecked(wrapped, bytes[0..1]));
     const last: [*]const u8 = @ptrFromInt(std.math.maxInt(usize));
     try std.testing.expectError(error.SizeOverflow, overlapsChecked(last[0..1], bytes[0..1]));
     try std.testing.expectError(error.SizeOverflow, overlapsChecked(bytes[0..1], last[0..1]));
