@@ -1,7 +1,6 @@
-//! Adds the source-pane layout rule used by the generated API reference. Zig's source grid must let
-//! its code column shrink so the existing code scrollbar contains long lines on narrow pages. Read
-//! the compiler's index.html from stdin and write the styled HTML to stdout; all other assets are
-//! installed directly from the compiler output.
+//! Styles the generated API reference's source pane so long lines scroll within the code column.
+//! Read the compiler's index.html from stdin and write the styled HTML to stdout. The docs build
+//! installs all other reference assets directly from the compiler output.
 
 const std = @import("std");
 

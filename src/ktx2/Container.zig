@@ -7,7 +7,7 @@ const std = @import("std");
 const ktx2 = @import("../ktx2.zig");
 const layout = @import("layout.zig");
 const fixtures = @import("fixtures.zig");
-const KhronosDataFormatDescriptor = @import("../KhronosDataFormatDescriptor.zig");
+const KhronosDataFormatDescriptor = @import("../common/KhronosDataFormatDescriptor.zig");
 const Container = @This();
 const testing = std.testing;
 

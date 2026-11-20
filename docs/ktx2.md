@@ -161,8 +161,8 @@ stored block grid even for tiny mips; PVRTC2 uses its ordinary block grid. This 
 either format or validate all format-specific restrictions.
 
 The [library entry](../src/ktx2.zig), independent [Khronos
-descriptor](../src/KhronosDataFormatDescriptor.zig) and shallow container owners keep framing and
-format description separate. [Container](../src/ktx2/Container.zig),
+descriptor](../src/common/KhronosDataFormatDescriptor.zig) and shallow container owners keep
+framing and format description separate. [Container](../src/ktx2/Container.zig),
 [TextureInput](../src/ktx2/TextureInput.zig), [Metadata](../src/ktx2/Metadata.zig),
 [BasisLz](../src/ktx2/BasisLz.zig) and [Header](../src/ktx2/Header.zig) own the corresponding
 workflows and their defining contracts. The [shared byte-range overlap

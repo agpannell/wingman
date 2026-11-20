@@ -5,7 +5,7 @@
 const std = @import("std");
 const ktx2 = @import("../ktx2.zig");
 const fixtures = @import("fixtures.zig");
-const KhronosDataFormatDescriptor = @import("../KhronosDataFormatDescriptor.zig");
+const KhronosDataFormatDescriptor = @import("../common/KhronosDataFormatDescriptor.zig");
 
 pub const identifier = [_]u8{
     0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb,

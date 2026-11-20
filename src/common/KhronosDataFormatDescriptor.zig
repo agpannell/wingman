@@ -19,7 +19,7 @@
 //!
 //! Reference: https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html
 const std = @import("std");
-const memory = @import("common/byte_ranges.zig");
+const memory = @import("byte_ranges.zig");
 const KhronosDataFormatDescriptor = @This();
 const testing = std.testing;
 

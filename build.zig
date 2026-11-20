@@ -187,12 +187,12 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "docs",
     });
     const reference_html_module = b.createModule(.{
-        .root_source_file = b.path("autodoc_html.zig"),
+        .root_source_file = b.path("tools/style_api_reference.zig"),
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });
     const reference_html = b.addExecutable(.{
-        .name = "wingman-autodoc-html",
+        .name = "wingman-style-api-reference",
         .root_module = reference_html_module,
         .use_llvm = true,
     });

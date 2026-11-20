@@ -63,7 +63,7 @@ pub const ImageRegion = @import("common/ImageRegion.zig");
 pub const exif = @import("exif.zig");
 pub const icc = @import("icc.zig");
 
-pub const KhronosDataFormatDescriptor = @import("KhronosDataFormatDescriptor.zig");
+pub const KhronosDataFormatDescriptor = @import("common/KhronosDataFormatDescriptor.zig");
 pub const ktx2 = @import("ktx2.zig");
 pub const etc = @import("etc.zig");
 
