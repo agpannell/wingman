@@ -5,17 +5,18 @@ const exif = @import("wingman").exif;
 pub fn main(init: std.process.Init) !void {
     // All metadata and thumbnail views below borrow this complete TIFF payload.
     const bytes = sampleExif();
-    const view = try exif.View.open(&bytes, .{});
+    const metadata = try exif.Metadata.open(&bytes, .{});
     // Orientation is a stored instruction for the caller; sampling does not rotate pixels.
-    const orientation = (try view.orientation()) orelse return error.MissingOrientation;
+    const orientation = (try metadata.orientation()) orelse return error.MissingOrientation;
     if (orientation != .right_top) return error.WrongOrientation;
     // IFD0 has one entry and IFD1 has nine: both directory headers also count as records.
-    if (view.record_count != 12) return error.WrongRecordCount;
+    if (metadata.record_count != 12) return error.WrongRecordCount;
     // IFD1 describes uncompressed data here, so it has no encoded JPEG slice.
-    const thumbnail = (try view.thumbnail()) orelse return error.MissingThumbnail;
+    const thumbnail = (try metadata.thumbnail()) orelse return error.MissingThumbnail;
     if (thumbnail.jpeg != null) return error.UnexpectedCompression;
     const raster = try exif.ThumbnailRaster.open(thumbnail.directory, .{});
     if (raster.width != 2 or raster.height != 1) return error.WrongExtent;
+    // Pixel arrays copy RGB codes; they do not borrow the raster or TIFF storage.
     const first_pixel = raster.rgb(0, 0);
     const second_pixel = raster.rgb(1, 0);
     if (!std.mem.eql(u8, &.{ 255, 0, 0 }, &first_pixel)) return error.WrongRedPixel;
@@ -30,11 +31,12 @@ pub fn main(init: std.process.Init) !void {
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
     try output.interface.print(
         "Exif: {d} bytes, {d} structural records, stored orientation {s}\n",
-        .{ bytes.len, view.record_count, @tagName(orientation) },
+        .{ bytes.len, metadata.record_count, @tagName(orientation) },
     );
-    try output.interface.print("thumbnail: {d}x{d}, RGB8 strips, {d} encoded bytes\n", .{
-        raster.width, raster.height, strip.len,
-    });
+    try output.interface.print(
+        "thumbnail: {d}x{d}, RGB8 strips, {d} encoded bytes\n",
+        .{ raster.width, raster.height, strip.len },
+    );
     for (0..raster.width) |x| {
         const rgb = raster.rgb(x, 0);
         try output.interface.print("  pixel {d}: {d} {d} {d}\n", .{ x, rgb[0], rgb[1], rgb[2] });
@@ -78,7 +80,8 @@ fn sampleExif() [152]u8 {
         std.mem.writeInt(u32, entry[4..8], field.count, .little);
         std.mem.writeInt(u32, entry[8..12], field.value, .little);
     }
-    for (0..3) |index| std.mem.writeInt(u16, bytes[140 + index * 2 ..][0..2], 8, .little);
+    for (0..3) |index|
+        std.mem.writeInt(u16, bytes[140 + index * 2 ..][0..2], 8, .little);
     bytes[146..152].* = .{ 255, 0, 0, 0, 255, 0 };
     return bytes;
 }

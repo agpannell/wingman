@@ -641,7 +641,7 @@ test "ICC borrowed tag bodies preserve version-specific storage outside the pack
     std.mem.writeInt(u32, bytes[140..144], 11, .big);
     @memcpy(bytes[144..148], "text");
     @memcpy(bytes[152..155], "abc");
-    const profile = try icc.Profile.open(&bytes, .{ .limits = .{ .tags = 1 } });
+    const profile = try icc.Profile.open(&bytes, .{ .tags = 1 });
     const version = profile.version;
     const tag = (try profile.find("desc".*)).?;
     try std.testing.expectEqualStrings("RGB ", &profile.color_space);
@@ -653,13 +653,13 @@ test "ICC borrowed tag bodies preserve version-specific storage outside the pack
     try std.testing.expect(try profile.find("wtpt".*) == null);
     try std.testing.expectError(
         error.MetadataLimitExceeded,
-        icc.Profile.open(&bytes, .{ .limits = .{ .tags = 0 } }),
+        icc.Profile.open(&bytes, .{ .tags = 0 }),
     );
 
     // The previous borrows have retired. Version two permits this unpadded final body.
     bytes[8] = 2;
     std.mem.writeInt(u32, bytes[0..4], 155, .big);
-    const legacy = try icc.Profile.open(bytes[0..155], .{ .limits = .{ .tags = 1 } });
+    const legacy = try icc.Profile.open(bytes[0..155], .{ .tags = 1 });
     try std.testing.expectEqual(4, version[0]);
     try std.testing.expectEqual(2, legacy.version[0]);
     try std.testing.expectEqual(155, legacy.source.len);
@@ -1179,16 +1179,24 @@ test "Exif metadata borrows either TIFF byte order" {
             0,
         },
     }) |bytes| {
-        const view = try exif.View.open(bytes, .{});
-        try std.testing.expectEqual(exif.Orientation.right_top, (try view.orientation()).?);
-        try std.testing.expectEqual(2, view.record_count);
-        const entry = (try (try view.primary()).find(0x0112)).?;
+        const entry = selected: {
+            const metadata = try exif.Metadata.open(bytes, .{});
+            try std.testing.expectEqual(
+                exif.Metadata.Orientation.right_top,
+                (try metadata.orientation()).?,
+            );
+            try std.testing.expectEqual(2, metadata.record_count);
+            const primary = try metadata.primary();
+            try std.testing.expectEqualSlices(u8, bytes[10..22], primary.entry_records);
+            try std.testing.expectEqual(bytes[10..].ptr, primary.entry_records.ptr);
+            try std.testing.expectEqual(null, try metadata.thumbnail());
+            break :selected (try primary.find(0x0112)).?;
+        };
         try std.testing.expectEqual(6, try entry.unsignedScalar());
         try std.testing.expectEqual(
             @intFromPtr(bytes.ptr) + 18,
             @intFromPtr((try entry.data()).ptr),
         );
-        try std.testing.expectEqual(null, try view.thumbnail());
     }
 }
 
@@ -1196,18 +1204,64 @@ test "Exif admission and field interpretation have separate boundaries" {
     const short = [_]u8{ 0x49, 0x49, 42, 0, 8, 0, 0, 0, 1, 0 };
     try std.testing.expectError(
         error.MetadataLimitExceeded,
-        exif.View.open(&short, .{ .limits = .{ .records = 1 } }),
+        exif.Metadata.open(&short, .{ .records = 1 }),
     );
-    try std.testing.expectError(error.InvalidExif, exif.View.open(&short, .{}));
+    try std.testing.expectError(error.InvalidExif, exif.Metadata.open(&short, .{}));
     const unknown_type = [_]u8{
         0x49, 0x49, 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 129, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
     };
-    const view = try exif.View.open(&unknown_type, .{ .limits = .{ .records = 2 } });
-    const primary = try view.primary();
+    const metadata = try exif.Metadata.open(&unknown_type, .{ .records = 2 });
+    const primary = try metadata.primary();
     const entry = primary.entry(0).?;
     try std.testing.expectEqual(129, entry.field_type);
     try std.testing.expectError(error.UnsupportedExif, entry.data());
-    try std.testing.expectEqual(1, (try view.directoryAt(view.first_ifd)).count);
+    try std.testing.expectEqual(
+        1,
+        (try metadata.directoryAt(metadata.first_directory_offset)).entry_count,
+    );
+}
+
+test "Exif thumbnail sampling and its record allowance work outside the package" {
+    const Raster = exif.ThumbnailRaster;
+    // Authored primary RGB directory: nine entries, one strip, six sample bytes at offset 128.
+    var wire: [134]u8 = @splat(0);
+    wire[0..8].* = .{ 0x49, 0x49, 42, 0, 8, 0, 0, 0 };
+    std.mem.writeInt(u16, wire[8..10], 9, .little);
+    const fields = [_]struct {
+        tag: u16,
+        kind: u16 = 4,
+        count: u32 = 1,
+        value: u32,
+    }{
+        .{ .tag = 0x0100, .value = 2 },
+        .{ .tag = 0x0101, .value = 1 },
+        .{ .tag = 0x0102, .kind = 3, .count = 3, .value = 122 },
+        .{ .tag = 0x0103, .value = 1 },
+        .{ .tag = 0x0106, .value = 2 },
+        .{ .tag = 0x0111, .value = 128 },
+        .{ .tag = 0x0115, .value = 3 },
+        .{ .tag = 0x0116, .value = 1 },
+        .{ .tag = 0x0117, .value = 6 },
+    };
+    for (fields, 0..) |field, index| {
+        const record = wire[10 + index * 12 ..][0..12];
+        std.mem.writeInt(u16, record[0..2], field.tag, .little);
+        std.mem.writeInt(u16, record[2..4], field.kind, .little);
+        std.mem.writeInt(u32, record[4..8], field.count, .little);
+        std.mem.writeInt(u32, record[8..12], field.value, .little);
+    }
+    wire[122..128].* = .{ 8, 0, 8, 0, 8, 0 };
+    wire[128..134].* = .{ 12, 34, 56, 78, 90, 123 };
+    const metadata = try exif.Metadata.open(&wire, .{ .entries = 9, .records = 10 });
+    const directory = try metadata.primary();
+    const options: Raster.OpenOptions = .{ .limits = .{ .records = 11 } };
+    const raster = try Raster.open(directory, options);
+    try std.testing.expectEqual([3]u8{ 12, 34, 56 }, raster.rgb(0, 0));
+    try std.testing.expectEqual([3]u8{ 78, 90, 123 }, raster.rgb(1, 0));
+    try std.testing.expectEqual(wire[0..].ptr, raster.source.ptr);
+    try std.testing.expectEqual(1, raster.rows_per_strip);
+    const refusal: Raster.Error = error.MetadataLimitExceeded;
+    try std.testing.expectError(refusal, Raster.open(directory, .{ .limits = .{ .records = 10 } }));
 }
 
 test "BLAKE3 complete input retired bytes snapshots and selected output" {

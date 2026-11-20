@@ -5,38 +5,47 @@ const icc = @import("wingman").icc;
 pub fn main(init: std.process.Init) !void {
     // Profile and tag views borrow the complete declared profile; keep these bytes unchanged.
     const bytes = sampleProfile();
-    const maximum_tags = 3;
-    const profile = try icc.Profile.open(&bytes, .{ .limits = .{ .tags = maximum_tags } });
-    // These distinct record signatures identify channels, while their common body has type curv.
-    const red = (try profile.find("rTRC".*)) orelse return error.MissingTag;
-    const green = (try profile.find("gTRC".*)) orelse return error.MissingTag;
-    const blue = (try profile.find("bTRC".*)) orelse return error.MissingTag;
-    if (red.data.ptr != green.data.ptr or red.data.ptr != blue.data.ptr)
-        return error.LostSharedStorage;
-    // The fourteen-byte body excludes the two zero padding bytes included in the profile length.
-    if (red.data.len != 14 or profile.source.len != 184) return error.WrongExtent;
-    if (profile.tag(3) != null or try profile.find("wtpt".*) != null) return error.UnexpectedTag;
-
     var buffer: [1024]u8 = undefined;
     var output: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
-    try output.interface.print(
-        "ICC v{d}: class {s}, input {s}, connection space {s}\n",
-        .{
-            profile.version[0],
-            &profile.device_class,
-            &profile.color_space,
-            &profile.connection_space,
-        },
-    );
-    for (0..profile.tag_count) |index| {
-        const tag = profile.tag(index) orelse return error.MissingTag;
-        // Opening checked that the body is inside source, so this offset is within the profile.
-        const offset = @intFromPtr(tag.data.ptr) - @intFromPtr(profile.source.ptr);
+    const shared_body = inspected: {
+        const maximum_tags = 3;
+        const profile = try icc.Profile.open(&bytes, .{ .tags = maximum_tags });
+        // These distinct record signatures identify channels, while their common body has type
+        // curv.
+        const red = (try profile.find("rTRC".*)) orelse return error.MissingTag;
+        const green = (try profile.find("gTRC".*)) orelse return error.MissingTag;
+        const blue = (try profile.find("bTRC".*)) orelse return error.MissingTag;
+        if (red.data.ptr != green.data.ptr or red.data.ptr != blue.data.ptr)
+            return error.LostSharedStorage;
+        if (profile.source.len != 184) return error.WrongExtent;
+        if (profile.tag(
+            3,
+        ) != null or try profile.find("wtpt".*) != null) return error.UnexpectedTag;
+
         try output.interface.print(
-            "  {s}: type bytes {s}, {d} body bytes at {d}\n",
-            .{ &tag.signature, tag.data[0..4], tag.data.len, offset },
+            "ICC v{d}: class {s}, input {s}, connection space {s}\n",
+            .{
+                profile.version[0],
+                &profile.device_class,
+                &profile.color_space,
+                &profile.connection_space,
+            },
         );
-    }
+        for (0..profile.tag_count) |index| {
+            const tag = profile.tag(index) orelse return error.MissingTag;
+            // Opening checked that the body is inside source, so this offset is within the profile.
+            const offset = @intFromPtr(tag.data.ptr) - @intFromPtr(profile.source.ptr);
+            try output.interface.print(
+                "  {s}: type bytes {s}, {d} body bytes at {d}\n",
+                .{ &tag.signature, tag.data[0..4], tag.data.len, offset },
+            );
+        }
+        break :inspected red.data;
+    };
+    // Only the immutable source backs this body; Profile and Tag descriptors have retired. The
+    // fourteen-byte body excludes the two zero padding bytes included in the profile length.
+    if (shared_body.ptr != bytes[168..].ptr or shared_body.len != 14) return error.WrongBorrow;
+    if (!std.mem.eql(u8, shared_body[0..4], "curv")) return error.WrongBodyType;
     try output.interface.writeAll(
         "three tags share one body; two alignment bytes stay outside it\n",
     );

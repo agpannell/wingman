@@ -639,13 +639,11 @@ pub fn validateText(text: []const u8, utf8: bool) Metadata.Error!void {
 pub fn validateLanguage(language: []const u8) Metadata.Error!void {
     if (language.len == 0) return;
     // These fixed irregular productions do not match the ordinary language-tag grammar.
-    for (
-        [_][]const u8{
-            "en-GB-oed", "i-ami",     "i-bnn",     "i-default", "i-enochian", "i-hak", "i-klingon",
-            "i-lux",     "i-mingo",   "i-navajo",  "i-pwn",     "i-tao",      "i-tay", "i-tsu",
-            "sgn-BE-FR", "sgn-BE-NL", "sgn-CH-DE",
-        },
-    ) |grandfathered| if (std.ascii.eqlIgnoreCase(language, grandfathered)) return;
+    for ([_][]const u8{
+        "en-GB-oed", "i-ami",     "i-bnn",     "i-default", "i-enochian", "i-hak", "i-klingon",
+        "i-lux",     "i-mingo",   "i-navajo",  "i-pwn",     "i-tao",      "i-tay", "i-tsu",
+        "sgn-BE-FR", "sgn-BE-NL", "sgn-CH-DE",
+    }) |grandfathered| if (std.ascii.eqlIgnoreCase(language, grandfathered)) return;
 
     var subtags = std.mem.splitScalar(u8, language, '-');
     const primary = (try nextLanguageSubtag(&subtags)) orelse return error.InvalidPngMetadata;
@@ -719,26 +717,24 @@ fn languageNumeric(subtag: []const u8) bool {
 test "PNG language tags admit RFC syntax and reject malformed subtag sequences" {
     // RFC 5646 section 2.1 syntax, including all irregular grandfathered productions. Registry
     // membership and duplicate-subtag validity are separate from well-formedness.
-    for (
-        [_][]const u8{
-            "",                              "en",         "ja-JP",               "zh-Hant-TW",
-            "es-419",                        "de-CH-1901", "sl-rozaj-biske-1994", "zh-cmn-Hans-CN",
-            "abc-def-ghi-jkl-Latn-US-abcde", "abcd",
-        },
-    ) |language| try validateLanguage(language);
-    for (
-        [_][]const u8{
-            "qaa-Qaaa-QM-x-southern", "en-a-aaa-b-bbb-x-ccc", "en-u-ca-gregory", "x-private",
-            "X-A-12345678",           "de-DE-1901-1901",      "en-a-aaa-A-bbb",  "en-GB-oed",
-            "i-ami",                  "i-bnn",                "i-default",       "i-enochian",
-            "i-hak",                  "i-klingon",            "i-lux",           "i-mingo",
-            "i-navajo",               "i-pwn",                "i-tao",           "i-tay",
-            "i-tsu",                  "sgn-BE-FR",            "sgn-BE-NL",       "sgn-CH-DE",
-            "I-KLINGON",              "SGN-be-fr",            "art-lojban",      "cel-gaulish",
-            "no-bok",                 "no-nyn",               "zh-guoyu",        "zh-hakka",
-            "zh-min",                 "zh-min-nan",           "zh-xiang",
-        },
-    ) |language| try validateLanguage(language);
+    for ([_][]const u8{
+        "",                              "en",         "ja-JP",               "zh-Hant-TW",
+        "es-419",                        "de-CH-1901", "sl-rozaj-biske-1994", "zh-cmn-Hans-CN",
+        "abc-def-ghi-jkl-Latn-US-abcde", "abcd",
+    }) |language|
+        try validateLanguage(language);
+    for ([_][]const u8{
+        "qaa-Qaaa-QM-x-southern", "en-a-aaa-b-bbb-x-ccc", "en-u-ca-gregory", "x-private",
+        "X-A-12345678",           "de-DE-1901-1901",      "en-a-aaa-A-bbb",  "en-GB-oed",
+        "i-ami",                  "i-bnn",                "i-default",       "i-enochian",
+        "i-hak",                  "i-klingon",            "i-lux",           "i-mingo",
+        "i-navajo",               "i-pwn",                "i-tao",           "i-tay",
+        "i-tsu",                  "sgn-BE-FR",            "sgn-BE-NL",       "sgn-CH-DE",
+        "I-KLINGON",              "SGN-be-fr",            "art-lojban",      "cel-gaulish",
+        "no-bok",                 "no-nyn",               "zh-guoyu",        "zh-hakka",
+        "zh-min",                 "zh-min-nan",           "zh-xiang",
+    }) |language|
+        try validateLanguage(language);
     const embedded_nul = [_]u8{ 0x65, 0x6e, 0x00, 0x55, 0x53 };
     const non_ascii = [_]u8{ 0xc3, 0xa9, 0x6e };
     const invalid_languages = [_][]const u8{
@@ -768,9 +764,8 @@ test "PNG language tags admit RFC syntax and reject malformed subtag sequences" 
         "en-GB-oed-x-private",
         "en-1234-ab",
     };
-    for (
-        invalid_languages,
-    ) |language| try std.testing.expectError(error.InvalidPngMetadata, validateLanguage(language));
+    for (invalid_languages) |language|
+        try std.testing.expectError(error.InvalidPngMetadata, validateLanguage(language));
     const long_private = "x" ++ @as(
         [9 * 4096]u8,
         @bitCast(@as([4096][9]u8, @splat("-a1234567".*))),
@@ -781,9 +776,10 @@ test "PNG language tags admit RFC syntax and reject malformed subtag sequences" 
 test "PNG iTXt rejects malformed language syntax for plain and compressed records" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{ "en--US", "en-a", "x", "en-abcdefghi", "en-US-Latn" }) |language| {
-        for (
-            [_][]const u8{ &[_]u8{ 0x4b, 0x00, 0x00, 0x00 }, &[_]u8{ 0x4b, 0x00, 0x01, 0x00 } },
-        ) |prefix| {
+        for ([_][]const u8{
+            &[_]u8{ 0x4b, 0x00, 0x00, 0x00 },
+            &[_]u8{ 0x4b, 0x00, 0x01, 0x00 },
+        }) |prefix| {
             const payload = try std.mem.concat(
                 allocator,
                 u8,
@@ -835,31 +831,27 @@ fn readPngInteger(bytes: []const u8, offset: usize) Metadata.Error!u32 {
 
 test "PNG metadata integers retain the standard 31-bit range at both boundaries" {
     // Independent network-order facts from PNG's integer representation, section 7.1.
-    for (
-        [_]struct {
-            value: u32,
-            wire: *const [4]u8,
-        }{
-            .{ .value = 0, .wire = &[_]u8{ 0x00, 0x00, 0x00, 0x00 } },
-            .{ .value = 1, .wire = &[_]u8{ 0x00, 0x00, 0x00, 0x01 } },
-            .{ .value = 0x7fff_fffe, .wire = &[_]u8{ 0x7f, 0xff, 0xff, 0xfe } },
-            .{ .value = 0x7fff_ffff, .wire = &[_]u8{ 0x7f, 0xff, 0xff, 0xff } },
-        },
-    ) |control| {
+    for ([_]struct {
+        value: u32,
+        wire: *const [4]u8,
+    }{
+        .{ .value = 0, .wire = &[_]u8{ 0x00, 0x00, 0x00, 0x00 } },
+        .{ .value = 1, .wire = &[_]u8{ 0x00, 0x00, 0x00, 0x01 } },
+        .{ .value = 0x7fff_fffe, .wire = &[_]u8{ 0x7f, 0xff, 0xff, 0xfe } },
+        .{ .value = 0x7fff_ffff, .wire = &[_]u8{ 0x7f, 0xff, 0xff, 0xff } },
+    }) |control| {
         try validateInteger(control.value);
         try std.testing.expectEqual(control.value, try readPngInteger(control.wire, 0));
     }
-    for (
-        [_]struct {
-            value: u32,
-            wire: *const [4]u8,
-        }{
-            .{ .value = 0x8000_0000, .wire = &[_]u8{ 0x80, 0x00, 0x00, 0x00 } },
-            .{ .value = 0x8000_0001, .wire = &[_]u8{ 0x80, 0x00, 0x00, 0x01 } },
-            .{ .value = 0xffff_fffe, .wire = &[_]u8{ 0xff, 0xff, 0xff, 0xfe } },
-            .{ .value = 0xffff_ffff, .wire = &[_]u8{ 0xff, 0xff, 0xff, 0xff } },
-        },
-    ) |control| {
+    for ([_]struct {
+        value: u32,
+        wire: *const [4]u8,
+    }{
+        .{ .value = 0x8000_0000, .wire = &[_]u8{ 0x80, 0x00, 0x00, 0x00 } },
+        .{ .value = 0x8000_0001, .wire = &[_]u8{ 0x80, 0x00, 0x00, 0x01 } },
+        .{ .value = 0xffff_fffe, .wire = &[_]u8{ 0xff, 0xff, 0xff, 0xfe } },
+        .{ .value = 0xffff_ffff, .wire = &[_]u8{ 0xff, 0xff, 0xff, 0xff } },
+    }) |control| {
         try std.testing.expectError(error.InvalidPngMetadata, validateInteger(control.value));
         try std.testing.expectError(error.InvalidPngMetadata, readPngInteger(control.wire, 0));
     }
@@ -915,8 +907,8 @@ test "PNG ICC and Exif views share checked payload mechanisms and explicit expan
     const image = try SourceImage.open(bytes, .{ .maximum_source_extent = 2 });
     const details = try image.metadata().read(.{});
     try std.testing.expectEqual(.icc, details.colorSource());
-    const view = try exif_module.View.open(details.exif_payload.?, .{});
-    try std.testing.expectEqual(.right_top, (try view.orientation()).?);
+    const exif = try exif_module.Metadata.open(details.exif_payload.?, .{});
+    try std.testing.expectEqual(.right_top, (try exif.orientation()).?);
     const workspace = try deflate.decode.Workspace.create(std.testing.allocator);
     defer workspace.destroy(std.testing.allocator);
     const expected = try std.testing.allocator.dupe(u8, fixture.srgb_icc);
@@ -925,7 +917,7 @@ test "PNG ICC and Exif views share checked payload mechanisms and explicit expan
     defer std.testing.allocator.free(destination);
     const profile_bytes = try details.icc_profile.?.expandInto(destination, workspace);
     try std.testing.expectEqualSlices(u8, expected, profile_bytes);
-    const profile = try icc_module.Profile.open(profile_bytes, .{ .limits = .{ .tags = 11 } });
+    const profile = try icc_module.Profile.open(profile_bytes, .{ .tags = 11 });
     try std.testing.expectEqualStrings("RGB ", &profile.color_space);
     try std.testing.expectEqual(11, profile.tag_count);
     try std.testing.expectEqual(4, profile.version[0]);
@@ -980,16 +972,20 @@ test "PNG compressed metadata restores bounded workspace backing after reuse" {
                     workspace,
                 );
                 try std.testing.expectEqualSlices(u8, expected, expanded);
-                for (destination[expected.len..]) |byte| try std.testing.expectEqual(0xa5, byte);
+                for (destination[expected.len..]) |byte|
+                    try std.testing.expectEqual(0xa5, byte);
             }
             try std.testing.expectEqual(live, fixed.end_index);
             try std.testing.expectEqual(requests, failing.alloc_index);
             workspace.destroy(failing.allocator());
         } else |failure| try std.testing.expectEqual(error.OutOfMemory, failure);
         try std.testing.expectEqual(17, fixed.end_index);
-        for (fixed.buffer[0..17]) |byte| try std.testing.expectEqual(0x3c, byte);
-        for (backing[0..8]) |byte| try std.testing.expectEqual(0xa5, byte);
-        for (backing[backing.len - 8 ..]) |byte| try std.testing.expectEqual(0xa5, byte);
+        for (fixed.buffer[0..17]) |byte|
+            try std.testing.expectEqual(0x3c, byte);
+        for (backing[0..8]) |byte|
+            try std.testing.expectEqual(0xa5, byte);
+        for (backing[backing.len - 8 ..]) |byte|
+            try std.testing.expectEqual(0xa5, byte);
     }
 }
 
@@ -1074,9 +1070,8 @@ test "PNG text byte refusal persists without traversing later chunks" {
     const exact: Metadata.Limits = .{ .maximum_bytes = 15, .maximum_records = 6 };
     _ = try reader.read(exact);
     iterator = reader.texts(exact);
-    for (
-        [_][]const u8{ "ABCDE", "abc", "z" },
-    ) |expected| try std.testing.expectEqualStrings(expected, (try iterator.next()).?.data);
+    for ([_][]const u8{ "ABCDE", "abc", "z" }) |expected|
+        try std.testing.expectEqualStrings(expected, (try iterator.next()).?.data);
     try std.testing.expectEqual(null, try iterator.next());
 }
 
@@ -1103,13 +1098,15 @@ test "PNG iTXt ignores every compression method when its text is uncompressed" {
             "snowman ☃",
             try text.expandInto(&destination, workspace),
         );
-        for (destination[11..]) |byte| try std.testing.expectEqual(0xa5, byte);
+        for (destination[11..]) |byte|
+            try std.testing.expectEqual(0xa5, byte);
         @memset(&destination, 0xa5);
         try std.testing.expectError(
             error.OutputTooSmall,
             text.expandInto(destination[0..10], workspace),
         );
-        for (destination) |byte| try std.testing.expectEqual(0xa5, byte);
+        for (destination) |byte|
+            try std.testing.expectEqual(0xa5, byte);
         try std.testing.expectEqual(null, try texts.next());
     }
     const reader = (try SourceImage.open(bytes, .{ .maximum_source_extent = 2 })).metadata();
@@ -1137,17 +1134,17 @@ test "PNG iTXt validates compression flags and selected compressed methods" {
         _ = try texts.next();
         try std.testing.expectError(error.UnsupportedPngMetadata, texts.next());
     }
-    for ([_]u8{ 2, 255 }) |flag| {
+    for ([_]u8{ 2, 255 }) |flag|
         try std.testing.expectError(
             error.InvalidPngMetadata,
             parseText(.{ .name = "iTXt".*, .data = &.{ 'K', 0, flag, 255, 0, 0 } }),
         );
-    }
     try std.testing.expectError(
         error.InvalidPngMetadata,
-        parseText(
-            .{ .name = "iTXt".*, .data = &[_]u8{ 0x4b, 0x00, 0x00, 0xff, 0x00, 0x00, 0xc0, 0x80 } },
-        ),
+        parseText(.{
+            .name = "iTXt".*,
+            .data = &[_]u8{ 0x4b, 0x00, 0x00, 0xff, 0x00, 0x00, 0xc0, 0x80 },
+        }),
     );
 }
 
@@ -1227,7 +1224,7 @@ test "PNG metadata permits density Exif and animation after a suggested palette"
     );
     try std.testing.expectEqual(source.ptr + 79, details.exif_payload.?.ptr);
     try std.testing.expectEqual(26, details.exif_payload.?.len);
-    const exif = try exif_module.View.open(details.exif_payload.?, .{});
+    const exif = try exif_module.Metadata.open(details.exif_payload.?, .{});
     try std.testing.expectEqual(.right_top, (try exif.orientation()).?);
     try std.testing.expectEqual(.unspecified, details.colorSource());
     try std.testing.expectError(
@@ -1328,42 +1325,35 @@ test "PNG singleton placement and required HDR declarations are selected errors"
 }
 
 test "PNG text keywords UTF-8 framing and compressed checksums have explicit failures" {
-    for ([_][]const u8{ "", " key", "key ", "two  spaces", &[_]u8{0x7f} }) |keyword| {
+    for ([_][]const u8{ "", " key", "key ", "two  spaces", &[_]u8{0x7f} }) |keyword|
         try std.testing.expectError(error.InvalidPngMetadata, validateKeyword(keyword));
-    }
     try std.testing.expectError(
         error.InvalidPngMetadata,
-        parseText(
-            .{
-                .name = "iTXt".*,
-                .data = &[_]u8{
-                    0x6b, 0x65, 0x79, 0x00, 0x00, 0x00, 0x65, 0x6e,
-                    0x00, 0xff, 0x00, 0x74, 0x65, 0x78, 0x74,
-                },
+        parseText(.{
+            .name = "iTXt".*,
+            .data = &[_]u8{
+                0x6b, 0x65, 0x79, 0x00, 0x00, 0x00, 0x65, 0x6e,
+                0x00, 0xff, 0x00, 0x74, 0x65, 0x78, 0x74,
             },
-        ),
+        }),
     );
     try std.testing.expectError(
         error.InvalidPngMetadata,
-        parseText(
-            .{
-                .name = "iTXt".*,
-                .data = &[_]u8{
-                    0x6b, 0x65, 0x79, 0x00, 0x00, 0x00, 0x65, 0x6e,
-                    0x00, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x6c, 0x61,
-                    0x74, 0x65, 0x64, 0x00, 0xc0, 0x80,
-                },
+        parseText(.{
+            .name = "iTXt".*,
+            .data = &[_]u8{
+                0x6b, 0x65, 0x79, 0x00, 0x00, 0x00, 0x65, 0x6e,
+                0x00, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x6c, 0x61,
+                0x74, 0x65, 0x64, 0x00, 0xc0, 0x80,
             },
-        ),
+        }),
     );
     try std.testing.expectError(
         error.UnsupportedPngMetadata,
-        parseText(
-            .{
-                .name = "zTXt".*,
-                .data = &[_]u8{ 0x6b, 0x65, 0x79, 0x00, 0x01, 0x64, 0x61, 0x74, 0x61 },
-            },
-        ),
+        parseText(.{
+            .name = "zTXt".*,
+            .data = &[_]u8{ 0x6b, 0x65, 0x79, 0x00, 0x01, 0x64, 0x61, 0x74, 0x61 },
+        }),
     );
     const workspace = try deflate.decode.Workspace.create(std.testing.allocator);
     defer workspace.destroy(std.testing.allocator);

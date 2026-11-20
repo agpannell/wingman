@@ -23,8 +23,8 @@ const EncodingStorage = encoding_workspace.Workspace;
 const encoding_fixtures = png_encoding_vectors;
 
 /// Checked metadata, profile, TIFF, resource, allocation and backing-writer errors.
-pub const Error = metadata.Metadata.Error || icc.Error || exif.Error || chunks.Error || Limits
-    .Error || encoding_workspace.WorkspaceError || encoding_workspace.WriteError;
+pub const Error = metadata.Metadata.Error || icc.Profile.Error || exif.Metadata.Error || chunks
+    .Error || Limits.Error || encoding_workspace.WorkspaceError || encoding_workspace.WriteError;
 
 /// Checks selected records and creates a small immutable borrow, allocating no storage. Color/depth
 /// must describe a valid PNG layout. Source metadata and later encoded payloads are both bounded;
@@ -59,7 +59,8 @@ pub fn prepare(self: MetadataInput, color_type: u8, depth: u8, limits: Limits) E
         source_bytes += 4;
     }
     if (self.chromaticities) |values| {
-        for (values) |value| try metadata.validateInteger(value);
+        for (values) |value|
+            try metadata.validateInteger(value);
         records += 1;
         source_bytes += 32;
     }
@@ -134,21 +135,19 @@ pub fn prepare(self: MetadataInput, color_type: u8, depth: u8, limits: Limits) E
     if (self.icc_profile) |profile| {
         const checked = try icc.Profile.open(
             profile.bytes,
-            .{ .limits = .{ .tags = limits.maximum_records - records } },
+            .{ .tags = limits.maximum_records - records },
         );
         const expected = if (color_type == 0 or color_type == 4) "GRAY" else "RGB ";
         if (!std.mem.eql(u8, &checked.color_space, expected)) return error.InvalidPngMetadata;
         records = try add(records, checked.tag_count);
     }
     if (self.exif_payload) |bytes| {
-        const checked = try exif.View.open(
+        const checked = try exif.Metadata.open(
             bytes,
             .{
-                .limits = .{
-                    .directories = limits.maximum_records - records,
-                    .entries = limits.maximum_records - records,
-                    .records = limits.maximum_records - records,
-                },
+                .directories = limits.maximum_records - records,
+                .entries = limits.maximum_records - records,
+                .records = limits.maximum_records - records,
             },
         );
         records = try add(records, checked.record_count);
@@ -252,9 +251,8 @@ pub const Prepared = struct {
         }
         if (value.chromaticities) |values| {
             var bytes: [32]u8 = undefined;
-            for (values, 0..) |number, index| {
+            for (values, 0..) |number, index|
                 std.mem.writeInt(u32, bytes[index * 4 ..][0..4], number, .big);
-            }
             try output.encodeChunk("cHRM", &.{&bytes}, null);
         }
         if (value.srgb_intent) |intent| try output.encodeChunk("sRGB", &.{&.{intent}}, null);
@@ -375,7 +373,8 @@ pub const Encoder = struct {
                 if (self.offset > destination.len) return error.OutputTooSmall;
                 var chunk_writer: chunks = undefined;
                 try chunk_writer.init(destination[self.offset..], name, capacity);
-                for (parts) |part| try chunk_writer.writer.writeAll(part);
+                for (parts) |part|
+                    try chunk_writer.writer.writeAll(part);
                 try compress(source, &chunk_writer.writer, self.mode, self.compression);
                 const used = try chunk_writer.finishPrefix();
                 self.payload_bytes = try add(self.payload_bytes, used - 12);
@@ -402,7 +401,8 @@ pub const Encoder = struct {
             if (self.offset > destination.len) return error.OutputTooSmall;
             var chunk_writer: chunks = undefined;
             try chunk_writer.init(destination[self.offset..], name, count);
-            for (parts) |part| try chunk_writer.writer.writeAll(part);
+            for (parts) |part|
+                try chunk_writer.writer.writeAll(part);
             if (uncompressed) |source| {
                 if (counter.count == 0) try chunk_writer.writer.writeAll(
                     counter.writer.buffered(),
@@ -536,8 +536,10 @@ test "PNG metadata writes retained streams once and replays drained streams" {
         try std.testing.expectEqualSlices(u8, control.chunk, guarded[3..][0..used]);
         try std.testing.expectEqual(control.reservations, scratch.allocations);
         try std.testing.expectEqual(scratch.allocated_bytes, scratch.freed_bytes);
-        for (guarded[0..3]) |byte| try std.testing.expectEqual(0xa5, byte);
-        for (guarded[3 + used ..]) |byte| try std.testing.expectEqual(0xa5, byte);
+        for (guarded[0..3]) |byte|
+            try std.testing.expectEqual(0xa5, byte);
+        for (guarded[3 + used ..]) |byte|
+            try std.testing.expectEqual(0xa5, byte);
         const bound = try prepared.capacityBound();
         try std.testing.expect(bound >= used);
         const output = try std.testing.allocator.alloc(u8, bound + 2);
@@ -546,7 +548,8 @@ test "PNG metadata writes retained streams once and replays drained streams" {
         const prepared_used = try prepared.writeInto(output[1..], workspace, .{ .level = 0 });
         try std.testing.expectEqualSlices(u8, control.chunk, output[1..][0..prepared_used]);
         try std.testing.expectEqual(0xa5, output[0]);
-        for (output[1 + prepared_used ..]) |byte| try std.testing.expectEqual(0xa5, byte);
+        for (output[1 + prepared_used ..]) |byte|
+            try std.testing.expectEqual(0xa5, byte);
     }
 }
 
@@ -572,7 +575,8 @@ test "prepared compressed text bounds a stream ending at a complete slab" {
     const used = try prepared.writeInto(buffer[1..][0..capacity], workspace, .{ .level = 0 });
     try std.testing.expect(used <= capacity);
     try std.testing.expectEqual(@as(u8, 0xa5), buffer[0]);
-    for (buffer[1 + used ..]) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+    for (buffer[1 + used ..]) |byte|
+        try std.testing.expectEqual(@as(u8, 0xa5), byte);
     const chunk = buffer[1..][0..used];
     const payload_len = std.mem.readInt(u32, chunk[0..4], .big);
     try std.testing.expectEqualStrings("zTXt", chunk[4..8]);
@@ -739,8 +743,8 @@ test "PNG metadata encoding preserves typed color HDR density Exif profile and t
     try std.testing.expectEqual(source.physical, details.physical);
     try std.testing.expectEqualSlices(u8, source.significant_bits.?, details.significant_bits.?);
     try std.testing.expectEqualSlices(u8, facts.exif_little, details.exif_payload.?);
-    const orientation = try (try exif.View.open(details.exif_payload.?, .{})).orientation();
-    try std.testing.expectEqual(exif.Orientation.right_top, orientation);
+    const orientation = try (try exif.Metadata.open(details.exif_payload.?, .{})).orientation();
+    try std.testing.expectEqual(exif.Metadata.Orientation.right_top, orientation);
     const workspace = try deflate.decode.Workspace.create(allocator);
     defer workspace.destroy(allocator);
     const expanded = try allocator.alloc(u8, 4096);
@@ -768,53 +772,39 @@ test "PNG metadata encoding preserves typed color HDR density Exif profile and t
 }
 
 test "PNG metadata encoding applies the shared integer boundary to every scalar field" {
-    for (
-        [_]struct {
-            value: u32,
-            failure: ?Error,
-        }{
-            .{ .value = 0x7fff_ffff, .failure = null },
-            .{ .value = 0x8000_0000, .failure = error.InvalidPngMetadata },
-        },
-    ) |control| {
-        for (
-            [_]MetadataInput{
-                .{ .gamma = control.value },
-                .{ .chromaticities = .{ control.value, 0, 0, 0, 0, 0, 0, 0 } },
-                .{
-                    .cicp = .{ .primaries = 9, .transfer = 16, .matrix = 0, .full_range = true },
-                    .mastering_display = .{
-                        .primaries = @splat(.{ 0, 0 }),
-                        .white_point = .{ 0, 0 },
-                        .maximum_luminance = control.value,
-                        .minimum_luminance = 0,
-                    },
+    for ([_]struct {
+        value: u32,
+        failure: ?Error,
+    }{
+        .{ .value = 0x7fff_ffff, .failure = null },
+        .{ .value = 0x8000_0000, .failure = error.InvalidPngMetadata },
+    }) |control| {
+        for ([_]MetadataInput{
+            .{ .gamma = control.value },
+            .{ .chromaticities = .{ control.value, 0, 0, 0, 0, 0, 0, 0 } },
+            .{
+                .cicp = .{ .primaries = 9, .transfer = 16, .matrix = 0, .full_range = true },
+                .mastering_display = .{
+                    .primaries = @splat(.{ 0, 0 }),
+                    .white_point = .{ 0, 0 },
+                    .maximum_luminance = control.value,
+                    .minimum_luminance = 0,
                 },
-                .{
-                    .cicp = .{ .primaries = 9, .transfer = 16, .matrix = 0, .full_range = true },
-                    .mastering_display = .{
-                        .primaries = @splat(.{ 0, 0 }),
-                        .white_point = .{ 0, 0 },
-                        .maximum_luminance = 0,
-                        .minimum_luminance = control.value,
-                    },
-                },
-                .{
-                    .content_light = .{
-                        .maximum_content = control.value,
-                        .maximum_frame_average = 0,
-                    },
-                },
-                .{
-                    .content_light = .{
-                        .maximum_content = 0,
-                        .maximum_frame_average = control.value,
-                    },
-                },
-                .{ .physical = .{ .x = control.value, .y = 0, .metres = false } },
-                .{ .physical = .{ .x = 0, .y = control.value, .metres = false } },
             },
-        ) |value| {
+            .{
+                .cicp = .{ .primaries = 9, .transfer = 16, .matrix = 0, .full_range = true },
+                .mastering_display = .{
+                    .primaries = @splat(.{ 0, 0 }),
+                    .white_point = .{ 0, 0 },
+                    .maximum_luminance = 0,
+                    .minimum_luminance = control.value,
+                },
+            },
+            .{ .content_light = .{ .maximum_content = control.value, .maximum_frame_average = 0 } },
+            .{ .content_light = .{ .maximum_content = 0, .maximum_frame_average = control.value } },
+            .{ .physical = .{ .x = control.value, .y = 0, .metres = false } },
+            .{ .physical = .{ .x = 0, .y = control.value, .metres = false } },
+        }) |value| {
             if (control.failure) |failure| try std.testing.expectError(
                 failure,
                 prepare(value, 6, 8, .{}),
@@ -841,37 +831,31 @@ test "PNG metadata encoding rejects invalid declarations before allocating" {
             },
         },
     };
-    for (
-        invalid,
-    ) |value| try std.testing.expectError(error.InvalidPngMetadata, prepare(value, 6, 8, limits));
-    for (
-        [_][]const u8{ &.{ 8, 8, 8 }, &.{ 8, 8, 8, 0 }, &.{ 8, 8, 8, 9 } },
-    ) |bits| try std.testing.expectError(
-        error.InvalidPngMetadata,
-        prepare(MetadataInput{ .significant_bits = bits }, 6, 8, limits),
-    );
-    for (
-        [_]MetadataInput.Text{
-            .{ .keyword = "", .data = "text" },
-            .{ .keyword = " leading", .data = "text" },
-            .{ .keyword = "two  spaces", .data = "text" },
-            .{
-                .keyword = "Comment",
-                .data = &[_]u8{ 0x62, 0x61, 0x64, 0x00, 0x74, 0x65, 0x78, 0x74 },
-            },
-            .{ .keyword = "Comment", .data = &[_]u8{ 0x62, 0x61, 0x64, 0xff } },
-            .{ .keyword = "Comment", .data = "text", .language = "en_US" },
-            .{
-                .keyword = "Comment",
-                .data = "text",
-                .translated_keyword = &[_]u8{ 0x62, 0x61, 0x64, 0xff },
-            },
-            .{ .keyword = "Comment", .data = "text", .encoding = .latin1, .language = "en" },
+    for (invalid) |value|
+        try std.testing.expectError(error.InvalidPngMetadata, prepare(value, 6, 8, limits));
+    for ([_][]const u8{ &.{ 8, 8, 8 }, &.{ 8, 8, 8, 0 }, &.{ 8, 8, 8, 9 } }) |bits|
+        try std.testing.expectError(
+            error.InvalidPngMetadata,
+            prepare(MetadataInput{ .significant_bits = bits }, 6, 8, limits),
+        );
+    for ([_]MetadataInput.Text{
+        .{ .keyword = "", .data = "text" },
+        .{ .keyword = " leading", .data = "text" },
+        .{ .keyword = "two  spaces", .data = "text" },
+        .{ .keyword = "Comment", .data = &[_]u8{ 0x62, 0x61, 0x64, 0x00, 0x74, 0x65, 0x78, 0x74 } },
+        .{ .keyword = "Comment", .data = &[_]u8{ 0x62, 0x61, 0x64, 0xff } },
+        .{ .keyword = "Comment", .data = "text", .language = "en_US" },
+        .{
+            .keyword = "Comment",
+            .data = "text",
+            .translated_keyword = &[_]u8{ 0x62, 0x61, 0x64, 0xff },
         },
-    ) |text| try std.testing.expectError(
-        error.InvalidPngMetadata,
-        prepare(MetadataInput{ .texts = &.{text} }, 6, 8, limits),
-    );
+        .{ .keyword = "Comment", .data = "text", .encoding = .latin1, .language = "en" },
+    }) |text|
+        try std.testing.expectError(
+            error.InvalidPngMetadata,
+            prepare(MetadataInput{ .texts = &.{text} }, 6, 8, limits),
+        );
     try std.testing.expectError(
         error.InvalidIcc,
         prepare(
@@ -923,7 +907,8 @@ test "PNG metadata encoding rejects invalid declarations before allocating" {
         error.OutputTooSmall,
         prepared.writeIntoWithScratch(std.testing.failing_allocator, &short, .{ .level = 0 }),
     );
-    for (short) |byte| try std.testing.expectEqual(0xa5, byte);
+    for (short) |byte|
+        try std.testing.expectEqual(0xa5, byte);
     // A tiny source is admitted, but stored compression expands its encoded metadata payload.
     const expanded_metadata = try prepare(
         MetadataInput{
@@ -1017,7 +1002,8 @@ test "zero metadata records emit no bytes and empty text still emits" {
     try std.testing.expectEqual(@as(usize, 0), length);
     const written = try empty.writeIntoWithScratch(std.testing.failing_allocator, &output, method);
     try std.testing.expectEqual(@as(usize, 0), written);
-    for (output) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+    for (output) |byte|
+        try std.testing.expectEqual(@as(u8, 0xa5), byte);
     const with_text = try prepare(
         MetadataInput{ .texts = &.{.{ .keyword = "k", .data = "" }} },
         6,

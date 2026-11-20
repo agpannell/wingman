@@ -18,7 +18,8 @@
 //! png reads and writes PNG images and APNG animations with explicit storage and sample policy.
 //! exif borrows classic TIFF attributes and thumbnail storage, including supported RGB/YCbCr
 //! thumbnail samples. icc inspects bounded uncompressed color-profile headers and opaque tag
-//! bodies. Orientation, complete profile validation and color transforms stay with callers.
+//! bodies. Orientation transforms, complete profile validation and color transforms stay with
+//! callers.
 //!
 //! dfont selects borrowed SFNT resources from Macintosh data-fork resource containers. sfnt borrows
 //! SFNT table directories and TTC/OTC collection members. Table payloads remain opaque, with
